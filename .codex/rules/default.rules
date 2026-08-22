@@ -1,0 +1,9 @@
+# Keep this equivalent to .claude/settings.json's permissions.allow list.
+prefix_rule(pattern=["git", ["add", "commit", "log", "rev-parse", "show", "status"]], decision="allow")
+prefix_rule(pattern=["rg"], decision="allow")
+prefix_rule(pattern=["find"], decision="allow")
+prefix_rule(pattern=["sed"], decision="allow")
+prefix_rule(pattern=["pwd"], decision="allow")
+prefix_rule(pattern=["ls"], decision="allow")
+prefix_rule(pattern=["mkdir"], decision="allow")
+prefix_rule(pattern=["python"], decision="allow")
