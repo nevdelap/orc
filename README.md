@@ -17,17 +17,24 @@ implement/review round so the work can be inspected or resumed.
 
 ## Launch
 
-From this repository, run Orc with uv:
+From an executable checkout, run Orc directly through its uv shebang:
+
+```console
+./orc.py begin DIRECTORY TASK-ID PROMPT
+```
+
+The equivalent explicit form is useful when diagnosing the launcher:
 
 ```console
 uv run --script orc.py begin DIRECTORY TASK-ID PROMPT
 ```
 
-For a managed checkout, install the locked environment first and run:
+For a managed checkout, install the locked environment first, then use either
+form above:
 
 ```console
 uv sync --locked
-uv run python orc.py begin DIRECTORY TASK-ID PROMPT
+./orc.py begin DIRECTORY TASK-ID PROMPT
 ```
 
 `DIRECTORY` must already exist and be a directory. Orc resolves it to an
@@ -73,11 +80,18 @@ rejected before the state record is changed.
 
 ## Interaction
 
-The active pane is shown with a highlighted border. Press `Tab` or `Shift-Tab`
-to switch panes, `1` or `2` to select Igor or Rufus, and `Ctrl-Q` to exit the
-UI. Ordinary keys, control keys, arrows, Enter, paste, and terminal resize
-signals are forwarded to the active Codex PTY. Exiting the UI does not delete
-task state; resume the task later with the same target directory.
+Both role panes remain visible whenever the terminal supports the selected
+layout. The active pane has a highlighted border and its role is shown in the
+status line. Click either pane or press `Tab` to focus the next pane; focus
+selection updates the border and status without sending the focus command to
+the agent. `Ctrl-Q` exits the UI.
+
+Ordinary keys, digits, control keys, arrows, Enter, Shift-Tab, paste, and
+terminal resize signals are forwarded to the active Codex PTY. Shift-Tab uses
+the terminal's reported control sequence when available. Orc keeps startup,
+idle, and handoff messages in each pane, and displays the task name and Orc
+version in the status bar. Exiting the UI does not delete task state; resume
+the task later with the same target directory.
 
 ## Troubleshooting
 
@@ -89,12 +103,20 @@ task state; resume the task later with the same target directory.
 - **Resume directory mismatch:** inspect the task record and pass its
   normalized `target_directory`; Orc intentionally rejects a different path.
 - **No interactive terminal:** run `begin` or `resume` from a real POSIX
-  terminal rather than redirecting standard input or output.
+  terminal rather than redirecting standard input or output. If `./orc.py` is
+  not executable in a checkout, run `chmod +x orc.py` once or use the explicit
+  `uv run --script orc.py` form.
+- **Resize or blank pane:** Orc measures the rendered pane after layout and
+  sends that width and height to the child PTY. If a pane looks blank after a
+  terminal resize, wait for the redraw, then click the pane to make its focus
+  and border state explicit. Extremely small terminals use a safe minimum; use
+  at least 80x24 for normal operation.
 - **Codex cannot start:** set `CODEX_COMMAND` or pass `--codex`, and verify the
   executable can run from the target directory.
 - **Git commit is `unknown`:** the target may not be a Git worktree or its
   `HEAD` may be unavailable. Orchestration can still retain the handoff.
 
-Use `uv run --script orc.py --help` for the complete CLI help. The hidden
+Use `./orc.py --help` for the complete CLI help. The hidden
 `idle-hook` command is invoked by Codex notifications and is not normally run
-by hand.
+by hand. Set `ORC_DISABLE_IDLE_HOOK=1` for general Orc testing when you
+need to keep an agent session available without an automatic handoff.

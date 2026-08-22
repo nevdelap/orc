@@ -86,7 +86,7 @@ Acceptance criteria:
 
 ## TASK-004 - Fix PTY resizing and pane focus input
 
-State: NEW
+State: COMPLETED
 
 Goal:
 
@@ -124,7 +124,7 @@ Scope:
 - Preserve the Linux-only POSIX PTY support model.
 - Ensure the first line remains an executable uv shebang in the form
   `#!/usr/bin/env -S uv run --script`, with valid inline script metadata.
-- Remove `1`, `2`, `Tab`, and `Shift-Tab` as global pane-switching shortcuts.
+- Remove `1`, `2`, and `Shift-Tab` as global pane-switching shortcuts; retain `Tab` for pane switching.
 - Provide a non-conflicting focus mechanism, such as clicking a pane, with
   visible active-pane feedback.
 - Measure each rendered pane and propagate its width and height to its child
@@ -157,11 +157,11 @@ Acceptance criteria:
   outer-terminal or initial value.
 - No blank, one-column, one-row, or apparently hung pane remains after a
   resize; a Linux PTY test observes correctly redrawn output.
-- Pressing `1`, `2`, `Tab`, or `Shift-Tab` does not change the active pane.
+- Pressing `1`, `2`, or `Shift-Tab` does not change the active pane; pressing `Tab` switches to the other pane.
 - The replacement focus mechanism selects either pane and updates the border
   and status reliably.
-- Formerly intercepted Tab and Shift-Tab input reaches the active Codex PTY
-  in the form reported by the terminal whenever available.
+- Formerly intercepted `1`, `2`, and Shift-Tab input reaches the active
+  Codex PTY in the form reported by the terminal whenever available.
 - README, status text, and tests contain none of the removed shortcuts.
 - Existing color, paste, control-key, handoff, completion, and target
   directory behavior remains passing.
@@ -172,6 +172,17 @@ Acceptance criteria:
   requested Nev checkpoints were performed or records the remaining blocker.
 - Applicable project checks, PTY/integration tests, direct-script checks, and
   clean-diff verification pass.
+
+Planning resolution:
+
+- Nev clarified the interaction contract during implementation: `Tab` remains
+  the global pane-switching key because it is needed to move between panes;
+  only `1`, `2`, and `Shift-Tab` must stop being consumed by Orc and must be
+  forwarded to the active Codex PTY. This operator clarification supersedes
+  the earlier blanket removal of all pane-switching shortcuts.
+- Nev directed that the normal idle hook remain available for handoff, with
+  `ORC_DISABLE_IDLE_HOOK=1` retained as a general Orc testing switch that
+  disconnects hook injection while an agent session is being inspected.
 
 ## TASK-005 - Add bounded workflow control and clarification pauses
 

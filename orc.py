@@ -33,6 +33,8 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Container
 from textual.events import Click, Paste
+from textual.geometry import Size
+from textual.screen import Screen
 from textual.widgets import Static
 
 IMPLEMENTER_PROMPT = """
@@ -64,6 +66,7 @@ hash.
 """.strip()
 
 ORC_VERSION = "orc v0.0.1"
+FOCUS_STATUS = "Click a pane to focus · Tab switches panes · Ctrl-Q exits"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -375,6 +378,17 @@ class SessionPane(Static):
         return rendered
 
 
+class OrcScreen(Screen[None]):
+    """Default screen that observes Textual's consumed resize event."""
+
+    def _screen_resized(self, size: Size) -> None:
+        super()._screen_resized(size)
+        resize_handler = getattr(self.app, "on_terminal_resize", None)
+        composed = getattr(self.app, "_compose_screen", None) is not None
+        if resize_handler is not None and self.is_attached and composed:
+            resize_handler(size)
+
+
 @dataclass
 class ChildSession:
     role: str
@@ -437,6 +451,9 @@ class OrcApp(App[None]):
         self.layout_mode = ""
         self.last_status = "starting"
         self.event_loop: asyncio.AbstractEventLoop | None = None
+
+    def get_default_screen(self) -> Screen:
+        return OrcScreen(id="_default")
 
     def compose(self) -> ComposeResult:
         yield Container(
@@ -509,11 +526,16 @@ class OrcApp(App[None]):
         else:
             prompt = reviewer_prompt(record) + "\n\n" + HANDOFF_PROMPT
 
-        command = [
-            self.args.codex,
-            "-c",
-            f"notify={notify_config(self.args.state_file)}",
-        ]
+        command = [self.args.codex]
+        # General Orc testing can keep the agent session in place by setting
+        # ORC_DISABLE_IDLE_HOOK=1 for this launch.
+        if os.environ.get("ORC_DISABLE_IDLE_HOOK") != "1":
+            command.extend(
+                [
+                    "-c",
+                    f"notify={notify_config(self.args.state_file)}",
+                ]
+            )
         thread_id = record.get(f"{role}_id")
         if isinstance(thread_id, str) and thread_id:
             requests = record.get("user_requests", [])
@@ -557,9 +579,8 @@ class OrcApp(App[None]):
         self.update_layout()
         self.set_master_reader(session)
         self.resize_session(session)
-        self.update_status(
-            f"{role.title()} active · Tab/1/2 switches focus · Ctrl-Q exits"
-        )
+        self.schedule_resize()
+        self.update_status(self.active_status())
 
     @staticmethod
     def fork_codex(
@@ -606,15 +627,60 @@ class OrcApp(App[None]):
                 self.update_status(f"could not write to {session.role}: {error}")
 
     def resize_session(self, session: ChildSession) -> None:
-        width = max(session.pane.size.width - 2, 2)
-        height = max(session.pane.size.height - 2, 2)
+        width, height = self.pane_terminal_size(session.pane)
         set_pty_size(session.master_fd, width, height)
         session.pane.resize_terminal(width, height)
 
-    def on_resize(self, _event: Any) -> None:
+    @staticmethod
+    def pane_terminal_size(pane: SessionPane) -> tuple[int, int]:
+        """Return the rendered content size available to a child PTY."""
+
+        content_size = getattr(pane, "content_size", None)
+        if content_size is not None:
+            width = getattr(content_size, "width", 0)
+            height = getattr(content_size, "height", 0)
+            if width or height:
+                return max(width, 2), max(height, 2)
+
+        # A pane may be measured before Textual has laid it out (startup) or
+        # while it is hidden in single-pane mode. Keep a safe fallback for
+        # those transient states without using the outer terminal dimensions.
+        size = getattr(pane, "size", None)
+        if size is None:
+            return 2, 2
+        gutter = getattr(getattr(pane, "styles", None), "gutter", None)
+        if gutter is None:
+            horizontal = vertical = 2
+        else:
+            horizontal = gutter.left + gutter.right
+            vertical = gutter.top + gutter.bottom
+        return max(size.width - horizontal, 2), max(size.height - vertical, 2)
+
+    def resize_sessions(self) -> None:
+        for session in getattr(self, "sessions", {}).values():
+            if not session.exited:
+                self.resize_session(session)
+
+    def schedule_resize(self) -> None:
+        """Repeat a resize after pending Textual layout work is applied."""
+
+        if getattr(self, "_running", False):
+            self.call_after_refresh(self.resize_sessions)
+
+    def on_terminal_resize(self, _size: Size) -> None:
         self.update_layout()
-        for session in self.sessions.values():
-            self.resize_session(session)
+        self.resize_sessions()
+        self.schedule_resize()
+
+    def on_resize(self, _event: Any) -> None:
+        # Keep this handler for direct Resize messages and test drivers. The
+        # mounted screen receives real terminal resizes first because Textual
+        # consumes that event before it can bubble to the App.
+        self.on_terminal_resize(_event)
+
+    def active_status(self) -> str:
+        layout = f" · layout: {self.layout_mode}" if self.layout_mode else ""
+        return f"{self.active_role.title()} active{layout} · {FOCUS_STATUS}"
 
     def update_layout(self) -> None:
         if not self.is_running:
@@ -626,7 +692,7 @@ class OrcApp(App[None]):
         if width >= 120 and width >= height * 1.35:
             mode = "side-by-side"
             panes.styles.layout = "horizontal"
-        elif height >= 32 and height >= width * 0.7:
+        elif height >= 32:
             mode = "stacked"
             panes.styles.layout = "vertical"
         else:
@@ -647,10 +713,8 @@ class OrcApp(App[None]):
 
         if mode != self.layout_mode:
             self.layout_mode = mode
-            self.update_status(
-                f"{self.active_role.title()} active · layout: {mode} · "
-                "Tab/1/2 switches focus · Ctrl-Q exits"
-            )
+            self.update_status(self.active_status())
+            self.schedule_resize()
 
     def update_status(self, message: str) -> None:
         self.last_status = message
@@ -715,27 +779,14 @@ class OrcApp(App[None]):
             self.exit()
             event.stop()
             return
-        if key in {"tab", "shift+tab"}:
+        if key == "tab":
             roles = ("implementer", "reviewer")
             index = roles.index(self.active_role)
-            self.active_role = roles[(index + (1 if key == "tab" else -1)) % 2]
+            self.active_role = roles[(index + 1) % 2]
             self.update_layout()
-            self.update_status(
-                f"{self.active_role.title()} active · layout: {self.layout_mode} · "
-                "Tab/1/2 switches focus · Ctrl-Q exits"
-            )
+            self.update_status(self.active_status())
             event.stop()
             return
-        if key in {"1", "2"}:
-            self.active_role = "implementer" if key == "1" else "reviewer"
-            self.update_layout()
-            self.update_status(
-                f"{self.active_role.title()} active · layout: {self.layout_mode} · "
-                "Tab/1/2 switches focus · Ctrl-Q exits"
-            )
-            event.stop()
-            return
-
         special_keys = {
             "enter": b"\r",
             "backspace": b"\x7f",
@@ -749,8 +800,18 @@ class OrcApp(App[None]):
             "pageup": b"\x1b[5~",
             "pagedown": b"\x1b[6~",
             "escape": b"\x1b",
+            "shift+tab": b"\x1b[Z",
         }
-        data = special_keys.get(key)
+        data = (
+            event.character.encode()
+            if event.character
+            and key
+            in {
+                "tab",
+                "shift+tab",
+            }
+            else special_keys.get(key)
+        )
         if data is None and key.startswith("ctrl+") and len(key) == 6:
             data = bytes([ord(key[-1].upper()) - ord("@")])
         if data is None and event.character:
@@ -766,13 +827,15 @@ class OrcApp(App[None]):
     def on_click(self, event: Click) -> None:
         widget = event.widget
         role = getattr(widget, "id", None)
+        while role not in {"implementer", "reviewer"} and widget is not None:
+            widget = getattr(widget, "parent", None)
+            role = getattr(widget, "id", None)
         if role in {"implementer", "reviewer"}:
             self.active_role = role
             self.update_layout()
-            self.update_status(
-                f"{self.active_role.title()} active · layout: {self.layout_mode} · "
-                "Tab/1/2 switches focus · Ctrl-Q exits"
-            )
+            self.resize_sessions()
+            self.schedule_resize()
+            self.update_status(self.active_status())
             event.stop()
 
     async def action_quit(self) -> None:

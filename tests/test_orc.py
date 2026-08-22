@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import fcntl
 import json
 import os
+import struct
 import subprocess
 import sys
+import termios
 from pathlib import Path
 
 import pytest
@@ -57,6 +61,17 @@ def make_git_target(path: Path) -> str:
         capture_output=True,
         text=True,
     ).stdout.strip()
+
+
+def test_direct_script_help_invocation() -> None:
+    result = subprocess.run(
+        [str(Path(__file__).parents[1] / "orc.py"), "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert "begin DIRECTORY TASK-ID" in result.stdout
 
 
 def test_help_requires_and_describes_directory(
@@ -363,42 +378,212 @@ def test_pty_size_handles_small_values_and_bad_fd() -> None:
     orc.set_pty_size(-1, 0, 0)
 
 
-def test_orc_input_forwarding_and_focus(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.integration
+def test_pty_size_updates_real_linux_pty() -> None:
+    master_fd, slave_fd = os.openpty()
+    try:
+        orc.set_pty_size(master_fd, 37, 11)
+        rows, columns, _, _ = struct.unpack(
+            "HHHH", fcntl.ioctl(slave_fd, termios.TIOCGWINSZ, bytes(8))
+        )
+        assert (columns, rows) == (37, 11)
+    finally:
+        os.close(master_fd)
+        os.close(slave_fd)
+
+
+@pytest.mark.integration
+def test_live_textual_resize_focus_and_pty_redraw(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_file = tmp_path / "state.json"
+    target = tmp_path / "target"
+    target.mkdir()
+    orc.save_state(
+        state_file,
+        {
+            "TASK-004": {
+                "status": "active",
+                "phase": "implementer",
+                "target_directory": str(target),
+            }
+        },
+    )
+    args = argparse.Namespace(state_file=state_file, codex="codex")
+    app = orc.OrcApp(args, "TASK-004")
+    monkeypatch.setattr(app, "launch_role", lambda _role: None)
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            app.event_loop = asyncio.get_running_loop()
+            sessions: dict[str, orc.ChildSession] = {}
+            try:
+                for role in ("implementer", "reviewer"):
+                    command = [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import signal,sys,time; "
+                            "signal.signal(signal.SIGWINCH, lambda *_: "
+                            "print('\\x1b[31mLIVE-' + sys.argv[1] + "
+                            "'-resized\\x1b[0m', flush=True)); "
+                            "print('\\x1b[31mLIVE-' + sys.argv[1] + "
+                            "'\\x1b[0m', flush=True); time.sleep(30)"
+                        ),
+                        role,
+                    ]
+                    pid, master_fd = app.fork_codex(command, os.environ.copy(), target)
+                    os.set_blocking(master_fd, False)
+                    session = orc.ChildSession(role, pid, master_fd, app.pane(role))
+                    sessions[role] = session
+                    app.sessions[role] = session
+                    app.started_roles.add(role)
+                    app.set_master_reader(session)
+
+                app.active_role = "implementer"
+                app.update_layout()
+                app.resize_sessions()
+                await pilot.pause(0.15)
+                assert app.layout_mode == "side-by-side"
+                assert app.pane("implementer").has_visible_content
+                assert (
+                    "LIVE-implementer" in app.pane("implementer").render_screen().plain
+                )
+                side_sizes = {
+                    role: _pty_size(app.sessions[role].master_fd) for role in sessions
+                }
+                assert all(
+                    width >= 2 and height >= 2 for width, height in side_sizes.values()
+                )
+
+                assert await pilot.click("#reviewer")
+                await pilot.pause()
+                assert app.active_role == "reviewer"
+                await pilot.press("tab")
+                await pilot.pause()
+                assert app.active_role == "implementer"
+                await pilot.click("#reviewer")
+                await pilot.pause()
+                assert app.active_role == "reviewer"
+                assert "active" in app.last_status
+                assert "Tab switches panes" in app.last_status
+                assert "active-pane" in app.pane("reviewer").classes
+                assert "active-pane" not in app.pane("implementer").classes
+
+                await pilot.resize_terminal(80, 40)
+                await pilot.pause(0.1)
+                assert app.layout_mode == "stacked"
+                stacked_sizes = {
+                    role: _pty_size(app.sessions[role].master_fd) for role in sessions
+                }
+                assert all(
+                    width >= 2 and height >= 2
+                    for width, height in stacked_sizes.values()
+                )
+
+                await pilot.resize_terminal(80, 24)
+                await pilot.pause(0.1)
+                assert app.layout_mode == "single"
+                tiny_before = {
+                    role: _pty_size(app.sessions[role].master_fd) for role in sessions
+                }
+                await pilot.resize_terminal(3, 3)
+                await pilot.pause(0.1)
+                tiny_after = {
+                    role: _pty_size(app.sessions[role].master_fd) for role in sessions
+                }
+                assert all(
+                    width >= 2 and height >= 2
+                    for width, height in (*tiny_before.values(), *tiny_after.values())
+                )
+                await pilot.resize_terminal(80, 40)
+                await pilot.pause(0.1)
+                assert app.layout_mode == "stacked"
+                assert app.pane("implementer").has_visible_content
+                assert (
+                    "LIVE-implementer-resized"
+                    in app.pane("implementer").render_screen().plain
+                )
+            finally:
+                for session in sessions.values():
+                    try:
+                        os.killpg(session.pid, orc.signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                app.exit()
+                for session in sessions.values():
+                    try:
+                        os.waitpid(session.pid, 0)
+                    except ChildProcessError:
+                        pass
+
+    asyncio.run(exercise())
+
+
+def _pty_size(fd: int) -> tuple[int, int]:
+    rows, columns, _, _ = struct.unpack(
+        "HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, bytes(8))
+    )
+    return columns, rows
+
+
+def test_resize_uses_rendered_pane_content_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = orc.OrcApp.__new__(orc.OrcApp)
+    pane = FakePane(120, 40, content_width=57, content_height=13)
+    session = argparse.Namespace(
+        master_fd=7, pane=pane, exited=False, role="implementer"
+    )
+    sizes: list[tuple[int, int]] = []
+    rendered_sizes: list[tuple[int, int]] = []
+    monkeypatch.setattr(orc, "set_pty_size", lambda _fd, w, h: sizes.append((w, h)))
+    pane.resize_terminal = lambda w, h: rendered_sizes.append((w, h))
+
+    app.resize_session(session)
+
+    assert sizes == [(57, 13)]
+    assert rendered_sizes == [(57, 13)]
+
+
+def test_orc_input_forwarding_and_tab_focus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     app = orc.OrcApp.__new__(orc.OrcApp)
     app.active_role = "implementer"
     app.layout_mode = "side-by-side"
     writes: list[bytes] = []
-    statuses: list[str] = []
     monkeypatch.setattr(app, "write_active", writes.append)
     monkeypatch.setattr(app, "update_layout", lambda: None)
-    monkeypatch.setattr(app, "update_status", statuses.append)
+    monkeypatch.setattr(app, "update_status", lambda _message: None)
 
-    event = Event("enter")
-    app.on_key(event)
-    assert writes == [b"\r"] and event.stopped
-    event = Event("c", "c")
-    app.on_key(event)
-    assert writes[-1] == b"c"
-    event = Event("ctrl+c")
-    app.on_key(event)
-    assert writes[-1] == b"\x03"
-    event = Event("tab")
-    app.on_key(event)
+    for event, expected in (
+        (Event("enter"), b"\r"),
+        (Event("c", "c"), b"c"),
+        (Event("ctrl+c"), b"\x03"),
+        (Event("shift+tab"), b"\x1b[Z"),
+        (Event("1", "1"), b"1"),
+        (Event("2", "2"), b"2"),
+    ):
+        app.on_key(event)
+        assert writes[-1] == expected
+        assert event.stopped
+
+    tab = Event("tab", "\t")
+    app.on_key(tab)
     assert app.active_role == "reviewer"
-    event = Event("1")
-    app.on_key(event)
-    assert app.active_role == "implementer"
+    assert tab.stopped
+    assert writes[-1] == b"2"
     event = Event("unknown")
     app.on_key(event)
     assert not event.stopped
-    assert statuses
 
 
 def test_paste_click_and_find_task_role(monkeypatch: pytest.MonkeyPatch) -> None:
     app = orc.OrcApp.__new__(orc.OrcApp)
     app.active_role = "implementer"
     app.layout_mode = "side-by-side"
-    app.layout_mode = "side-by-side"
+    app.sessions = {}
     writes: list[bytes] = []
     statuses: list[str] = []
     monkeypatch.setattr(app, "write_active", writes.append)
@@ -442,8 +627,18 @@ class FakeStyle:
 
 
 class FakePane:
-    def __init__(self, width: int = 100, height: int = 40) -> None:
+    def __init__(
+        self,
+        width: int = 100,
+        height: int = 40,
+        content_width: int | None = None,
+        content_height: int | None = None,
+    ) -> None:
         self.size = argparse.Namespace(width=width, height=height)
+        self.content_size = argparse.Namespace(
+            width=width if content_width is None else content_width,
+            height=height if content_height is None else content_height,
+        )
         self.styles = FakeStyle()
         self.classes: set[str] = set()
         self.messages: list[str] = []
@@ -498,6 +693,7 @@ def app_stub(
 def test_orc_app_launches_roles_with_target_cwd_and_resume_prompt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.delenv("ORC_DISABLE_IDLE_HOOK", raising=False)
     target = tmp_path / "target"
     target.mkdir()
     record: dict[str, object] = {
@@ -537,6 +733,37 @@ def test_orc_app_launches_roles_with_target_cwd_and_resume_prompt(
     assert launched[1][0][3:5] == ["resume", "rufus-thread"]
     assert "Target project directory" in launched[1][0][-1]
     assert statuses
+
+
+def test_launch_can_disable_idle_hook_for_orc_testing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    record: dict[str, object] = {
+        "target_directory": str(target),
+        "prompt": "initial",
+        "user_requests": [],
+        "implementer_id": None,
+        "reviewer_id": None,
+    }
+    app, _state_file, _panes = app_stub(tmp_path, record)
+    launched: list[list[str]] = []
+    monkeypatch.setattr(
+        app,
+        "fork_codex",
+        lambda command, _environment, _cwd=None: (
+            launched.append(command) or (123, os.open("/dev/null", os.O_RDWR))
+        ),
+    )
+    monkeypatch.setattr(app, "set_master_reader", lambda _session: None)
+    monkeypatch.setattr(app, "resize_session", lambda _session: None)
+    monkeypatch.setattr(app, "update_layout", lambda: None)
+    monkeypatch.setattr(app, "update_status", lambda _message: None)
+    monkeypatch.setenv("ORC_DISABLE_IDLE_HOOK", "1")
+    app.launch_role("implementer")
+
+    assert launched and "-c" not in launched[0]
 
 
 def test_orc_app_launch_error_and_invalid_records(
@@ -850,6 +1077,7 @@ def test_app_constructor_compose_mount_and_fatal_error(
 def test_launch_resume_and_poll_edge_branches(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.delenv("ORC_DISABLE_IDLE_HOOK", raising=False)
     target = tmp_path / "target"
     target.mkdir()
     record: dict[str, object] = {
