@@ -13,18 +13,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import errno
 import fcntl
 import json
 import os
-from pathlib import Path
 import signal
 import struct
 import subprocess
 import sys
 import termios
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import pyte
@@ -34,7 +34,6 @@ from textual.app import App, ComposeResult
 from textual.containers import Container
 from textual.events import Click, Paste
 from textual.widgets import Static
-
 
 IMPLEMENTER_PROMPT = """
 Read the docs in design_docs/ and docs/roles.md. You are Igor the implementer.
@@ -67,9 +66,13 @@ hash.
 ORC_VERSION = "orc v0.0.1"
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Orchestrate Igor and Rufus Codex sessions."
+        description=(
+            "Orchestrate Igor and Rufus Codex sessions. "
+            "Usage: begin DIRECTORY TASK-ID PROMPT or "
+            "resume DIRECTORY TASK-ID PROMPT."
+        )
     )
     parser.add_argument(
         "--state-file",
@@ -85,12 +88,24 @@ def parse_args() -> argparse.Namespace:
 
     commands = parser.add_subparsers(dest="command", required=True)
 
-    begin = commands.add_parser("begin", help="Begin a task.")
+    begin = commands.add_parser("begin", help="Begin a task in DIRECTORY.")
+    begin.add_argument(
+        "directory",
+        metavar="DIRECTORY",
+        type=Path,
+        help="Existing target project directory.",
+    )
     begin.add_argument("task_id", help="Task identifier, such as TASK-001.")
     begin.add_argument("prompt", help="Initial request for Igor.")
 
     resume = commands.add_parser(
-        "resume", help="Resume a task with a follow-up or new request."
+        "resume", help="Resume a task in its stored DIRECTORY."
+    )
+    resume.add_argument(
+        "directory",
+        metavar="DIRECTORY",
+        type=Path,
+        help="Existing target project directory matching the task state.",
     )
     resume.add_argument("task_id", help="Task identifier, such as TASK-001.")
     resume.add_argument(
@@ -101,7 +116,27 @@ def parse_args() -> argparse.Namespace:
     hook = commands.add_parser("idle-hook", help=argparse.SUPPRESS)
     hook.add_argument("payload", nargs="?")
 
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    # The child PTY changes its working directory to the target project.  An
+    # absolute state path keeps the idle hook attached to Orc's state file
+    # when the caller supplied a relative --state-file.
+    args.state_file = args.state_file.expanduser().resolve()
+    return args
+
+
+def normalize_target_directory(value: Path) -> Path:
+    """Return an absolute target directory, or a useful CLI error."""
+
+    candidate = value.expanduser()
+    try:
+        normalized = candidate.resolve(strict=True)
+    except FileNotFoundError as error:
+        raise SystemExit(f"target directory does not exist: {value}") from error
+    except (OSError, RuntimeError) as error:
+        raise SystemExit(f"cannot access target directory {value}: {error}") from error
+    if not normalized.is_dir():
+        raise SystemExit(f"target directory is not a directory: {value}")
+    return normalized
 
 
 def load_state(path: Path) -> dict[str, Any]:
@@ -133,8 +168,12 @@ def reviewer_prompt(record: dict[str, Any]) -> str:
     requests.extend(record.get("user_requests", []))
     requests = [request for request in requests if isinstance(request, str)]
     request_text = "\n".join(f"- {request}" for request in requests)
+    target = record.get("target_directory", "unknown")
     return (
         f"{REVIEWER_PROMPT}\n\n"
+        f"Target project directory: {target}\n"
+        "Review the target project's current worktree and Git repository. "
+        "Do not review or modify Orc's repository.\n"
         "Igor has completed the implementation turn. Review the current "
         "worktree now. Do not implement fixes. Report findings and evidence, "
         "or report exactly TASK COMPLETE when ready.\n\n"
@@ -186,11 +225,13 @@ def assistant_message_from_payload(value: Any) -> str | None:
     return None
 
 
-def current_commit(cwd: str | None) -> str:
+def current_commit(cwd: str | Path | None) -> str:
+    if cwd is None:
+        return "unknown"
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
-            cwd=cwd or None,
+            cwd=cwd,
             capture_output=True,
             check=True,
             text=True,
@@ -208,7 +249,7 @@ def notify_config(state_file: Path) -> str:
         "--script",
         str(Path(__file__).resolve()),
         "--state-file",
-        str(state_file),
+        str(state_file.expanduser().resolve()),
         "idle-hook",
     ]
     return json.dumps(hook, separators=(",", ":"))
@@ -220,7 +261,7 @@ def set_pty_size(fd: int, width: int, height: int) -> None:
     size = struct.pack("HHHH", height, width, 0, 0)
     try:
         fcntl.ioctl(fd, termios.TIOCSWINSZ, size)
-    except OSError:
+    except (OSError, ValueError):
         pass
 
 
@@ -233,7 +274,7 @@ class SessionPane(Static):
         self.stream = pyte.Stream(self.terminal_screen)
         self.has_output = False
         self.has_visible_content = False
-        self.message = f"{role.title()} not yet started."
+        self.message: str | None = f"{role.title()} not yet started."
         self.render_timer: Any = None
         super().__init__(
             self.message,
@@ -244,9 +285,7 @@ class SessionPane(Static):
 
     def feed(self, data: bytes) -> None:
         self.stream.feed(data.decode("utf-8", errors="replace"))
-        has_visible_content = any(
-            line.strip() for line in self.terminal_screen.display
-        )
+        has_visible_content = any(line.strip() for line in self.terminal_screen.display)
         if has_visible_content:
             self.has_output = True
             self.has_visible_content = True
@@ -291,7 +330,9 @@ class SessionPane(Static):
         for row_index in range(self.terminal_screen.lines):
             row = self.terminal_screen.buffer[row_index]
             run_chars: list[str] = []
-            run_style: tuple[str | None, str | None, bool, bool, bool, bool, bool, bool] | None = None
+            run_style: (
+                tuple[str | None, str | None, bool, bool, bool, bool, bool, bool] | None
+            ) = None
 
             def flush_run() -> None:
                 nonlocal run_chars, run_style
@@ -425,7 +466,7 @@ class OrcApp(App[None]):
 
     def fatal_error(self, message: str) -> None:
         self.last_status = message
-        self.exit(message)
+        self.exit()
 
     def pane(self, role: str) -> SessionPane:
         return self.query_one(f"#{role}", SessionPane)
@@ -440,11 +481,24 @@ class OrcApp(App[None]):
             self.fatal_error(f"no state for task {self.task_id}")
             return
 
+        target_value = record.get("target_directory")
+        if not isinstance(target_value, str) or not target_value:
+            self.fatal_error(
+                f"task {self.task_id} has no target directory in Orc state"
+            )
+            return
+        target_directory = Path(target_value)
+
         if role == "implementer":
             prompt = (
                 IMPLEMENTER_PROMPT
                 if not record.get("user_requests")
                 else IMPLEMENTER_ROUND_PROMPT
+            )
+            prompt += (
+                f"\n\nTarget project directory: {target_directory}\n"
+                "Work in the target project; Orc's repository contains only "
+                "the orchestrator state and UI."
             )
             prompt += "\n\n" + HANDOFF_PROMPT
             if record.get("user_requests"):
@@ -486,8 +540,9 @@ class OrcApp(App[None]):
             environment["TERM"] = "xterm-256color"
         environment["ORC_TASK_ID"] = self.task_id
         environment["ORC_ROLE"] = role
+        environment["ORC_TARGET_DIRECTORY"] = str(target_directory)
         try:
-            pid, master_fd = self.fork_codex(command, environment)
+            pid, master_fd = self.fork_codex(command, environment, target_directory)
         except OSError as error:
             self.fatal_error(f"could not launch {role}: {error}")
             return
@@ -502,13 +557,21 @@ class OrcApp(App[None]):
         self.update_layout()
         self.set_master_reader(session)
         self.resize_session(session)
-        self.update_status(f"{role.title()} active · Tab/1/2 switches focus · Ctrl-Q exits")
+        self.update_status(
+            f"{role.title()} active · Tab/1/2 switches focus · Ctrl-Q exits"
+        )
 
     @staticmethod
-    def fork_codex(command: list[str], environment: dict[str, str]) -> tuple[int, int]:
+    def fork_codex(
+        command: list[str],
+        environment: dict[str, str],
+        cwd: Path | str | None = None,
+    ) -> tuple[int, int]:
         pid, master_fd = os.forkpty()
         if pid == 0:
             try:
+                if cwd is not None:
+                    os.chdir(cwd)
                 os.execvpe(command[0], command, environment)
             except OSError as error:
                 os.write(2, f"orc: could not exec {command[0]}: {error}\n".encode())
@@ -649,7 +712,7 @@ class OrcApp(App[None]):
     def on_key(self, event: Any) -> None:
         key = event.key
         if key == "ctrl+q":
-            self.action_quit()
+            self.exit()
             event.stop()
             return
         if key in {"tab", "shift+tab"}:
@@ -712,7 +775,7 @@ class OrcApp(App[None]):
             )
             event.stop()
 
-    def action_quit(self) -> None:
+    async def action_quit(self) -> None:
         self.exit()
 
     def on_unmount(self) -> None:
@@ -742,6 +805,7 @@ def run_app(args: argparse.Namespace, task_id: str) -> None:
 
 
 def begin(args: argparse.Namespace) -> None:
+    target_directory = normalize_target_directory(args.directory)
     state = load_state(args.state_file)
     if args.task_id in state:
         raise SystemExit(f"task already exists: {args.task_id}")
@@ -751,6 +815,7 @@ def begin(args: argparse.Namespace) -> None:
         "phase": "implementer",
         "round": 0,
         "prompt": args.prompt,
+        "target_directory": str(target_directory),
         "implementer_id": None,
         "reviewer_id": None,
         "user_requests": [],
@@ -763,10 +828,22 @@ def begin(args: argparse.Namespace) -> None:
 
 
 def resume(args: argparse.Namespace) -> None:
+    target_directory = normalize_target_directory(args.directory)
     state = load_state(args.state_file)
     record = state.get(args.task_id)
     if not isinstance(record, dict):
         raise SystemExit(f"unknown task: {args.task_id}")
+
+    stored_target = record.get("target_directory")
+    if not isinstance(stored_target, str) or not stored_target:
+        raise SystemExit(
+            f"task {args.task_id} has no stored target directory; begin a new task"
+        )
+    if Path(stored_target) != target_directory:
+        raise SystemExit(
+            f"target directory does not match task {args.task_id}: "
+            f"stored {stored_target}, received {target_directory}"
+        )
 
     requests = record.get("user_requests")
     if requests is None:
@@ -803,6 +880,12 @@ def idle_hook(args: argparse.Namespace) -> None:
     record = state.get(task_id)
     if not isinstance(record, dict):
         raise SystemExit(f"idle hook found no state for task {task_id}")
+    target_value = record.get("target_directory")
+    if not isinstance(target_value, str) or not target_value:
+        raise SystemExit(
+            f"idle hook found no valid target directory for task {task_id}"
+        )
+    target_directory = normalize_target_directory(Path(target_value))
     if session_id:
         record[f"{role}_id"] = session_id
     handoff_thread_id = session_id
@@ -814,13 +897,14 @@ def idle_hook(args: argparse.Namespace) -> None:
     record["last_idle_event"] = payload
 
     handoff = {
-        "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "time": datetime.now(UTC).isoformat(timespec="seconds"),
         "local_time": datetime.now().astimezone().isoformat(timespec="seconds"),
         "task_id": task_id,
         "role": role,
         "round": record.get("round", 0),
         "thread_id": handoff_thread_id,
-        "commit": current_commit(payload.get("cwd") if isinstance(payload, dict) else None),
+        "target_directory": str(target_directory),
+        "commit": current_commit(target_directory),
         "message": assistant_message_from_payload(payload),
     }
     handoffs = record.setdefault("handoffs", [])

@@ -11,16 +11,19 @@ responsibilities are defined in `docs/roles.md`.
 
 ## TASK-003 - Run Orc against a target project directory
 
-State: NEW
+State: COMPLETED
 
 Goal:
+
 - Allow Orc to orchestrate Igor and Rufus for a project other than Orc's own
   repository by selecting and retaining an explicit target directory.
 
 Dependencies:
+
 - None.
 
 Scope:
+
 - `orc.py`: CLI parsing, task-state persistence, child launch, idle-hook
   lookup, target-directory handling, and target Git evidence.
 - `README.md`: the complete user-facing tool guide described below.
@@ -53,6 +56,7 @@ Scope:
   TUI interaction model.
 
 Acceptance criteria:
+
 - `begin DIRECTORY TASK-ID PROMPT` validates the positional directory, stores
   its normalized value, and launches both roles there.
 - `resume DIRECTORY TASK-ID PROMPT` requires a directory matching the stored
@@ -71,11 +75,9 @@ Acceptance criteria:
   CWD, resume persistence, target-repository commit capture, PTY/TUI behavior,
   role transitions, handoffs, colors, input, and resizing.
 - CI runs on Ubuntu 24.04 with Python 3.11, 3.12, 3.13, and 3.14. It runs
-  these exact checks: `uv sync --locked`; `uv run pytest -q --cov=orc
-  --cov-report=term-missing --cov-fail-under=90`; `uv run ruff check .`;
+  these exact checks: `uv sync --locked`; `uv run pytest -q --cov=orc --cov-report=term-missing --cov-fail-under=90`; `uv run ruff check .`;
   `uv run ruff format --check .`; `uv run mypy orc.py`;
-  `uv run python -m compileall -q orc.py tests`; `uv run mdformat --check
-  README.md design_docs docs`; `uv run pip-audit --strict`; and
+  `uv run python -m compileall -q orc.py tests`; `uv run mdformat --check README.md design_docs docs`; `uv run pip-audit --strict`; and
   `actionlint .github/workflows/ci.yml`.
 - CI includes the full PTY/integration suite, uploads useful failure
   diagnostics, and fails on any check failure.

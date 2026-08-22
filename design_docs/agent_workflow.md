@@ -64,6 +64,7 @@ check. The final diff comparison is against the index, so unrelated unstaged
 edits will make the recipe fail even if the formatter itself succeeds. The
 `--no-ext-diff` flag matters here because repository diff drivers can hide or
 rewrite the true raw patch, which would make the gate report the wrong state.
+
 ## Task Definition
 
 ### Task Scoping

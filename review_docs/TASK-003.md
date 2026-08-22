@@ -100,14 +100,158 @@ Evidence:
 - The plan remains a planning-only diff: no application source or tests are
   included in the shared commit.
 
+### R004
+
+Status: ADDRESSED
+
+The idle-hook path can capture Orc's own repository commit when the task record
+does not contain a valid target directory. `idle_hook()` only checks that the
+task record is a dictionary, then passes `record.get("target_directory")` to
+`current_commit()`; `current_commit()` treats `None` as the subprocess default
+working directory. That default is Orc's process directory, so a stale
+pre-TASK-003 task or malformed state can produce target Git evidence from Orc's
+repository, contrary to the target-isolation acceptance criterion.
+
+Evidence:
+
+- `orc.py:878-899` reads the record and constructs the handoff without
+  validating `target_directory` before calling `current_commit()`.
+- `orc.py:228-237` passes `cwd=cwd or None`, which makes a missing target run
+  `git rev-parse` in the Orc process directory.
+- `orc.py:482-487` rejects a missing target only during child launch; it does
+  not protect the idle-hook handoff path.
+- The test suite covers missing-target launch failure at
+  `tests/test_orc.py:552-555`, but has no missing-target idle-hook assertion.
+
+Required resolution: reject or otherwise safely handle a missing/invalid
+target before collecting handoff Git evidence, and add a regression test that
+proves the idle hook cannot inspect Orc's repository for such a record.
+
+Resolution:
+
+- `current_commit()` now returns `unknown` for a missing directory, and
+  `idle_hook()` rejects missing or invalid target state before Git lookup,
+  normalizes the target, and passes that target explicitly to the handoff.
+- A regression test verifies the malformed state is rejected without mutation.
+
+Evidence:
+
+- `orc.py:228-242` handles `None` without invoking Git in the caller's
+  directory.
+- `orc.py:883-907` validates and normalizes the idle-hook target before
+  collecting commit evidence.
+- `tests/test_orc.py:296-309` covers missing-target rejection and state
+  preservation; `tests/test_orc.py:206-212` covers the `None` commit guard.
+
+### R005
+
+Status: ADDRESSED
+
+The task commit changes `design_docs/agent_workflow.md`, but that file is not
+in TASK-003's approved Scope. The change is an extra blank line before a
+heading; it is unrelated to target-directory behavior and cannot be justified
+as a change to the named `README.md`, tests, CI, dependency, or conditional
+ignore file families. The task commit contract requires implementation content
+to remain exactly within the approved Scope.
+
+Evidence:
+
+- `git diff --name-status HEAD^ HEAD` includes
+  `M design_docs/agent_workflow.md`.
+- `git diff --no-ext-diff HEAD^ HEAD -- design_docs/agent_workflow.md` shows
+  only the added blank line at the existing document boundary.
+- TASK-003's Scope in `design_docs/implementation_plan.md:26-57` names
+  `orc.py`, `README.md`, `tests/`, the CI/dependency files, and conditional
+  `.gitignore` changes, but not `design_docs/agent_workflow.md`.
+
+Required resolution: remove the out-of-scope change from the task commit, or
+have the human operator explicitly revise the task Scope before the commit is
+accepted.
+
+Resolution:
+
+- The task retains only the single formatting change required by the exact
+  documentation gate. The operator explicitly directed this required,
+  formatting-only change while resolving R007.
+
+Evidence:
+
+- `git diff --no-ext-diff HEAD^ HEAD -- design_docs/agent_workflow.md` shows
+  only the required blank line before the heading.
+- No other workflow-document changes are present in the task diff.
+
+### R006
+
+Status: ADDRESSED
+
+The shared task commit message does not satisfy the commit contract's 60-column
+body-line limit. The violating lines are in Igor's `Implemented:` section,
+which Rufus must preserve while amending the review section.
+
+Evidence:
+
+- `git show -s --format=%B HEAD | awk 'length($0) > 60 {print NR ":" length($0) ":" $0}'`
+  reports lines 5 and 7 in the Implemented section.
+- The commit contract in `design_docs/agent_workflow.md` requires all body
+  lines to be at or below 60 characters.
+
+Required resolution: Igor should rewrap the Implemented section and Rufus's
+review section should remain within the 60-column limit on the next amendment.
+
+Resolution:
+
+- Igor rewrapped the shared commit message while preserving the required
+  Implemented content, and the reviewer section also stays within the limit.
+
+Evidence:
+
+- The 60-column audit reports no lines over the limit for the current commit
+  message.
+
+### R007
+
+Status: ADDRESSED
+
+The exact documentation gate required by TASK-003 still fails after R005's
+out-of-scope file removal. The baseline `design_docs/agent_workflow.md` is not
+mdformat-normalized, so a clean checkout of this task cannot pass the required
+`uv run mdformat --check README.md design_docs docs` command.
+
+Evidence:
+
+- `uv run mdformat --check README.md design_docs docs` fails with
+  `File "/workspace/design_docs/agent_workflow.md" is not formatted.`
+- `design_docs/agent_workflow.md` is unchanged from the planning baseline, so
+  removing the task's formatting change exposes the pre-existing gate failure.
+- TASK-003 acceptance criteria require this exact command to pass.
+
+Resolution:
+
+- Igor retained only the required formatting change in
+  `design_docs/agent_workflow.md`, as explicitly directed by the operator.
+
+Evidence:
+
+- `uv run mdformat --check README.md design_docs docs`: PASS.
+- The workflow-document diff contains only the one mdformat-required blank
+  line; no unrelated workflow guidance was changed.
+
 ## Verification
 
+- `uv sync --locked`: PASS.
+- `uv run pytest -q --cov=orc --cov-report=term-missing --cov-fail-under=90`: PASS, 36 tests and 97.51% coverage.
+- `uv run ruff check .`: PASS.
+- `uv run ruff format --check .`: PASS.
+- `uv run mypy orc.py`: PASS.
+- `uv run python -m compileall -q orc.py tests`: PASS.
+- `uv run mdformat --check README.md design_docs docs`: PASS.
+- `uv run pip-audit --strict`: PASS.
+- `actionlint .github/workflows/ci.yml`: PASS using the pinned v1.7.12
+  binary downloaded by the workflow.
 - `git diff --no-ext-diff --check HEAD^ HEAD`: PASS.
-- Commit subject and body lines are at or below 60 characters: PASS.
-- The plan keeps TASK-003 in the valid `NEW` state: PASS.
-- No product-runtime gates were applicable because this planning diff changes
-  no application source or tests.
+- The commit contains one task commit above the planning baseline and the
+  worktree is clean after the review metadata update.
 
 ## Final decision
 
-Status: PLANNING_APPROVED
+Status: COMPLETED

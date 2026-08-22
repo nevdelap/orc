@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test / Python ${{ matrix.python-version }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked
+      - run: uv run pytest -q --cov=orc --cov-report=term-missing --cov-fail-under=90
+      - name: Upload test diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-diagnostics-${{ matrix.python-version }}
+          path: |
+            .pytest_cache
+            /tmp/orc-test-*
+          if-no-files-found: ignore
+
+  quality:
+    name: Quality
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy orc.py
+      - run: uv run python -m compileall -q orc.py tests
+
+  integration:
+    name: Integration and PTY
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked
+      - run: uv run pytest -q -m integration tests
+      - name: Upload integration diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-diagnostics
+          path: |
+            .pytest_cache
+            /tmp/orc-test-*
+          if-no-files-found: ignore
+
+  documentation:
+    name: Documentation
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked
+      - run: uv run mdformat --check README.md design_docs docs
+
+  dependency:
+    name: Dependency audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked
+      - run: uv run pip-audit --strict
+
+  security:
+    name: Workflow security
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install actionlint
+        run: |
+          mkdir -p "$RUNNER_TEMP/actionlint"
+          curl -fsSL https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
+            -o "$RUNNER_TEMP/actionlint/actionlint.tgz"
+          tar -xzf "$RUNNER_TEMP/actionlint/actionlint.tgz" \
+            -C "$RUNNER_TEMP/actionlint"
+          echo "$RUNNER_TEMP/actionlint" >> "$GITHUB_PATH"
+      - run: actionlint .github/workflows/ci.yml
