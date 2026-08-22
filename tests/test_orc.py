@@ -191,6 +191,48 @@ def test_resume_records_request_after_matching_target(
     assert record["phase"] == "implementer"
 
 
+def test_resume_restarts_reviewer_after_child_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    state_file = tmp_path / "state.json"
+    state = {
+        "TASK-003": {
+            "status": "stopped",
+            "phase": "stopped",
+            "round": 2,
+            "prompt": "first",
+            "target_directory": str(target.resolve()),
+            "user_requests": ["continue to completion"],
+            "reviewer_id": "missing-rollout-thread",
+            "stop_reason": "child_failure",
+            "child_failure": {"role": "reviewer", "exit_status": 256},
+        }
+    }
+    orc.save_state(state_file, state)
+    monkeypatch.setattr(orc, "run_app", lambda *_: None)
+
+    orc.resume(cli_args(state_file, target))
+
+    record = orc.load_state(state_file)["TASK-003"]
+    assert record["status"] == "active"
+    assert record["phase"] == "reviewer"
+    assert record["round"] == 2
+    assert record["reviewer_id"] is None
+    assert record["user_requests"] == [
+        "continue to completion",
+        "implement the task",
+    ]
+
+
+@pytest.mark.parametrize("phase", ["implementer", "reviewer", "stopped", None])
+def test_startup_role_follows_persisted_phase(phase: str | None) -> None:
+    record = {"phase": phase}
+    expected = phase if phase in {"implementer", "reviewer"} else "implementer"
+    assert orc.OrcApp.initial_role(record) == expected
+
+
 def test_resume_rejects_missing_stored_target_without_mutation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1216,3 +1258,466 @@ def test_ctrl_q_action_quit_success_run_and_main_branches(
     monkeypatch.setattr(orc, "resume", lambda _args: calls.append("resume"))
     orc.main()
     assert calls == ["begin", "resume"]
+
+
+def hook_args(state_file: Path, payload: dict[str, object]) -> argparse.Namespace:
+    return argparse.Namespace(state_file=state_file, payload=json.dumps(payload))
+
+
+def test_auto_cli_bounds_and_invalid_combinations(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    auto = orc.parse_args(
+        [
+            "begin",
+            str(target),
+            "TASK-005",
+            "implement",
+            "--auto",
+            "--max-rounds",
+            "3",
+            "--deadline-minutes",
+            "7",
+        ]
+    )
+    assert auto.auto is True
+    assert auto.max_rounds == 3
+    assert auto.deadline_minutes == 7
+    with pytest.raises(SystemExit):
+        orc.parse_args(
+            ["begin", str(target), "TASK-005", "implement", "--max-rounds", "2"]
+        )
+    with pytest.raises(SystemExit):
+        orc.parse_args(
+            [
+                "begin",
+                str(target),
+                "TASK-005",
+                "implement",
+                "--auto",
+                "--max-rounds",
+                "6",
+            ]
+        )
+    with pytest.raises(SystemExit):
+        orc.parse_args(
+            [
+                "begin",
+                str(target),
+                "TASK-005",
+                "implement",
+                "--auto",
+                "--deadline-minutes",
+                "1441",
+            ]
+        )
+
+
+def test_begin_persists_bounded_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    state_file = tmp_path / "state.json"
+    args = orc.parse_args(
+        [
+            "--state-file",
+            str(state_file),
+            "begin",
+            str(target),
+            "TASK-005",
+            "implement",
+            "--auto",
+            "--max-rounds",
+            "2",
+            "--deadline-minutes",
+            "3",
+        ]
+    )
+    monkeypatch.setattr(orc, "run_app", lambda *_: None)
+    orc.begin(args)
+    record = orc.load_state(state_file)["TASK-005"]
+    assert record["automatic_rounds"] is True
+    assert record["max_rounds"] == 2
+    assert record["deadline_seconds"] == 180
+    assert record["cycle_started_at"]
+    assert record["deadline_at"]
+    assert record["stop_reason"] is None
+
+
+@pytest.mark.parametrize("role", ["implementer", "reviewer"])
+def test_unable_to_proceed_persists_blocker_and_does_not_transition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, role: str
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    state_file = tmp_path / "state.json"
+    record = {
+        "status": "active",
+        "phase": role,
+        "round": 1,
+        "target_directory": str(target),
+        "handoffs": [],
+        "processed_idle_events": [],
+        f"{role}_id": f"{role}-thread",
+    }
+    orc.save_state(state_file, {"TASK-005": record})
+    monkeypatch.setenv("ORC_TASK_ID", "TASK-005")
+    monkeypatch.setenv("ORC_ROLE", role)
+    payload = {
+        "session_id": f"{role}-thread",
+        "status": orc.UNABLE_TO_PROCEED,
+        "reason": "Need a human choice about the release target.",
+        "last-assistant-message": "Status: UNABLE_TO_PROCEED",
+    }
+    orc.idle_hook(hook_args(state_file, payload))
+    saved = orc.load_state(state_file)["TASK-005"]
+    assert saved["status"] == "blocked"
+    assert saved["phase"] == "blocked"
+    assert saved["stop_reason"] == "clarification"
+    assert saved["blocker_role"] == role
+    assert saved["blocker_reason"] == "Need a human choice about the release target."
+    assert len(saved["handoffs"]) == 1
+
+    before = saved.copy()
+    with pytest.raises(SystemExit, match="non-empty"):
+        args = orc.parse_args(
+            ["--state-file", str(state_file), "resume", str(target), "TASK-005", " "]
+        )
+        orc.resume(args)
+    assert orc.load_state(state_file)["TASK-005"] == before
+
+
+def test_resume_delivers_exact_clarification_without_resetting_limits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    state_file = tmp_path / "state.json"
+    record = {
+        "status": "blocked",
+        "phase": "blocked",
+        "round": 2,
+        "target_directory": str(target.resolve()),
+        "user_requests": [],
+        "automatic_rounds": True,
+        "max_rounds": 4,
+        "deadline_seconds": 300,
+        "cycle_started_at": "2026-08-23T00:00:00+00:00",
+        "deadline_at": "2099-08-23T00:00:00+00:00",
+        "stop_reason": "clarification",
+    }
+    orc.save_state(state_file, {"TASK-005": record})
+    args = orc.parse_args(
+        [
+            "--state-file",
+            str(state_file),
+            "resume",
+            str(target),
+            "TASK-005",
+            "Choose option B exactly",
+        ]
+    )
+    monkeypatch.setattr(orc, "run_app", lambda *_: None)
+    orc.resume(args)
+    saved = orc.load_state(state_file)["TASK-005"]
+    assert saved["user_requests"] == ["Choose option B exactly"]
+    assert saved["max_rounds"] == 4
+    assert saved["deadline_seconds"] == 300
+    assert saved["round"] == 2
+    assert saved["status"] == "active"
+    assert saved["phase"] == "implementer"
+
+
+def test_auto_cycles_stop_at_completion_and_ignore_duplicate_idle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    state_file = tmp_path / "state.json"
+    record = {
+        "status": "active",
+        "phase": "reviewer",
+        "round": 1,
+        "target_directory": str(target),
+        "automatic_rounds": True,
+        "max_rounds": 5,
+        "deadline_at": "2099-08-23T00:00:00+00:00",
+        "handoffs": [],
+        "reviewer_id": "rufus",
+    }
+    orc.save_state(state_file, {"TASK-005": record})
+    monkeypatch.setenv("ORC_TASK_ID", "TASK-005")
+    monkeypatch.setenv("ORC_ROLE", "reviewer")
+    payload = {
+        "session_id": "rufus",
+        "status": "COMPLETE",
+        "last-assistant-message": "TASK COMPLETE",
+    }
+    args = hook_args(state_file, payload)
+    orc.idle_hook(args)
+    orc.idle_hook(args)
+    saved = orc.load_state(state_file)["TASK-005"]
+    assert saved["stop_reason"] == "completion"
+    assert saved["reviewer_reported_complete"] is True
+    assert saved["phase"] == "complete"
+    assert len(saved["handoffs"]) == 1
+
+
+def test_auto_cycle_limit_and_deadline_are_distinct(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    state_file = tmp_path / "state.json"
+    base = {
+        "status": "active",
+        "phase": "reviewer",
+        "round": 2,
+        "target_directory": str(target),
+        "automatic_rounds": True,
+        "max_rounds": 2,
+        "deadline_at": "2099-08-23T00:00:00+00:00",
+        "handoffs": [],
+        "reviewer_id": "rufus",
+    }
+    orc.save_state(state_file, {"TASK-005": base})
+    monkeypatch.setenv("ORC_TASK_ID", "TASK-005")
+    monkeypatch.setenv("ORC_ROLE", "reviewer")
+    payload = {"session_id": "rufus", "last-assistant-message": "not complete"}
+    orc.idle_hook(hook_args(state_file, payload))
+    saved = orc.load_state(state_file)["TASK-005"]
+    assert saved["stop_reason"] == "max_rounds"
+
+    base["phase"] = "implementer"
+    base["status"] = "active"
+    base["deadline_at"] = "2000-01-01T00:00:00+00:00"
+    base["processed_idle_events"] = []
+    orc.save_state(state_file, {"TASK-005": base})
+    monkeypatch.setenv("ORC_ROLE", "implementer")
+    orc.idle_hook(
+        hook_args(
+            state_file,
+            {"session_id": "igor", "last-assistant-message": "late"},
+        )
+    )
+    saved = orc.load_state(state_file)["TASK-005"]
+    assert saved["stop_reason"] == "deadline"
+    assert saved["status"] == "stopped"
+
+
+def test_malformed_handoff_is_rejected_without_state_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    state_file = tmp_path / "state.json"
+    record = {
+        "status": "active",
+        "phase": "implementer",
+        "target_directory": str(target),
+        "handoffs": [],
+    }
+    orc.save_state(state_file, {"TASK-005": record})
+    monkeypatch.setenv("ORC_TASK_ID", "TASK-005")
+    monkeypatch.setenv("ORC_ROLE", "implementer")
+    with pytest.raises(SystemExit, match="requires a concise reason"):
+        orc.idle_hook(
+            hook_args(
+                state_file,
+                {"status": orc.UNABLE_TO_PROCEED, "session_id": "igor"},
+            )
+        )
+    assert orc.load_state(state_file)["TASK-005"] == record
+
+
+def test_auto_launch_resumes_without_human_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    record: dict[str, object] = {
+        "status": "active",
+        "phase": "implementer",
+        "round": 2,
+        "target_directory": str(target),
+        "prompt": "initial",
+        "user_requests": [],
+        "automatic_rounds": True,
+        "implementer_id": "igor-thread",
+        "reviewer_id": None,
+    }
+    app, _state_file, _panes = app_stub(tmp_path, record)
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        app,
+        "fork_codex",
+        lambda command, _environment, _cwd=None: (
+            commands.append(command) or (123, os.open("/dev/null", os.O_RDWR))
+        ),
+    )
+    monkeypatch.setattr(app, "set_master_reader", lambda _session: None)
+    monkeypatch.setattr(app, "resize_session", lambda _session: None)
+    monkeypatch.setattr(app, "update_layout", lambda: None)
+    monkeypatch.setattr(app, "update_status", lambda _message: None)
+    app.launch_role("implementer")
+    assert commands[0][3:5] == ["resume", "igor-thread"]
+    assert "Continue implementing the task" in commands[0][-1]
+    assert "User request:" not in commands[0][-1]
+
+
+def test_stale_same_role_session_or_generation_is_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    state_file = tmp_path / "state.json"
+    record = {
+        "status": "active",
+        "phase": "implementer",
+        "round": 2,
+        "target_directory": str(target),
+        "implementer_id": "current",
+        "role_generations": {"implementer": 4},
+        "handoffs": [],
+        "processed_idle_events": [],
+    }
+    orc.save_state(state_file, {"TASK-005": record})
+    monkeypatch.setenv("ORC_TASK_ID", "TASK-005")
+    monkeypatch.setenv("ORC_ROLE", "implementer")
+    orc.idle_hook(
+        hook_args(
+            state_file,
+            {
+                "session_id": "old",
+                "round": 2,
+                "generation": 3,
+                "last-assistant-message": "stale",
+            },
+        )
+    )
+    saved = orc.load_state(state_file)["TASK-005"]
+    assert saved == record
+
+
+def test_ordinary_handoff_status_is_metadata_not_an_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    state_file = tmp_path / "state.json"
+    orc.save_state(
+        state_file,
+        {
+            "TASK-005": {
+                "status": "active",
+                "phase": "implementer",
+                "round": 1,
+                "target_directory": str(target),
+                "handoffs": [],
+            }
+        },
+    )
+    monkeypatch.setenv("ORC_TASK_ID", "TASK-005")
+    monkeypatch.setenv("ORC_ROLE", "implementer")
+    orc.idle_hook(
+        hook_args(
+            state_file,
+            {
+                "session_id": "igor",
+                "status": "IMPLEMENTED",
+                "last-assistant-message": "Status: IMPLEMENTED",
+            },
+        )
+    )
+    saved = orc.load_state(state_file)["TASK-005"]
+    assert saved["last_handoff"]["status"] == "IMPLEMENTED"
+    assert saved["phase"] == "reviewer"
+
+
+def test_review_findings_do_not_count_prompt_completion_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    state_file = tmp_path / "state.json"
+    orc.save_state(
+        state_file,
+        {
+            "TASK-005": {
+                "status": "active",
+                "phase": "reviewer",
+                "round": 2,
+                "target_directory": str(target),
+                "handoffs": [],
+                "reviewer_id": "rufus",
+            }
+        },
+    )
+    monkeypatch.setenv("ORC_TASK_ID", "TASK-005")
+    monkeypatch.setenv("ORC_ROLE", "reviewer")
+    payload = {
+        "session_id": "rufus",
+        "status": "REVIEWED_FOUND_ISSUES",
+        "input-messages": ["or report exactly TASK COMPLETE when ready"],
+        "last-assistant-message": (
+            "Status: REVIEWED_FOUND_ISSUES\n\nRequested action: fix findings."
+        ),
+    }
+
+    orc.idle_hook(hook_args(state_file, payload))
+
+    saved = orc.load_state(state_file)["TASK-005"]
+    assert saved["reviewer_reported_complete"] is False
+    assert saved["status"] == "paused"
+    assert saved["phase"] == "reviewer"
+    assert saved["stop_reason"] == "manual_pause"
+
+
+def test_explicit_default_limits_require_auto(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    for option, value in (("--max-rounds", "5"), ("--deadline-minutes", "60")):
+        with pytest.raises(SystemExit):
+            orc.parse_args(
+                [
+                    "begin",
+                    str(target),
+                    "TASK-005",
+                    "implement",
+                    option,
+                    value,
+                ]
+            )
+
+
+def test_resume_rejects_completion_as_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    state_file = tmp_path / "state.json"
+    state = {
+        "TASK-005": {
+            "status": "paused",
+            "phase": "complete",
+            "stop_reason": "completion",
+            "target_directory": str(target.resolve()),
+            "user_requests": [],
+        }
+    }
+    orc.save_state(state_file, state)
+    args = orc.parse_args(
+        [
+            "--state-file",
+            str(state_file),
+            "resume",
+            str(target),
+            "TASK-005",
+            "continue",
+        ]
+    )
+    monkeypatch.setattr(orc, "run_app", lambda *_: pytest.fail("must not launch"))
+    with pytest.raises(SystemExit, match="already complete"):
+        orc.resume(args)
+    assert orc.load_state(state_file) == state

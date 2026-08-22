@@ -17,13 +17,14 @@ import errno
 import fcntl
 import json
 import os
+import re
 import signal
 import struct
 import subprocess
 import sys
 import termios
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -67,6 +68,17 @@ hash.
 
 ORC_VERSION = "orc v0.0.1"
 FOCUS_STATUS = "Click a pane to focus · Tab switches panes · Ctrl-Q exits"
+UNABLE_TO_PROCEED = "UNABLE_TO_PROCEED"
+DEFAULT_MAX_ROUNDS = 5
+DEFAULT_DEADLINE_SECONDS = 60 * 60
+VALID_STOP_REASONS = {
+    "completion",
+    "clarification",
+    "deadline",
+    "max_rounds",
+    "child_failure",
+    "manual_pause",
+}
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -100,6 +112,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     begin.add_argument("task_id", help="Task identifier, such as TASK-001.")
     begin.add_argument("prompt", help="Initial request for Igor.")
+    begin.add_argument(
+        "--auto",
+        action="store_true",
+        help="Run bounded Igor/Rufus cycles automatically.",
+    )
+    begin.add_argument(
+        "--max-rounds",
+        type=int,
+        default=None,
+        help="Automatic cycle limit, from 1 through 5 (default: 5).",
+    )
+    begin.add_argument(
+        "--deadline-minutes",
+        type=int,
+        default=None,
+        help="Automatic wall-clock limit, from 1 through 1440 minutes (default: 60).",
+    )
 
     resume = commands.add_parser(
         "resume", help="Resume a task in its stored DIRECTORY."
@@ -120,6 +149,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     hook.add_argument("payload", nargs="?")
 
     args = parser.parse_args(argv)
+    if args.command == "begin":
+        max_rounds = DEFAULT_MAX_ROUNDS if args.max_rounds is None else args.max_rounds
+        deadline_minutes = (
+            60 if args.deadline_minutes is None else args.deadline_minutes
+        )
+        if not args.auto and (
+            args.max_rounds is not None or args.deadline_minutes is not None
+        ):
+            parser.error("--max-rounds and --deadline-minutes require --auto")
+        if not 1 <= max_rounds <= DEFAULT_MAX_ROUNDS:
+            parser.error("--max-rounds must be an integer from 1 through 5")
+        if not 1 <= deadline_minutes <= 1440:
+            parser.error("--deadline-minutes must be an integer from 1 through 1440")
+        args.max_rounds = max_rounds
+        args.deadline_minutes = deadline_minutes
     # The child PTY changes its working directory to the target project.  An
     # absolute state path keeps the idle hook attached to Orc's state file
     # when the caller supplied a relative --state-file.
@@ -164,6 +208,127 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
 
 def session_name(task_id: str, role: str) -> str:
     return f"{task_id}-{role}"
+
+
+def utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def iso_now() -> str:
+    return utc_now().isoformat(timespec="seconds")
+
+
+def parse_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def payload_field(value: Any, key: str) -> Any:
+    if isinstance(value, dict):
+        if key in value:
+            return value[key]
+        for nested in value.values():
+            found = payload_field(nested, key)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for nested in value:
+            found = payload_field(nested, key)
+            if found is not None:
+                return found
+    return None
+
+
+def message_field(message: str | None, key: str) -> str | None:
+    if not message:
+        return None
+    match = re.search(
+        rf"^\s*{re.escape(key)}\s*:\s*(.+?)\s*$",
+        message,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    return match.group(1).strip() if match else None
+
+
+def handoff_status(payload: Any) -> str | None:
+    value = payload_field(payload, "status")
+    message = assistant_message_from_payload(payload)
+    if value is None:
+        value = message_field(message, "status")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip().upper().replace("-", "_")
+    if normalized == UNABLE_TO_PROCEED:
+        return UNABLE_TO_PROCEED
+    if normalized in {"COMPLETE", "COMPLETED", "TASK_COMPLETE", "TASK COMPLETE"}:
+        return "COMPLETE"
+    # Only the blocker status has special control semantics. Other non-empty
+    # statuses are ordinary handoff metadata and must not stop the workflow.
+    return normalized
+
+
+def handoff_reason(payload: Any) -> str | None:
+    message = assistant_message_from_payload(payload)
+    for key in ("reason", "blocker_reason", "blockers", "blocker"):
+        value = payload_field(payload, key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        value = message_field(message, key)
+        if value:
+            return value
+    return None
+
+
+def handoff_event_key(task_id: str, role: str, payload: Any) -> str:
+    try:
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        encoded = repr(payload)
+    return f"{task_id}:{role}:{encoded}"
+
+
+def handoff_details(payload: Any) -> dict[str, Any]:
+    message = assistant_message_from_payload(payload)
+    details: dict[str, Any] = {}
+    for key in ("summary", "files", "verification", "blockers", "requested_action"):
+        value = payload_field(payload, key)
+        if value is None:
+            value = message_field(message, key)
+        if value is not None:
+            details[key] = value
+    return details
+
+
+def deadline_expired(record: dict[str, Any], now: datetime | None = None) -> bool:
+    if not record.get("automatic_rounds"):
+        return False
+    deadline = parse_timestamp(record.get("deadline_at"))
+    return deadline is not None and (now or utc_now()) >= deadline
+
+
+def set_stop_reason(
+    record: dict[str, Any], reason: str, *, completed: bool = False
+) -> None:
+    if reason not in VALID_STOP_REASONS:
+        raise ValueError(f"unknown Orc stop reason: {reason}")
+    record["status"] = (
+        "completed"
+        if completed
+        else ("blocked" if reason == "clarification" else "stopped")
+    )
+    record["phase"] = (
+        "complete"
+        if completed
+        else ("blocked" if reason == "clarification" else "stopped")
+    )
+    record["stop_reason"] = reason
 
 
 def reviewer_prompt(record: dict[str, Any]) -> str:
@@ -471,6 +636,11 @@ class OrcApp(App[None]):
             id="status",
         )
 
+    @staticmethod
+    def initial_role(record: dict[str, Any]) -> str:
+        phase = record.get("phase")
+        return phase if phase in {"implementer", "reviewer"} else "implementer"
+
     def on_mount(self) -> None:
         if os.name != "posix":
             self.fatal_error("Orc's interactive PTY UI currently requires POSIX.")
@@ -479,7 +649,12 @@ class OrcApp(App[None]):
         self.set_interval(0.1, self.poll_state)
         self.set_interval(0.1, self.poll_children)
         self.update_layout()
-        self.call_after_refresh(self.launch_role, "implementer")
+        state = load_state(self.args.state_file)
+        record = state.get(self.task_id)
+        initial_role = (
+            self.initial_role(record) if isinstance(record, dict) else "implementer"
+        )
+        self.call_after_refresh(self.launch_role, initial_role)
 
     def fatal_error(self, message: str) -> None:
         self.last_status = message
@@ -489,9 +664,9 @@ class OrcApp(App[None]):
         return self.query_one(f"#{role}", SessionPane)
 
     def launch_role(self, role: str) -> None:
-        if role in self.started_roles:
+        existing = self.sessions.get(role)
+        if role in self.started_roles and existing is not None and not existing.exited:
             return
-
         state = load_state(self.args.state_file)
         record = state.get(self.task_id)
         if not isinstance(record, dict):
@@ -505,12 +680,36 @@ class OrcApp(App[None]):
             )
             return
         target_directory = Path(target_value)
+        if record.get("status") in {"blocked", "stopped", "completed"}:
+            return
+        if deadline_expired(record):
+            set_stop_reason(record, "deadline")
+            save_state(self.args.state_file, state)
+            self.update_status("Stopped: automatic deadline expired")
+            self.exit()
+            return
+
+        requests = record.get("user_requests", [])
+        has_request = isinstance(requests, list) and bool(requests)
+        thread_id = record.get(f"{role}_id")
+        auto_continuation = bool(record.get("automatic_rounds")) and bool(
+            isinstance(thread_id, str) and thread_id
+        )
+        if role == "implementer" and record.get("round", 0) == 0:
+            record["round"] = 1
+        generations = record.get("role_generations", {})
+        if not isinstance(generations, dict):
+            generations = {}
+        generation = int(generations.get(role, 0)) + 1
+        generations[role] = generation
+        record["role_generations"] = generations
+        save_state(self.args.state_file, state)
 
         if role == "implementer":
             prompt = (
-                IMPLEMENTER_PROMPT
-                if not record.get("user_requests")
-                else IMPLEMENTER_ROUND_PROMPT
+                IMPLEMENTER_ROUND_PROMPT
+                if has_request or auto_continuation
+                else IMPLEMENTER_PROMPT
             )
             prompt += (
                 f"\n\nTarget project directory: {target_directory}\n"
@@ -518,10 +717,10 @@ class OrcApp(App[None]):
                 "the orchestrator state and UI."
             )
             prompt += "\n\n" + HANDOFF_PROMPT
-            if record.get("user_requests"):
+            if has_request:
                 prompt += "\n\nUser request for this context:\n"
-                prompt += str(record["user_requests"][-1])
-            else:
+                prompt += str(requests[-1])
+            elif not auto_continuation:
                 prompt += "\n\nUser request:\n" + str(record["prompt"])
         else:
             prompt = reviewer_prompt(record) + "\n\n" + HANDOFF_PROMPT
@@ -536,10 +735,14 @@ class OrcApp(App[None]):
                     f"notify={notify_config(self.args.state_file)}",
                 ]
             )
-        thread_id = record.get(f"{role}_id")
         if isinstance(thread_id, str) and thread_id:
-            requests = record.get("user_requests", [])
-            if not isinstance(requests, list) or not requests:
+            if not isinstance(requests, list):
+                self.fatal_error(
+                    f"cannot resume {role}: invalid user requests for task "
+                    f"{self.task_id}"
+                )
+                return
+            if not requests and not record.get("automatic_rounds"):
                 self.fatal_error(
                     f"cannot resume {role}: no user request recorded for task "
                     f"{self.task_id}"
@@ -562,6 +765,8 @@ class OrcApp(App[None]):
             environment["TERM"] = "xterm-256color"
         environment["ORC_TASK_ID"] = self.task_id
         environment["ORC_ROLE"] = role
+        environment["ORC_ROUND"] = str(record.get("round", 0))
+        environment["ORC_ROLE_GENERATION"] = str(generation)
         environment["ORC_TARGET_DIRECTORY"] = str(target_directory)
         try:
             pid, master_fd = self.fork_codex(command, environment, target_directory)
@@ -729,13 +934,22 @@ class OrcApp(App[None]):
         if not isinstance(record, dict):
             return
 
-        if record.get("status") == "paused":
-            self.update_status("One implementer/reviewer round complete")
+        if deadline_expired(record):
+            set_stop_reason(record, "deadline")
+            save_state(self.args.state_file, state)
+            self.update_status("Stopped: automatic deadline expired")
             self.exit()
             return
 
-        if record.get("phase") == "reviewer":
-            self.launch_role("reviewer")
+        status = record.get("status")
+        if status in {"paused", "blocked", "stopped", "completed"}:
+            reason = record.get("stop_reason", "manual_pause")
+            self.update_status(f"Stopped: {reason}")
+            self.exit()
+            return
+
+        if record.get("phase") in {"reviewer", "implementer"}:
+            self.launch_role(str(record["phase"]))
 
     def poll_children(self) -> None:
         for session in self.sessions.values():
@@ -754,6 +968,9 @@ class OrcApp(App[None]):
                     pass
                 state = load_state(self.args.state_file)
                 record = state.get(self.task_id)
+                expected_handoff = (
+                    isinstance(record, dict) and record.get("phase") != session.role
+                )
                 if (
                     session.role == "implementer"
                     and isinstance(record, dict)
@@ -763,15 +980,31 @@ class OrcApp(App[None]):
                 elif (
                     session.role == "reviewer"
                     and isinstance(record, dict)
-                    and record.get("status") == "paused"
+                    and (
+                        record.get("phase") in {"implementer", "complete"}
+                        or record.get("status") == "paused"
+                    )
                 ):
                     session.pane.show_message("Rufus idle · review round complete")
-                if session.role == self.active_role:
-                    if not isinstance(record, dict) or record.get("status") != "paused":
-                        self.update_status(
-                            f"{session.role.title()} ended; use resume to continue"
-                        )
-                        self.exit()
+                if (
+                    isinstance(record, dict)
+                    and record.get("status") == "active"
+                    and record.get("phase") == session.role
+                ):
+                    record["child_failure"] = {
+                        "role": session.role,
+                        "exit_status": _status,
+                        "time": iso_now(),
+                    }
+                    set_stop_reason(record, "child_failure")
+                    save_state(self.args.state_file, state)
+                    self.update_status(f"Stopped: {session.role.title()} child failure")
+                    self.exit()
+                elif session.role == self.active_role and not expected_handoff:
+                    self.update_status(
+                        f"{session.role.title()} ended; use resume to continue"
+                    )
+                    self.exit()
 
     def on_key(self, event: Any) -> None:
         key = event.key
@@ -873,6 +1106,10 @@ def begin(args: argparse.Namespace) -> None:
     if args.task_id in state:
         raise SystemExit(f"task already exists: {args.task_id}")
 
+    automatic = bool(getattr(args, "auto", False))
+    max_rounds = int(getattr(args, "max_rounds", DEFAULT_MAX_ROUNDS))
+    deadline_seconds = int(getattr(args, "deadline_minutes", 60) * 60)
+    started = utc_now()
     state[args.task_id] = {
         "status": "active",
         "phase": "implementer",
@@ -885,6 +1122,18 @@ def begin(args: argparse.Namespace) -> None:
         "last_reviewer_event": None,
         "reviewer_reported_complete": False,
         "handoffs": [],
+        "processed_idle_events": [],
+        "automatic_rounds": automatic,
+        "max_rounds": max_rounds,
+        "deadline_seconds": deadline_seconds,
+        "cycle_started_at": started.isoformat(timespec="seconds"),
+        "deadline_at": (started + timedelta(seconds=deadline_seconds)).isoformat(
+            timespec="seconds"
+        ),
+        "last_role": None,
+        "last_commit": None,
+        "role_generations": {"implementer": 0, "reviewer": 0},
+        "stop_reason": None,
     }
     save_state(args.state_file, state)
     run_app(args, args.task_id)
@@ -907,18 +1156,57 @@ def resume(args: argparse.Namespace) -> None:
             f"target directory does not match task {args.task_id}: "
             f"stored {stored_target}, received {target_directory}"
         )
+    if not isinstance(args.prompt, str) or not args.prompt.strip():
+        raise SystemExit("resume requires a non-empty clarification or request")
+    if record.get("status") == "active":
+        raise SystemExit(f"task {args.task_id} is already active")
+    if record.get("status") == "completed":
+        raise SystemExit(f"task {args.task_id} is already complete")
+    if record.get("phase") == "complete" or record.get("stop_reason") == "completion":
+        raise SystemExit(f"task {args.task_id} is already complete")
+    if record.get("stop_reason") == "deadline":
+        raise SystemExit(f"task {args.task_id} deadline has expired")
+    if record.get("stop_reason") == "max_rounds":
+        raise SystemExit(f"task {args.task_id} reached its maximum rounds")
 
     requests = record.get("user_requests")
     if requests is None:
-        requests = record.pop("user_feedback", [])
-        record["user_requests"] = requests
+        requests = record.get("user_feedback", [])
     if not isinstance(requests, list):
         raise SystemExit(f"Orc state for {args.task_id} has invalid user_requests")
+    if deadline_expired(record):
+        raise SystemExit(f"task {args.task_id} deadline has expired")
+
+    child_failure = record.get("child_failure")
+    reviewer_rollout_failed = (
+        record.get("stop_reason") == "child_failure"
+        and isinstance(child_failure, dict)
+        and child_failure.get("role") == "reviewer"
+    )
+
+    # All validation is complete before changing the loaded record.
+    requests = list(requests)
     requests.append(args.prompt)
+    record["user_requests"] = requests
     record["last_user_request"] = args.prompt
+    previous_status = record.get("status")
     record["status"] = "active"
-    record["phase"] = "implementer"
-    record["round"] = int(record.get("round", 0)) + 1
+    if reviewer_rollout_failed:
+        # A missing Codex rollout cannot be resumed.  Preserve Igor's commit
+        # and review round, but force a new Rufus session on the next launch.
+        record["reviewer_id"] = None
+        record["reviewer_reported_complete"] = False
+        record["phase"] = "reviewer"
+    else:
+        record["phase"] = "implementer"
+    if previous_status == "paused":
+        record["round"] = int(record.get("round", 0)) + 1
+    record["stop_reason"] = None
+    record["clarification_received"] = (
+        args.prompt
+        if previous_status == "blocked"
+        else record.get("clarification_received")
+    )
     save_state(args.state_file, state)
     run_app(args, args.task_id)
 
@@ -943,6 +1231,58 @@ def idle_hook(args: argparse.Namespace) -> None:
     record = state.get(task_id)
     if not isinstance(record, dict):
         raise SystemExit(f"idle hook found no state for task {task_id}")
+
+    status = handoff_status(payload)
+    reason = handoff_reason(payload)
+    if status == UNABLE_TO_PROCEED and not reason:
+        raise SystemExit("UNABLE_TO_PROCEED handoff requires a concise reason")
+
+    event_key = handoff_event_key(task_id, role, payload)
+    processed = record.get("processed_idle_events", [])
+    if not isinstance(processed, list):
+        processed = []
+    if event_key in processed:
+        return
+    if record.get("status") in {"blocked", "stopped", "completed"}:
+        return
+    current_phase = record.get("phase")
+    if current_phase in {"implementer", "reviewer"} and current_phase != role:
+        return
+    if record.get("status") == "paused" and role == "reviewer":
+        return
+
+    expected_session = record.get(f"{role}_id")
+    if (
+        isinstance(expected_session, str)
+        and expected_session
+        and session_id
+        and session_id != expected_session
+    ):
+        return
+    expected_round = int(record.get("round", 0))
+    generations = record.get("role_generations", {})
+    generation_tracking = isinstance(generations, dict) and role in generations
+    for key, expected in (("round", expected_round), ("generation", None)):
+        value = payload_field(payload, key)
+        if value is None and generation_tracking and key == "round":
+            value = os.environ.get("ORC_ROUND")
+        if value is None and generation_tracking and key == "generation":
+            value = os.environ.get("ORC_ROLE_GENERATION")
+        if value is None:
+            continue
+        try:
+            actual = int(value)
+        except (TypeError, ValueError):
+            return
+        if key == "generation":
+            expected = generations.get(role)
+        if expected is not None and actual != int(expected):
+            return
+    if deadline_expired(record):
+        set_stop_reason(record, "deadline")
+        save_state(args.state_file, state)
+        return
+
     target_value = record.get("target_directory")
     if not isinstance(target_value, str) or not target_value:
         raise SystemExit(
@@ -960,7 +1300,7 @@ def idle_hook(args: argparse.Namespace) -> None:
     record["last_idle_event"] = payload
 
     handoff = {
-        "time": datetime.now(UTC).isoformat(timespec="seconds"),
+        "time": iso_now(),
         "local_time": datetime.now().astimezone().isoformat(timespec="seconds"),
         "task_id": task_id,
         "role": role,
@@ -969,22 +1309,67 @@ def idle_hook(args: argparse.Namespace) -> None:
         "target_directory": str(target_directory),
         "commit": current_commit(target_directory),
         "message": assistant_message_from_payload(payload),
+        "status": status,
     }
+    handoff.update(handoff_details(payload))
+    if status == UNABLE_TO_PROCEED:
+        handoff["reason"] = reason
     handoffs = record.setdefault("handoffs", [])
     if not isinstance(handoffs, list):
         handoffs = []
         record["handoffs"] = handoffs
     handoffs.append(handoff)
     record["last_handoff"] = handoff
+    record["last_role"] = role
+    record["last_commit"] = handoff["commit"]
+    processed.append(event_key)
+    record["processed_idle_events"] = processed[-20:]
+
+    if status == UNABLE_TO_PROCEED:
+        record["blocker_role"] = role
+        record["blocker_reason"] = reason
+        record["blocked_task"] = task_id
+        record["blocked_round"] = record.get("round", 0)
+        record["blocked_thread"] = handoff_thread_id
+        record["blocked_at"] = handoff["time"]
+        record["blocked_commit"] = handoff["commit"]
+        record["last_reviewer_event"] = (
+            payload if role == "reviewer" else record.get("last_reviewer_event")
+        )
+        set_stop_reason(record, "clarification")
+        save_state(args.state_file, state)
+        return
 
     if role == "implementer":
+        if int(record.get("round", 0)) == 0:
+            record["round"] = 1
         record["phase"] = "reviewer"
         save_state(args.state_file, state)
         return
 
     record["last_reviewer_event"] = payload
-    record["status"] = "paused"
-    record["reviewer_reported_complete"] = "TASK COMPLETE" in json.dumps(payload)
+    message = assistant_message_from_payload(payload) or ""
+    record["reviewer_reported_complete"] = status == "COMPLETE" or bool(
+        re.search(r"(?im)^\s*TASK COMPLETE\s*$", message)
+    )
+    if record["reviewer_reported_complete"]:
+        # Keep the historical paused status while making completion explicit.
+        record["status"] = "paused"
+        record["phase"] = "complete"
+        record["stop_reason"] = "completion"
+    elif record.get("automatic_rounds"):
+        maximum = int(record.get("max_rounds", DEFAULT_MAX_ROUNDS))
+        if int(record.get("round", 0)) >= maximum:
+            set_stop_reason(record, "max_rounds")
+        else:
+            record["round"] = int(record.get("round", 0)) + 1
+            record["phase"] = "implementer"
+            record["status"] = "active"
+            record["stop_reason"] = None
+    else:
+        record["status"] = "paused"
+        record["phase"] = "reviewer"
+        record["stop_reason"] = "manual_pause"
     save_state(args.state_file, state)
 
 

@@ -11,7 +11,7 @@ responsibilities are defined in `docs/roles.md`.
 
 ## TASK-005 - Add bounded workflow control and clarification pauses
 
-State: NEW
+State: COMPLETED
 
 Goal:
 

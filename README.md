@@ -76,7 +76,36 @@ uv run --script orc.py resume DIRECTORY TASK-ID PROMPT
 
 The resume directory is mandatory and must resolve to exactly the directory
 stored for that task. A conflicting, missing, invalid, or non-directory path is
-rejected before the state record is changed.
+rejected before the state record is changed. A resume request must be non-empty;
+when a task is paused for clarification, that request is the clarification
+passed to Igor and is recorded exactly once.
+
+For bounded automatic cycles, opt in explicitly at begin:
+
+```console
+uv run --script orc.py begin DIRECTORY TASK-ID PROMPT --auto \
+  --max-rounds 5 --deadline-minutes 60
+```
+
+`--auto` runs Igor and Rufus repeatedly until completion, a blocker, child
+failure, the configured round limit, or the persisted deadline. The limit is
+1–5 rounds and the deadline is 1–1440 minutes; both default to 5 and 60. The
+settings are saved with the task and reused by `resume`. Without `--auto`, Orc
+keeps the manual one-round pause after Rufus. The automatic mode never resumes
+after a clarification pause.
+
+## Handoffs and stop states
+
+Each idle handoff is persisted with its role, round, thread, target commit,
+UTC/local times, and the handoff fields. An agent may stop only when it cannot
+proceed without a human and must report the exact status
+`UNABLE_TO_PROCEED` plus a concise reason. Orc stores the blocker role, reason,
+task, round, thread, timestamp, commit, and phase, then launches no next role.
+
+The persisted `stop_reason` distinguishes `completion`, `clarification`,
+`deadline`, `max_rounds`, `child_failure`, and `manual_pause`. Duplicate idle
+events and stale notifications are ignored, so they cannot create an extra
+round or concurrent child.
 
 ## Interaction
 

@@ -23,3 +23,12 @@ product decision by guessing; those changes belong in the plan.
 
 The commit contract and state transitions are defined in
 `design_docs/agent_workflow.md`.
+
+## Bounded workflow handoffs
+
+Igor and Rufus must end each idle turn with the required concise handoff. If
+neither role can proceed without a human decision, the handoff status must be
+exactly `UNABLE_TO_PROCEED` and include a concise reason. Orc persists that
+blocker and pauses without starting the other role. A later `resume` must carry
+a non-empty clarification; the clarification is recorded exactly and does not
+reset the task's automatic-cycle or deadline settings.

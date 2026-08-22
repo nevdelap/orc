@@ -239,6 +239,31 @@ Acceptance criteria:
   research in it, provided the `State:` field stays `BLOCKED`. Only the state,
   not the specification, is what `BLOCKED` freezes.
 
+## Bounded workflow state machine
+
+Orc supports the existing manual one-round workflow and an explicitly enabled
+bounded mode. `begin DIRECTORY TASK-ID PROMPT` remains manual: Igor hands off to
+Rufus, then Rufus pauses the task with `stop_reason: manual_pause`. Automatic
+mode is enabled only with `begin ... --auto`; it alternates Igor and Rufus and
+persists `automatic_rounds`, `max_rounds`, `deadline_seconds`,
+`cycle_started_at`, `deadline_at`, `last_role`, `last_commit`, and
+`stop_reason`. `--max-rounds` accepts 1 through 5 and defaults to 5;
+`--deadline-minutes` accepts 1 through 1440 and defaults to 60. Resume reuses
+those values.
+
+An idle handoff may report exactly `UNABLE_TO_PROCEED` with a concise reason.
+Orc persists the blocker role, reason, task, round, thread, timestamp, current
+commit, and phase, then stops without launching or retrying another role. A
+resume must provide a non-empty clarification and records that exact request;
+validation happens before any state mutation or child launch. A clarification
+pause is never automatically resumed.
+
+The distinct persisted stop reasons are `completion`, `clarification`,
+`deadline`, `max_rounds`, `child_failure`, and `manual_pause`. The scheduler
+checks the deadline before launching and while waiting for idle children, never
+runs more than five automatic rounds, and ignores duplicate idle events and
+stale role notifications.
+
 ## Housekeeping
 
 Housekeeping is the maintenance step between implementation tasks. It is not new
