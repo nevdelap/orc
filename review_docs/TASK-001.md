@@ -18,7 +18,7 @@ Evidence:
 
 ### R002
 
-Status: OPEN
+Status: ADDRESSED
 
 The current worktree is not clean, so the task cannot meet the completion
 requirement. It contains an uncommitted modification to
@@ -36,6 +36,14 @@ Evidence:
 - The completion rules in `design_docs/agent_workflow.md` require the final
   working tree to be clean and no unrelated work to be included.
 
+Resolution:
+
+- The untracked `orc.py` was the intended TASK-002 bootstrap implementation,
+  created immediately after TASK-001 established the Orc foundation.
+- The current worktree is clean, and TASK-002 now owns and commits `orc.py`.
+- The rules-file content is tracked in the foundation commit and is unchanged
+  by the final TASK-002 commit.
+
 ## Final decision
 
-Status: REVIEWED_FOUND_ISSUES
+Status: COMPLETED

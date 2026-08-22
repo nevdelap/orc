@@ -54,7 +54,11 @@ Verification performed:
 
 ## TASK-001 - Strip copied Stay foundation for Orc
 
-State: REVIEWED_FOUND_ISSUES
+State: COMPLETED
+
+Completion note: TASK-001 was the bootstrap foundation for Orc. The review
+observed `orc.py` before TASK-002 had been committed; that was the intentional
+transition into Orc's self-development loop, not unfinished TASK-001 work.
 
 Goal:
 - Leave a minimal repository foundation for Orc by removing the copied Stay
