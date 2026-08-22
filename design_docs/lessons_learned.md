@@ -24,6 +24,16 @@ lessons from completed Orc tasks. It complements
   task, role, round, thread ID, and current commit hash.
 - Interactive PTY/TUI behavior needs focused checks for lifecycle attachment,
   resize, input forwarding, ANSI color preservation, and pane focus.
+- Validate and normalize a target directory before collecting any Git evidence;
+  a missing target must never fall back to Orc's process directory.
+- Derive child PTY dimensions from each rendered pane after layout and resize,
+  and cover the live path with a real PTY test rather than only unit checks.
+- Treat global shortcuts as part of the input contract: reserve only keys
+  needed by Orc and verify that all other control and text input reaches the
+  active child.
+- Record manual UI acceptance against an exact commit, terminal environment,
+  size matrix, scenario, observation, and result so review amendments cannot
+  make the evidence ambiguous.
 
 ## Housekeeping
 
