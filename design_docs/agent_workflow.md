@@ -263,7 +263,9 @@ with missing or false `automatic_rounds` retains its history, uses valid stored
 limits or the defaults, and receives a fresh deadline from resume time.
 
 The distinct persisted stop reasons are `completion`, `clarification`,
-`deadline`, `max_rounds`, `child_failure`, and legacy `manual_pause`. The
+`deadline`, `max_rounds`, `child_failure`, `manual_pause`, and
+`orchestrator_exit`. An `orchestrator_exit` record has `status: stopped`,
+`phase: stopped`, a bounded `stop_diagnostic`, and inactive role states. The
 scheduler checks the deadline before launching and while waiting for idle
 children, never runs more than five automatic rounds, and ignores duplicate
 idle events and stale role notifications.
@@ -322,13 +324,16 @@ The workflow transition function is the authority for handoffs, terminal
 events, child failures, polling, CLI resume, and in-place resume. Terminal
 events are idempotent. Resume decisions follow one matrix for both entry
 points: active is rejected as already active; completed, blocked, paused,
-deadline-stopped, maximum-rounds-stopped, and manual-pause-stopped records
+deadline-stopped, maximum-rounds-stopped, manual-pause-stopped, and
+orchestrator-exit-stopped records
 require their documented inactive-role predicates and a non-empty request;
 valid single-role child failures restart that failed role at the current round;
 all other inconsistent records are rejected without mutation. Accepted
 resumes preserve identity, configuration, limits, history, and audit data,
 clear terminal and launch/session metadata, append the exact request, and start
-a fresh deadline.
+a fresh deadline. Accepted orchestrator-exit resumes require both roles to be
+inactive, clear `stop_diagnostic`, and start Igor at round 1. Active roles or
+malformed records are rejected without mutation.
 
 Every role generation has a fresh opaque launch token. Its final non-blank line
 must be exactly `ORC_HANDOFF_V1: <JSON object>` with exactly seven fields:
@@ -359,8 +364,9 @@ two seconds and SIGKILL within one additional second, and Git lookup and
 Claude capability probes each time out after five seconds.
 
 For `paused`, `blocked`, and `completed` tasks whose rendered roles are both
-`inactive`, and for `stopped` tasks with `stop_reason: child_failure`, exactly
-one `failed` role, and one `inactive` role, `Ctrl-R` opens an Orc-owned
+`inactive`, for `stopped` tasks with `stop_reason: orchestrator_exit` and both
+roles `inactive`, and for `stopped` tasks with `stop_reason: child_failure`,
+exactly one `failed` role, and one `inactive` role, `Ctrl-R` opens an Orc-owned
 follow-up prompt without restarting the process. Enter requires a non-empty
 request; Escape cancels and an empty submission leaves state unchanged. A
 successful submission retires remaining children, preserves the task identity,
