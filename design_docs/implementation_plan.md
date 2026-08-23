@@ -300,3 +300,119 @@ Acceptance criteria:
   TASK-010's requirement that terminal-state UIs remain alive.
 - Tests, CLI help, README/workflow documentation, Linux PTY/TUI checks, and
   clean-diff verification pass on the final task commit.
+
+## TASK-012 - Improve retained UI, scrolling, and in-place resume
+
+State: NEW
+
+Goal:
+
+- Make Orc's retained terminal UI useful after a round by preserving the
+  complete version rail, allowing each agent pane to be inspected through
+  scrollback, and allowing a new automatic round to be started without
+  exiting and restarting Orc.
+
+Dependencies:
+
+- TASK-011 must be `COMPLETED`.
+
+Scope:
+
+- `orc` status bar: fix the right-rail sizing and rendering so the complete
+  `orc v0.0.1` text, including its leading separating space and final
+  character, is displayed at the far right at every supported size in the
+  Linux `xterm-256color` matrix of 120x40, 80x40, and 80x24. Terminals
+  smaller than 80x24 are outside this task's support contract. Left-side
+  clipping must stop before the reserved rail and must never clip, displace,
+  or consume the version text.
+- `orc` and the pane terminal model: retain sufficient per-pane scrollback to
+  inspect output beyond the visible viewport, with independent scroll
+  positions for Igor and Rufus. Retain at least 10,000 logical lines per
+  pane; when that cap is reached, discard the oldest lines and make the new
+  oldest retained line the Home position. The pane under the pointer is the
+  scroll target; moving the pointer changes only the scroll target and never
+  changes the active agent or forwards a click to an agent.
+- `orc` pane input: Page Up and Page Down scroll the target pane by one
+  viewport; Home scrolls to the oldest retained line; End scrolls to the
+  newest output. These scrolling keys are consumed by Orc and are not sent
+  to an agent. Up and Down remain agent input for prompt-history navigation
+  and are sent only to the workflow-active agent. When any ordinary keyboard
+  input, control input, Enter, or paste is sent to the active agent, its pane
+  first scrolls to the bottom. New PTY output does not force a manually
+  scrolled pane to the bottom until the user presses End or sends input to
+  that agent.
+- `orc` pane navigation: restore `Tab` as a scroll-target selector. Each
+  press cycles the scroll target between Igor and Rufus, wrapping at either
+  end. It changes only which pane receives scroll navigation; it does not
+  change the workflow-active agent, highlighted agent border, or agent input
+  destination. Keyboard input other than scroll navigation still goes only to
+  the workflow-active agent's pane; it is never sent to the selected inactive
+  scroll pane. `Tab` is not forwarded to an agent. This deliberately
+  supersedes TASK-011's Tab pass-through rule for the scrolling UI.
+- `orc` in-place resume: when the persisted task status is `paused`,
+  `blocked`, or `completed` and both rendered role states are `inactive`, or
+  when status is `stopped`, `stop_reason` is `child_failure`, exactly one
+  role is `failed`, and the other is `inactive`, `Ctrl-R` opens an Orc-owned
+  follow-up prompt instead of forwarding the key. The prompt accepts
+  ordinary editing and paste, submits a non-empty request with Enter, and
+  cancels with Escape. Submission retires any remaining child sessions,
+  preserves the task ID, target directory, backend, backend command/version,
+  task handoff history, and configured round/deadline limits, appends the
+  request to `user_requests`, clears the current stop, blocker,
+  child-failure, failed-role, and role-session metadata, sets `status: active`,
+  `phase: implementer`, `round: 1`, and starts a fresh
+  `cycle_started_at`/`deadline_at` window before launching Igor in the
+  existing Orc process. An empty submission is rejected without changing
+  task state. `Ctrl-R` has no resume effect while either role is active or
+  when the status/role data is inconsistent.
+- `README.md`, `design_docs/agent_workflow.md`, and CLI/UI help: document the
+  complete version rail, independent pane scrollback and controls, the
+  scroll-to-bottom-on-agent-input rule, the pointer-only scroll-target
+  behavior, and the `Ctrl-R` in-place resume flow.
+- `tests/test_orc.py` and Linux PTY/TUI fixtures: cover complete version text
+  at Linux `xterm-256color` 120x40, 80x40, and 80x24, plus the out-of-scope
+  smaller-size boundary; independent pane scroll positions; output older
+  than the viewport and the 10,000-line cap; Page Up/Page Down/Home/End
+  scrolling; Up/Down prompt-history forwarding; retained scroll position
+  while PTY output arrives; scroll-to-bottom for keyboard, control, Enter,
+  and paste input; pointer target changes without active-agent changes; and
+  in-place resume for every eligible inactive-role status and the
+  stopped-child-failure case, inconsistent-state no-op, cancellation,
+  empty-input rejection, exact state preservation/reset, fresh deadline, and
+  reset to round 1 without a process restart.
+
+Acceptance criteria:
+
+- The status bar always displays the complete `orc v0.0.1` segment at the
+  far right, including the separating space and final character, without
+  overlap or clipping at Linux `xterm-256color` 120x40, 80x40, or 80x24;
+  smaller terminals are outside the support contract.
+- Igor and Rufus each have retained, independently navigable scrollback.
+  Page Up/Page Down, Home, and End have exactly the documented effects on
+  the pane under the pointer and are not forwarded to an agent. Each pane
+  retains at least 10,000 logical lines and Home reaches the oldest retained
+  line after the cap discards older output. Up and Down remain available for
+  prompt-history navigation in the workflow-active agent's PTY.
+- `Tab` cycles the scroll target between Igor and Rufus without changing the
+  workflow-active role, border, or agent input destination, and without being
+  forwarded to an agent.
+- Only the workflow-active agent's pane receives keyboard input. Selecting an
+  inactive pane as the scroll target never makes it an input destination.
+- New PTY output preserves a pane's manually selected scroll position, while
+  any keyboard, control, Enter, or paste input sent to that pane first moves
+  it to the bottom.
+- Pointer movement can choose which pane receives scroll navigation but never
+  changes the workflow-active role, border, or agent input destination.
+- With status `paused`, `blocked`, or `completed` and both roles `inactive`,
+  or status `stopped` with `stop_reason: child_failure`, one `failed` role,
+  and one `inactive` role, `Ctrl-R` opens the follow-up prompt in the same
+  Orc process. A non-empty Enter submission preserves the specified
+  identity/configuration and handoff history, appends the request, clears
+  stale terminal and failed-role metadata, starts a fresh deadline, and
+  starts Igor with displayed round `1`. Escape, empty submission, active
+  roles, and every other inconsistent status/role combination leave the
+  terminal state unchanged.
+- `Ctrl-R` does not interrupt or alter an active implementer or reviewer, and
+  ordinary active-agent input continues to obey TASK-011's forwarding rules.
+- Tests, CLI/UI help, README/workflow documentation, Linux PTY/TUI checks,
+  and clean-diff verification pass on the final task commit.
