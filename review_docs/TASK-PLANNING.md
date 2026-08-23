@@ -6,25 +6,26 @@
 
 Status: ADDRESSED
 
-Independent planning review is pending for TASK-004, TASK-005, and TASK-006.
+Independent planning review is pending for TASK-004, TASK-005, TASK-006, and
+TASK-007.
 
-The planning commit defines the bundled PTY/UI, workflow-control, and Claude
-Code backend tasks. Rufus must verify that each task has complete Goal,
-Dependencies, Scope, and Acceptance criteria, that the dependencies are
-ordered correctly, and that the proposed five-round and 60-minute limits are
-explicit and testable.
+The planning commit defines the bundled PTY/UI, workflow-control, agentbox
+identity/launcher, and Claude Code backend tasks. Rufus must verify that each
+task has complete Goal, Dependencies, Scope, and Acceptance criteria, that the
+dependencies are ordered correctly, and that the proposed five-round and
+60-minute limits are explicit and testable.
 
 Resolution:
 
-- TASK-004, TASK-005, and TASK-006 each contain Goal, Dependencies, Scope, and
-  Acceptance criteria sections.
+- TASK-004, TASK-005, TASK-006, and TASK-007 each contain Goal, Dependencies,
+  Scope, and Acceptance criteria sections.
 - Dependencies form the explicit order TASK-003 -> TASK-004 -> TASK-005 ->
-  TASK-006, and TASK-003 is already `COMPLETED`.
+  TASK-007 -> TASK-006, and TASK-003 and TASK-005 are already `COMPLETED`.
 - TASK-005 explicitly states the five-round maximum and 60-minute default.
 
 Evidence:
 
-- `design_docs/implementation_plan.md` contains all three complete task
+- `design_docs/implementation_plan.md` contains all four complete task
   specifications and the dependency chain.
 
 ### R002
@@ -133,12 +134,70 @@ Evidence:
 - `design_docs/implementation_plan.md` specifies the selector, commands,
   capability probe, state fields, and acceptance coverage.
 
+### R005
+
+Status: ADDRESSED
+
+The prior review found that the planning commit lacked the required planning
+subject, shared message sections, and model trailer.
+
+Resolution:
+
+- The commit subject is `Planning: add agentbox-aware Orc launcher`.
+- The commit contains `Implemented:`, `Reviewed:`, and one
+  `Co-Authored-By:` trailer, with body lines at or below 60 characters.
+
+Evidence:
+
+- `git show -s --format=%B HEAD`.
+- `design_docs/agent_workflow.md` defines the planning commit contract.
+
+### R006
+
+Status: ADDRESSED
+
+The prior review found that TASK-006 appeared before its unmet TASK-007
+dependency, allowing the first-task selection rule to choose TASK-006 too
+early.
+
+Resolution:
+
+- TASK-007 now appears before TASK-006 in the implementation plan.
+- TASK-006 retains `TASK-007 must be COMPLETED` as its dependency.
+
+Evidence:
+
+- `design_docs/implementation_plan.md` orders TASK-007 before TASK-006.
+- `design_docs/agent_workflow.md` requires dependency-compliant task
+  selection.
+
+### R007
+
+Status: ADDRESSED
+
+The prior review found that the planning change modified the reviewer-owned
+review document and recorded premature approval.
+
+Resolution:
+
+- Igor's corrected planning snapshot changed only
+  `design_docs/implementation_plan.md`; this reviewer amendment adds the
+  permitted review record.
+- Its `Reviewed:` section records an open independent review item for Rufus;
+  this review now records the final decision.
+
+Evidence:
+
+- `git diff --name-status HEAD^ HEAD` lists the implementation plan and this
+  reviewer-owned review record, with no source or test changes.
+- `git show -s --format=%B HEAD` contains the pending review item.
+
 ## Verification
 
 - `git diff --no-ext-diff --check HEAD^ HEAD`: PASS.
 - Commit subject and body lines are at or below 60 characters: PASS.
-- TASK-003 is `COMPLETED`; TASK-004, TASK-005, and TASK-006 remain valid
-  `NEW` tasks with the required dependency order.
+- TASK-003 and TASK-005 are `COMPLETED`; TASK-004, TASK-007, and TASK-006
+  remain valid `NEW` tasks with the required dependency order.
 - No product-runtime gates were applicable because this planning diff changes
   no application source or tests.
 
