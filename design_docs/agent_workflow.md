@@ -242,7 +242,7 @@ Acceptance criteria:
 ## Bounded workflow state machine
 
 Orc supports the existing manual one-round workflow and an explicitly enabled
-bounded mode. `begin DIRECTORY TASK-ID PROMPT` remains manual: Igor hands off to
+bounded mode. `begin DIRECTORY TASK-ID [PROMPT]` remains manual: Igor hands off to
 Rufus, then Rufus pauses the task with `stop_reason: manual_pause`. Automatic
 mode is enabled only with `begin ... --auto`; it alternates Igor and Rufus and
 persists `automatic_rounds`, `max_rounds`, `deadline_seconds`,
@@ -263,6 +263,21 @@ The distinct persisted stop reasons are `completion`, `clarification`,
 checks the deadline before launching and while waiting for idle children, never
 runs more than five automatic rounds, and ignores duplicate idle events and
 stale role notifications.
+
+The compact status bar reports the task name and current task status,
+`Igor: <state>`, `Rufus: <state>`, the backend, Orc version, and pane-switch
+hint. Role states are `not started`, `active`, `waiting`, `inactive`, and
+`failed`. A role with a recorded normal handoff is `waiting` until the next
+workflow transition; a live child does not make that role `active`. Once
+completion is recorded, both roles are `inactive` and Orc keeps the final panes
+and status visible until the user quits with `Ctrl-Q`.
+
+The begin prompt is optional: `begin DIRECTORY TASK-ID` uses only the built-in
+implementer prompt, while an omitted prompt is persisted as empty and is never
+rendered as an empty user request. Resume remains strict and requires a
+non-empty request or clarification. After a normal handoff Orc retires the
+completed child before scheduling the next role. Retiring a completed child is
+ordinary workflow cleanup and must not be persisted as `child_failure`.
 
 ## Housekeeping
 

@@ -38,19 +38,19 @@ for that confinement model. The marker-based behavior is Linux-only.
 From an executable checkout, run Orc directly through its uv shebang:
 
 ```console
-./orc begin DIRECTORY TASK-ID PROMPT
+./orc begin DIRECTORY TASK-ID [PROMPT]
 ```
 
 The equivalent explicit form is useful when diagnosing the launcher:
 
 ```console
-uv run --script orc begin DIRECTORY TASK-ID PROMPT
+uv run --script orc begin DIRECTORY TASK-ID [PROMPT]
 ```
 
 Select Claude Code explicitly for a new task:
 
 ```console
-./orc begin DIRECTORY TASK-ID PROMPT --backend claude
+./orc begin DIRECTORY TASK-ID [PROMPT] --backend claude
 ```
 
 Orc probes the selected Claude executable with `--help` before creating task
@@ -73,7 +73,7 @@ form above:
 
 ```console
 uv sync --locked
-./orc begin DIRECTORY TASK-ID PROMPT
+./orc begin DIRECTORY TASK-ID [PROMPT]
 ```
 
 `DIRECTORY` must already exist and be a directory. Orc resolves it to an
@@ -93,7 +93,7 @@ Orc stores state in `~/.orc/codex-state.json` by default. Override it before
 the command with `--state-file`:
 
 ```console
-uv run --script orc --state-file /tmp/orc-state.json begin DIRECTORY TASK-ID PROMPT
+uv run --script orc --state-file /tmp/orc-state.json begin DIRECTORY TASK-ID [PROMPT]
 ```
 
 The task record retains the normalized target directory, backend and command,
@@ -104,11 +104,13 @@ the target has its own source-control or backup policy.
 
 ## Workflow
 
-`begin DIRECTORY TASK-ID PROMPT` validates the target, creates a new task, and
-starts Igor. When Igor becomes idle, Orc starts Rufus in the same target. Rufus
-reviews the target worktree and reports findings without implementing fixes.
-After the review becomes idle, Orc pauses the round. Use `resume` to send Igor a
-follow-up or to ask for another implementation round:
+`begin DIRECTORY TASK-ID [PROMPT]` validates the target, creates a new task,
+and starts Igor. The prompt is optional; when omitted, Igor receives Orc's
+built-in implementer instructions without an empty user-request section. When
+Igor becomes idle, Orc starts Rufus in the same target. Rufus reviews the target
+worktree and reports findings without implementing fixes. After the review
+becomes idle, Orc pauses the round. Use `resume` to send Igor a follow-up or to
+ask for another implementation round:
 
 ```console
 uv run --script orc resume DIRECTORY TASK-ID PROMPT
@@ -133,6 +135,17 @@ failure, the configured round limit, or the persisted deadline. The limit is
 settings are saved with the task and reused by `resume`. Without `--auto`, Orc
 keeps the manual one-round pause after Rufus. The automatic mode never resumes
 after a clarification pause.
+
+The compact status bar shows the task and current task status, Igor and Rufus
+states, the selected backend, Orc's version, and the pane-switch hint. Role
+states are `not started`, `active`, `waiting`, `inactive`, and `failed`. A role
+that has handed off is `waiting` until the next workflow transition, even if
+its child process is still alive. A completed task leaves both roles `inactive`
+and keeps the UI visible until `Ctrl-Q`.
+
+When the agentbox marker is present and the selected launch actually includes
+the backend's no-permission flag, the bar also shows `agentbox: no-permissions`. Orc retires a normally handed-off child before launching the
+next role or round; that lifecycle is not a `child_failure`.
 
 ## Handoffs and stop states
 

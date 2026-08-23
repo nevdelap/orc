@@ -234,7 +234,7 @@ Acceptance criteria:
 
 ## TASK-008 - Make workflow status truthful and advance rounds reliably
 
-State: NEW
+State: COMPLETED
 
 Goal:
 

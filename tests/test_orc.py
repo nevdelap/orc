@@ -229,10 +229,43 @@ def test_resume_restarts_reviewer_after_child_failure(
     assert record["phase"] == "reviewer"
     assert record["round"] == 2
     assert record["reviewer_id"] is None
+    assert "child_failure" not in record
     assert record["user_requests"] == [
         "continue to completion",
         "implement the task",
     ]
+
+
+@pytest.mark.parametrize("role", ["implementer", "reviewer"])
+def test_resume_clears_failure_before_role_becomes_active(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, role: str
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    state_file = tmp_path / "state.json"
+    state = {
+        "TASK-003": {
+            "status": "stopped",
+            "phase": "stopped",
+            "round": 2,
+            "prompt": "first",
+            "target_directory": str(target.resolve()),
+            "user_requests": [],
+            "stop_reason": "child_failure",
+            "child_failure": {"role": role, "exit_status": 256},
+        }
+    }
+    orc.save_state(state_file, state)
+    monkeypatch.setattr(orc, "run_app", lambda *_: None)
+
+    orc.resume(cli_args(state_file, target))
+
+    saved = orc.load_state(state_file)["TASK-003"]
+    assert "child_failure" not in saved
+    assert saved["phase"] == ("reviewer" if role == "reviewer" else "implementer")
+    app, _state_file, panes = app_stub(tmp_path, saved)
+    app.sessions[role] = orc.ChildSession(role, 123, 99, panes[role])
+    assert app.role_state(saved, role) == "active"
 
 
 @pytest.mark.parametrize("phase", ["implementer", "reviewer", "stopped", None])
@@ -354,7 +387,7 @@ def test_idle_hook_reviewer_pauses_and_finds_role_by_session(
     orc.idle_hook(args)
 
     record = orc.load_state(state_file)["TASK-003"]
-    assert record["status"] == "paused"
+    assert record["status"] == "completed"
     assert record["reviewer_reported_complete"] is True
     assert record["reviewer_id"] == "rufus"
 
@@ -2096,6 +2129,221 @@ def test_claude_stream_parser_requires_session_and_valid_handoff() -> None:
         b'"result":"finished without handoff"}\n',
     )
     assert orc.OrcApp.claude_handoff(incomplete) is None
+
+
+def test_begin_prompt_is_optional_and_empty_prompt_uses_built_in_instructions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    state_file = tmp_path / "state.json"
+    args = orc.parse_args(
+        ["--state-file", str(state_file), "begin", str(target), "TASK-008"]
+    )
+    assert args.prompt == ""
+    monkeypatch.setattr(orc, "run_app", lambda *_: None)
+    orc.begin(args)
+    assert orc.load_state(state_file)["TASK-008"]["prompt"] == ""
+
+    app, _state_file, _panes = app_stub(
+        tmp_path,
+        {
+            "status": "active",
+            "phase": "implementer",
+            "target_directory": str(target),
+            "prompt": "",
+            "user_requests": [],
+        },
+    )
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        app,
+        "fork_codex",
+        lambda command, _environment, _cwd=None: (
+            commands.append(command) or (123, os.open("/dev/null", os.O_RDWR))
+        ),
+    )
+    monkeypatch.setattr(app, "set_master_reader", lambda _session: None)
+    monkeypatch.setattr(app, "resize_session", lambda _session: None)
+    monkeypatch.setattr(app, "update_layout", lambda: None)
+    monkeypatch.setattr(app, "update_status", lambda _message: None)
+    app.launch_role("implementer")
+    assert "Continue implementing the task" not in commands[0][-1]
+    assert "User request:" not in commands[0][-1]
+    assert "Read the docs in design_docs/" in commands[0][-1]
+
+
+def test_status_bar_derives_both_role_states_and_agentbox_indicator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    marker = tmp_path / "identity"
+    marker.write_text("")
+    monkeypatch.setattr(orc, "AGENTBOX_IDENTITY", marker)
+    monkeypatch.setattr(orc.sys, "platform", "linux")
+    app, state_file, _panes = app_stub(
+        tmp_path,
+        {
+            "status": "active",
+            "phase": "reviewer",
+            "target_directory": str(target),
+            "handoffs": [{"role": "implementer"}],
+            "backend": "codex",
+            "launch_command": ["codex", orc.CODEX_AGENTBOX_FLAG],
+        },
+    )
+    state = orc.load_state(state_file)
+    record = state["TASK-003"]
+    assert app.role_state(record, "implementer") == "waiting"
+    assert app.role_state(record, "reviewer") == "not started"
+    rendered = app.status_text(record)
+    assert "TASK-003 · active" in rendered
+    assert "Igor: waiting" in rendered
+    assert "Rufus: not started" in rendered
+    assert "agentbox: no-permissions" in rendered
+    assert "layout:" not in rendered
+    assert orc.ORC_VERSION in rendered
+
+    record["status"] = "completed"
+    record["phase"] = "complete"
+    assert app.role_state(record, "implementer") == "inactive"
+    assert app.role_state(record, "reviewer") == "inactive"
+
+
+def test_auto_handoff_retires_live_child_before_next_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    app, state_file, panes = app_stub(
+        tmp_path,
+        {
+            "status": "active",
+            "phase": "reviewer",
+            "round": 1,
+            "target_directory": str(target),
+            "automatic_rounds": True,
+            "handoffs": [{"role": "implementer"}],
+            "role_generations": {"implementer": 1},
+        },
+    )
+    session = orc.ChildSession(
+        "implementer", 123, 99, panes["implementer"], handoff_count=0
+    )
+    app.sessions = {"implementer": session}
+    killed: list[tuple[int, int]] = []
+    launched: list[str] = []
+    monkeypatch.setattr(orc.os, "killpg", lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setattr(app.event_loop, "remove_reader", lambda *_: None)
+    monkeypatch.setattr(app, "launch_role", launched.append)
+    monkeypatch.setattr(app, "update_status", lambda _message: None)
+
+    app.poll_state()
+
+    assert session.retired is True
+    assert killed == [(123, orc.signal.SIGTERM)]
+    assert launched == ["reviewer"]
+    saved = orc.load_state(state_file)["TASK-003"]
+    assert "child_failure" not in saved
+
+
+def test_completed_task_keeps_ui_alive_with_both_roles_inactive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    app, _state_file, _panes = app_stub(
+        tmp_path,
+        {
+            "status": "completed",
+            "phase": "complete",
+            "target_directory": str(target),
+            "handoffs": [
+                {"role": "implementer"},
+                {"role": "reviewer"},
+            ],
+        },
+    )
+    exited: list[bool] = []
+    rendered: list[str] = []
+    monkeypatch.setattr(app, "exit", lambda: exited.append(True))
+    monkeypatch.setattr(app, "update_status", rendered.append)
+
+    app.poll_state()
+
+    assert not exited
+    assert rendered
+    assert "completed" in rendered[-1]
+    assert "Igor: inactive" in rendered[-1]
+    assert "Rufus: inactive" in rendered[-1]
+
+
+@pytest.mark.parametrize("status", ["paused", "blocked", "stopped"])
+def test_stop_status_keeps_compact_status_bar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    app, _state_file, _panes = app_stub(
+        tmp_path,
+        {
+            "status": status,
+            "phase": "blocked" if status == "blocked" else "reviewer",
+            "target_directory": str(target),
+            "stop_reason": "clarification" if status == "blocked" else "manual_pause",
+            "handoffs": [],
+        },
+    )
+    rendered: list[str] = []
+    monkeypatch.setattr(app, "exit", lambda: None)
+    monkeypatch.setattr(app, "update_status", rendered.append)
+
+    app.poll_state()
+
+    assert rendered
+    assert "TASK-003 · " + status in rendered[-1]
+    assert "Igor:" in rendered[-1]
+    assert "Rufus:" in rendered[-1]
+    assert orc.ORC_VERSION in rendered[-1]
+    assert orc.FOCUS_STATUS in rendered[-1]
+
+
+def test_codex_nonzero_exit_after_handoff_is_child_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    app, state_file, panes = app_stub(
+        tmp_path,
+        {
+            "status": "active",
+            "phase": "reviewer",
+            "target_directory": str(target),
+            "handoffs": [{"role": "implementer"}],
+        },
+    )
+    session = orc.ChildSession("implementer", 7, 99, panes["implementer"])
+    app.sessions = {"implementer": session}
+    monkeypatch.setattr(orc.os, "waitpid", lambda *_: (7, 256))
+    monkeypatch.setattr(app.event_loop, "remove_reader", lambda *_: None)
+    exited: list[bool] = []
+    rendered: list[str] = []
+    monkeypatch.setattr(app, "exit", lambda: exited.append(True))
+    monkeypatch.setattr(app, "update_status", rendered.append)
+
+    app.poll_children()
+
+    saved = orc.load_state(state_file)["TASK-003"]
+    assert saved["stop_reason"] == "child_failure"
+    assert saved["child_failure"]["backend"] == "codex"
+    assert saved["child_failure"]["reason"] == "Codex exited with status 1"
+    assert exited
+    assert rendered
+    assert "TASK-003 · stopped" in rendered[-1]
+    assert "Igor: failed" in rendered[-1]
+    assert "Rufus:" in rendered[-1]
+    assert orc.ORC_VERSION in rendered[-1]
 
 
 def test_claude_stream_handles_noise_and_message_shapes() -> None:

@@ -97,7 +97,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Orchestrate Igor and Rufus sessions. "
-            "Usage: begin DIRECTORY TASK-ID PROMPT or "
+            "Usage: begin DIRECTORY TASK-ID [PROMPT] or "
             "resume DIRECTORY TASK-ID PROMPT."
         ),
         epilog=(
@@ -127,7 +127,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Existing target project directory.",
     )
     begin.add_argument("task_id", help="Task identifier, such as TASK-001.")
-    begin.add_argument("prompt", help="Initial request for Igor.")
+    begin.add_argument(
+        "prompt",
+        nargs="?",
+        default="",
+        help="Optional initial request for Igor.",
+    )
     begin.add_argument(
         "--backend",
         choices=("codex", "claude"),
@@ -362,19 +367,23 @@ def set_stop_reason(
 def reviewer_prompt(record: dict[str, Any]) -> str:
     requests = [record.get("prompt")]
     requests.extend(record.get("user_requests", []))
-    requests = [request for request in requests if isinstance(request, str)]
-    request_text = "\n".join(f"- {request}" for request in requests)
+    requests = [
+        request for request in requests if isinstance(request, str) and request.strip()
+    ]
     target = record.get("target_directory", "unknown")
-    return (
+    prompt = (
         f"{REVIEWER_PROMPT}\n\n"
         f"Target project directory: {target}\n"
         "Review the target project's current worktree and Git repository. "
         "Do not review or modify Orc's repository.\n"
         "Igor has completed the implementation turn. Review the current "
         "worktree now. Do not implement fixes. Report findings and evidence, "
-        "or report exactly TASK COMPLETE when ready.\n\n"
-        f"User requests in this context:\n{request_text}"
+        "or report exactly TASK COMPLETE when ready."
     )
+    if requests:
+        prompt += "\n\nUser requests in this context:\n"
+        prompt += "\n".join(f"- {request}" for request in requests)
+    return prompt
 
 
 def session_id_from_payload(value: Any) -> str | None:
@@ -773,6 +782,9 @@ class ChildSession:
     final_response: str | None = None
     stream_error: str | None = None
     exited: bool = False
+    retired: bool = False
+    handoff_count: int = 0
+    command: list[str] | None = None
 
     def __post_init__(self) -> None:
         if self.stream_events is None:
@@ -816,10 +828,6 @@ class OrcApp(App[None]):
         padding: 0 1;
     }
 
-    #version {
-        width: auto;
-        padding: 0 1;
-    }
     """
 
     def __init__(self, args: argparse.Namespace, task_id: str) -> None:
@@ -827,6 +835,7 @@ class OrcApp(App[None]):
         self.args = args
         self.task_id = task_id
         self.sessions: dict[str, ChildSession] = {}
+        self.retired_sessions: list[ChildSession] = []
         self.started_roles: set[str] = set()
         self.active_role = "implementer"
         self.layout_mode = ""
@@ -848,7 +857,6 @@ class OrcApp(App[None]):
                 id="status-message",
                 markup=False,
             ),
-            Static(ORC_VERSION, id="version", markup=False),
             id="status",
         )
 
@@ -879,9 +887,90 @@ class OrcApp(App[None]):
     def pane(self, role: str) -> SessionPane:
         return self.query_one(f"#{role}", SessionPane)
 
+    def _handoffs_for_role(
+        self, record: dict[str, Any], role: str
+    ) -> list[dict[str, Any]]:
+        handoffs = record.get("handoffs", [])
+        if not isinstance(handoffs, list):
+            return []
+        return [
+            handoff
+            for handoff in handoffs
+            if isinstance(handoff, dict) and handoff.get("role") == role
+        ]
+
+    def role_state(self, record: dict[str, Any], role: str) -> str:
+        """Derive the display state for one role from workflow evidence."""
+
+        if record.get("status") == "completed" or record.get("phase") == "complete":
+            return "inactive"
+
+        failure = record.get("child_failure")
+        if isinstance(failure, dict) and failure.get("role") == role:
+            return "failed"
+
+        session = self.sessions.get(role)
+        if (
+            session is not None
+            and not session.exited
+            and not getattr(session, "retired", False)
+        ):
+            handoffs = record.get("handoffs", [])
+            handoff_count = len(handoffs) if isinstance(handoffs, list) else 0
+            session_handoff_count = getattr(session, "handoff_count", handoff_count)
+            if handoff_count > session_handoff_count and any(
+                isinstance(handoff, dict) and handoff.get("role") == role
+                for handoff in handoffs[session_handoff_count:]
+            ):
+                return "waiting"
+            return "active"
+
+        if self._handoffs_for_role(record, role):
+            return "waiting"
+
+        return "not started"
+
+    def agentbox_enabled(self, record: dict[str, Any]) -> bool:
+        if sys.platform != "linux" or not AGENTBOX_IDENTITY.exists():
+            return False
+        backend = backend_from_record(record)
+        expected = CODEX_AGENTBOX_FLAG if backend == "codex" else CLAUDE_AGENTBOX_FLAG
+        phase = record.get("phase")
+        session = self.sessions.get(phase) if isinstance(phase, str) else None
+        command = (
+            getattr(session, "command", None)
+            if session is not None
+            else record.get("launch_command")
+        )
+        return isinstance(command, list) and expected in command
+
+    def status_text(self, record: dict[str, Any]) -> str:
+        backend = backend_from_record(record)
+        indicator = (
+            " · agentbox: no-permissions" if self.agentbox_enabled(record) else ""
+        )
+        return (
+            f"{self.task_id} · {record.get('status', 'unknown')} · "
+            f"Igor: {self.role_state(record, 'implementer')} · "
+            f"Rufus: {self.role_state(record, 'reviewer')} · "
+            f"backend: {backend}{indicator} · {ORC_VERSION} · {FOCUS_STATUS}"
+        )
+
+    def refresh_status(self) -> None:
+        state = load_state(self.args.state_file)
+        record = state.get(self.task_id)
+        if isinstance(record, dict):
+            rendered = self.status_text(record)
+            self.update_status(rendered)
+
     def launch_role(self, role: str) -> None:
         existing = self.sessions.get(role)
-        if role in self.started_roles and existing is not None and not existing.exited:
+        if (
+            role in self.started_roles
+            and existing is not None
+            and not existing.exited
+            and not getattr(existing, "retired", False)
+        ):
             return
         state = load_state(self.args.state_file)
         record = state.get(self.task_id)
@@ -901,7 +990,7 @@ class OrcApp(App[None]):
         if deadline_expired(record):
             set_stop_reason(record, "deadline")
             save_state(self.args.state_file, state)
-            self.update_status("Stopped: automatic deadline expired")
+            self.refresh_status()
             self.exit()
             return
 
@@ -956,7 +1045,7 @@ class OrcApp(App[None]):
             if has_request:
                 prompt += "\n\nUser request for this context:\n"
                 prompt += str(requests[-1])
-            elif not auto_continuation:
+            elif not auto_continuation and str(record.get("prompt", "")).strip():
                 prompt += "\n\nUser request:\n" + str(record["prompt"])
         else:
             prompt = reviewer_prompt(record) + "\n\n" + HANDOFF_PROMPT
@@ -977,6 +1066,12 @@ class OrcApp(App[None]):
             bool(record.get("automatic_rounds")),
             self.args.state_file,
         )
+
+        record["launch_command"] = command
+        record["launch_backend"] = backend
+        handoffs = record.get("handoffs", [])
+        handoff_count = len(handoffs) if isinstance(handoffs, list) else 0
+        save_state(self.args.state_file, state)
 
         environment = os.environ.copy()
         # The child is connected to Orc's ANSI-capable terminal emulator, not
@@ -1001,7 +1096,15 @@ class OrcApp(App[None]):
         os.set_blocking(master_fd, False)
         pane = self.pane(role)
         pane.show_message(f"Starting {role.title()}…")
-        session = ChildSession(role, pid, master_fd, pane, backend=backend)
+        session = ChildSession(
+            role,
+            pid,
+            master_fd,
+            pane,
+            backend=backend,
+            handoff_count=handoff_count,
+            command=command,
+        )
         self.sessions[role] = session
         self.started_roles.add(role)
         self.active_role = role
@@ -1009,7 +1112,7 @@ class OrcApp(App[None]):
         self.set_master_reader(session)
         self.resize_session(session)
         self.schedule_resize()
-        self.update_status(self.active_status())
+        self.refresh_status()
 
     @staticmethod
     def fork_codex(
@@ -1165,7 +1268,7 @@ class OrcApp(App[None]):
             }
             set_stop_reason(record, "child_failure")
             save_state(self.args.state_file, state)
-            self.update_status(f"Stopped: {session.role.title()} Claude failure")
+            self.refresh_status()
             self.exit()
             return True
 
@@ -1181,9 +1284,7 @@ class OrcApp(App[None]):
             }
             set_stop_reason(record, "child_failure")
             save_state(self.args.state_file, state)
-            self.update_status(
-                f"Stopped: {session.role.title()} Claude handoff failure"
-            )
+            self.refresh_status()
             self.exit()
             return True
 
@@ -1228,7 +1329,7 @@ class OrcApp(App[None]):
             }
             set_stop_reason(record, "child_failure")
             save_state(self.args.state_file, state)
-            self.update_status(f"Stopped: {session.role.title()} handoff error")
+            self.refresh_status()
             self.exit()
         finally:
             if previous_task is None:
@@ -1258,6 +1359,49 @@ class OrcApp(App[None]):
         except OSError as error:
             if error.errno not in (errno.EPIPE, errno.EBADF):
                 self.update_status(f"could not write to {session.role}: {error}")
+
+    def retire_session(self, session: ChildSession) -> None:
+        """Stop a child after a normal handoff without treating it as a failure."""
+
+        if getattr(session, "retired", False) or session.exited:
+            return
+        session.retired = True
+        try:
+            if self.event_loop is not None:
+                self.event_loop.remove_reader(session.master_fd)
+        except (NotImplementedError, ValueError):
+            pass
+        try:
+            os.killpg(session.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            try:
+                os.kill(session.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        retired_sessions = getattr(self, "retired_sessions", None)
+        if retired_sessions is None:
+            retired_sessions = []
+            self.retired_sessions = retired_sessions
+        retired_sessions.append(session)
+        if self.sessions.get(session.role) is session:
+            del self.sessions[session.role]
+
+    def retire_completed_sessions(self, record: dict[str, Any]) -> None:
+        handoffs = record.get("handoffs", [])
+        if not isinstance(handoffs, list):
+            return
+        for session in list(self.sessions.values()):
+            if session.exited or getattr(session, "retired", False):
+                continue
+            handoff_count = getattr(session, "handoff_count", 0)
+            new_handoffs = handoffs[handoff_count:]
+            if any(
+                isinstance(handoff, dict) and handoff.get("role") == session.role
+                for handoff in new_handoffs
+            ):
+                self.retire_session(session)
 
     def resize_session(self, session: ChildSession) -> None:
         width, height = self.pane_terminal_size(session.pane)
@@ -1312,18 +1456,14 @@ class OrcApp(App[None]):
         self.on_terminal_resize(_event)
 
     def active_status(self) -> str:
-        backend = "codex"
-        try:
-            record = load_state(self.args.state_file).get(self.task_id)
-            if isinstance(record, dict):
-                backend = backend_from_record(record)
-        except (AttributeError, SystemExit):
-            pass
-        layout = f" · layout: {self.layout_mode}" if self.layout_mode else ""
-        return (
-            f"{self.active_role.title()} active · backend: {backend}"
-            f"{layout} · {FOCUS_STATUS}"
-        )
+        args = getattr(self, "args", None)
+        if args is None or not hasattr(args, "state_file"):
+            return f"{self.active_role.title()} active · {ORC_VERSION} · {FOCUS_STATUS}"
+        state = load_state(args.state_file)
+        record = state.get(self.task_id)
+        if not isinstance(record, dict):
+            return f"{self.task_id} · unknown · {ORC_VERSION} · {FOCUS_STATUS}"
+        return self.status_text(record)
 
     def update_layout(self) -> None:
         if not self.is_running:
@@ -1356,15 +1496,18 @@ class OrcApp(App[None]):
 
         if mode != self.layout_mode:
             self.layout_mode = mode
-            self.update_status(self.active_status())
             self.schedule_resize()
+        self.refresh_status()
 
     def update_status(self, message: str) -> None:
         self.last_status = message
-        if self.is_running:
-            self.query_one("#status-message", Static).update(
-                f"{self.task_id} · {message}"
+        if getattr(self, "_running", False):
+            rendered = (
+                message
+                if message.startswith(f"{self.task_id} ·")
+                else f"{self.task_id} · {message}"
             )
+            self.query_one("#status-message", Static).update(rendered)
 
     def poll_state(self) -> None:
         state = load_state(self.args.state_file)
@@ -1372,25 +1515,34 @@ class OrcApp(App[None]):
         if not isinstance(record, dict):
             return
 
+        self.retire_completed_sessions(record)
+
         if deadline_expired(record):
             set_stop_reason(record, "deadline")
             save_state(self.args.state_file, state)
-            self.update_status("Stopped: automatic deadline expired")
+            self.refresh_status()
             self.exit()
             return
 
         status = record.get("status")
-        if status in {"paused", "blocked", "stopped", "completed"}:
-            reason = record.get("stop_reason", "manual_pause")
-            self.update_status(f"Stopped: {reason}")
+        if status == "completed":
+            self.refresh_status()
+            return
+        if status in {"paused", "blocked", "stopped"}:
+            self.refresh_status()
             self.exit()
             return
 
         if record.get("phase") in {"reviewer", "implementer"}:
             self.launch_role(str(record["phase"]))
+        self.refresh_status()
 
     def poll_children(self) -> None:
-        for session in self.sessions.values():
+        sessions = [
+            *list(self.sessions.values()),
+            *list(getattr(self, "retired_sessions", [])),
+        ]
+        for session in sessions:
             if session.exited:
                 continue
             try:
@@ -1407,12 +1559,36 @@ class OrcApp(App[None]):
                     pass
                 state = load_state(self.args.state_file)
                 record = state.get(self.task_id)
+                if getattr(session, "retired", False):
+                    try:
+                        os.close(session.master_fd)
+                    except OSError:
+                        pass
+                    if session in getattr(self, "retired_sessions", []):
+                        self.retired_sessions.remove(session)
+                    self.refresh_status()
+                    continue
                 if (
                     isinstance(record, dict)
                     and getattr(session, "backend", "codex") == "claude"
                 ):
                     self.drain_session(session)
                     self.handle_claude_exit(session, state, record, _status)
+                    continue
+                if isinstance(record, dict) and child_exit_code(_status) != 0:
+                    record["child_failure"] = {
+                        "role": session.role,
+                        "backend": "codex",
+                        "exit_status": _status,
+                        "reason": (
+                            f"Codex exited with status {child_exit_code(_status)}"
+                        ),
+                        "time": iso_now(),
+                    }
+                    set_stop_reason(record, "child_failure")
+                    save_state(self.args.state_file, state)
+                    self.refresh_status()
+                    self.exit()
                     continue
                 expected_handoff = (
                     isinstance(record, dict) and record.get("phase") != session.role
@@ -1444,13 +1620,12 @@ class OrcApp(App[None]):
                     }
                     set_stop_reason(record, "child_failure")
                     save_state(self.args.state_file, state)
-                    self.update_status(f"Stopped: {session.role.title()} child failure")
+                    self.refresh_status()
                     self.exit()
                 elif session.role == self.active_role and not expected_handoff:
-                    self.update_status(
-                        f"{session.role.title()} ended; use resume to continue"
-                    )
+                    self.refresh_status()
                     self.exit()
+                self.refresh_status()
 
     def on_key(self, event: Any) -> None:
         key = event.key
@@ -1521,7 +1696,11 @@ class OrcApp(App[None]):
         self.exit()
 
     def on_unmount(self) -> None:
-        for session in self.sessions.values():
+        sessions = [
+            *self.sessions.values(),
+            *getattr(self, "retired_sessions", []),
+        ]
+        for session in sessions:
             try:
                 if self.event_loop is not None:
                     self.event_loop.remove_reader(session.master_fd)
@@ -1662,6 +1841,7 @@ def resume(args: argparse.Namespace) -> None:
     requests.append(args.prompt)
     record["user_requests"] = requests
     record["last_user_request"] = args.prompt
+    record.pop("child_failure", None)
     previous_status = record.get("status")
     record["status"] = "active"
     if reviewer_rollout_failed:
@@ -1784,6 +1964,14 @@ def idle_hook(args: argparse.Namespace) -> None:
         "message": assistant_message_from_payload(payload),
         "status": status,
     }
+    generation = payload_field(payload, "generation")
+    if generation is None:
+        generation = os.environ.get("ORC_ROLE_GENERATION")
+    if generation is not None:
+        try:
+            handoff["generation"] = int(generation)
+        except (TypeError, ValueError):
+            pass
     handoff.update(handoff_details(payload))
     if status == UNABLE_TO_PROCEED:
         handoff["reason"] = reason
@@ -1826,10 +2014,7 @@ def idle_hook(args: argparse.Namespace) -> None:
         re.search(r"(?im)^\s*TASK COMPLETE\s*$", message)
     )
     if record["reviewer_reported_complete"]:
-        # Keep the historical paused status while making completion explicit.
-        record["status"] = "paused"
-        record["phase"] = "complete"
-        record["stop_reason"] = "completion"
+        set_stop_reason(record, "completion", completed=True)
     elif record.get("automatic_rounds"):
         maximum = int(record.get("max_rounds", DEFAULT_MAX_ROUNDS))
         if int(record.get("round", 0)) >= maximum:
