@@ -1908,3 +1908,450 @@ def test_resume_rejects_completion_as_terminal(
     with pytest.raises(SystemExit, match="already complete"):
         orc.resume(args)
     assert orc.load_state(state_file) == state
+
+
+def make_fake_claude(path: Path, *, compatible: bool = True) -> None:
+    help_text = (
+        "Usage: claude [--print] [--output-format stream-json] "
+        "[--input-format text] [--resume SESSION-ID]"
+        if compatible
+        else "Usage: claude"
+    )
+    path.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, pathlib, sys\n"
+        f"help_text = {help_text!r}\n"
+        "if '--help' in sys.argv:\n"
+        "    print(help_text)\n"
+        "    raise SystemExit(0)\n"
+        "if '--version' in sys.argv:\n"
+        "    print('Claude Code test 1.2.3')\n"
+        "    raise SystemExit(0)\n"
+        "if os.environ.get('ORC_CAPTURE'):\n"
+        "    pathlib.Path(os.environ['ORC_CAPTURE']).write_text(json.dumps(sys.argv))\n"
+        "print(json.dumps({'type': 'system', 'session_id': 'claude-test'}), "
+        "flush=True)\n"
+        "print(json.dumps({'type': 'result', 'session_id': 'claude-test', "
+        "'result': 'Status: COMPLETE\\nSummary: done'}), flush=True)\n"
+    )
+    path.chmod(0o755)
+
+
+def test_claude_cli_selection_and_probe_before_state_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    fake = tmp_path / "fake claude"
+    make_fake_claude(fake)
+    state_file = tmp_path / "state.json"
+    monkeypatch.setenv("ORC_CLAUDE_COMMAND", str(fake))
+    args = orc.parse_args(
+        [
+            "--state-file",
+            str(state_file),
+            "begin",
+            str(target),
+            "TASK-006",
+            "implement",
+            "--backend",
+            "claude",
+        ]
+    )
+    monkeypatch.setattr(orc, "run_app", lambda *_: None)
+    orc.begin(args)
+    record = orc.load_state(state_file)["TASK-006"]
+    assert record["backend"] == "claude"
+    assert record["backend_command"] == str(fake)
+    assert record["backend_version"] == "Claude Code test 1.2.3"
+    assert record["claude_session_id"] is None
+
+    bad = tmp_path / "bad claude"
+    make_fake_claude(bad, compatible=False)
+    bad_state = tmp_path / "bad-state.json"
+    monkeypatch.setenv("ORC_CLAUDE_COMMAND", str(bad))
+    bad_args = orc.parse_args(
+        [
+            "--state-file",
+            str(bad_state),
+            "begin",
+            str(target),
+            "TASK-006-BAD",
+            "implement",
+            "--backend",
+            "claude",
+        ]
+    )
+    with pytest.raises(SystemExit, match="incompatible"):
+        orc.begin(bad_args)
+    assert not bad_state.exists()
+
+
+def test_claude_resume_reuses_stored_backend_and_rejects_conflict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    state_file = tmp_path / "state.json"
+    state = {
+        "TASK-006": {
+            "status": "paused",
+            "phase": "reviewer",
+            "target_directory": str(target.resolve()),
+            "user_requests": [],
+            "backend": "claude",
+            "backend_command": "missing-claude",
+            "claude_session_id": "claude-test",
+        }
+    }
+    orc.save_state(state_file, state)
+    conflict = orc.parse_args(
+        [
+            "--state-file",
+            str(state_file),
+            "resume",
+            str(target),
+            "TASK-006",
+            "continue",
+            "--backend",
+            "codex",
+        ]
+    )
+    with pytest.raises(SystemExit, match="cannot resume with backend"):
+        orc.resume(conflict)
+    assert orc.load_state(state_file) == state
+
+
+def test_claude_launch_argv_and_agentbox_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "identity"
+    marker.write_text("arbitrary")
+    monkeypatch.setattr(orc, "AGENTBOX_IDENTITY", marker)
+    monkeypatch.setattr(orc.sys, "platform", "linux")
+    command = orc.backend_launch_command(
+        "claude",
+        ["claude executable with spaces"],
+        "Prompt",
+        "TASK-006",
+        "implementer",
+        None,
+        False,
+        False,
+        tmp_path / "state.json",
+    )
+    assert command[:6] == [
+        "claude executable with spaces",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--input-format",
+        "text",
+    ]
+    assert command[-2] == orc.CLAUDE_AGENTBOX_FLAG
+    assert command.count(orc.CLAUDE_AGENTBOX_FLAG) == 1
+    resumed = orc.backend_launch_command(
+        "claude",
+        ["claude"],
+        "Follow up",
+        "TASK-006",
+        "implementer",
+        "claude-test",
+        True,
+        False,
+        tmp_path / "state.json",
+    )
+    assert resumed[6:8] == ["--resume", "claude-test"]
+    monkeypatch.setattr(orc, "AGENTBOX_IDENTITY", tmp_path / "absent")
+    assert orc.CLAUDE_AGENTBOX_FLAG not in orc.backend_launch_command(
+        "claude",
+        ["claude"],
+        "Prompt",
+        "TASK-006",
+        "implementer",
+        None,
+        False,
+        False,
+        tmp_path / "state.json",
+    )
+
+
+def test_claude_stream_parser_requires_session_and_valid_handoff() -> None:
+    session = orc.ChildSession("implementer", 1, 1, object(), backend="claude")
+    orc.OrcApp.read_claude_stream(
+        session,
+        b'{"type":"system","session_id":"claude-test"}\n'
+        b'{"type":"result","session_id":"claude-test",'
+        b'"result":"Status: COMPLETE\\nSummary: done"}\n',
+    )
+    payload = orc.OrcApp.claude_handoff(session)
+    assert payload == {
+        "session_id": "claude-test",
+        "last-assistant-message": "Status: COMPLETE\nSummary: done",
+    }
+    incomplete = orc.ChildSession("implementer", 1, 1, object(), backend="claude")
+    orc.OrcApp.read_claude_stream(
+        incomplete,
+        b'{"type":"result","session_id":"claude-test",'
+        b'"result":"finished without handoff"}\n',
+    )
+    assert orc.OrcApp.claude_handoff(incomplete) is None
+
+
+def test_claude_stream_handles_noise_and_message_shapes() -> None:
+    session = orc.ChildSession("implementer", 1, 1, object(), backend="claude")
+    orc.OrcApp.read_claude_stream(
+        session,
+        b"terminal noise\n[1, 2]\n"
+        b'{"type":"assistant","message":"plain"}\n'
+        b'{"type":"assistant","message":{"content":"string"}}\n'
+        b'{"type":"assistant","message":{"content":[{"text":"part"}]}}\n'
+        b'{"type":"error","subtype":"error","result":"backend failed"}\n',
+    )
+    assert session.final_response == "backend failed"
+    assert session.stream_error == "backend failed"
+    assert orc.backend_command_value(["claude", "--wrapper"]) == [
+        "claude",
+        "--wrapper",
+    ]
+    with pytest.raises(SystemExit, match="backend command"):
+        orc.backend_command_value([])
+
+
+def test_claude_sessions_are_role_specific(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    record: dict[str, object] = {
+        "status": "active",
+        "phase": "reviewer",
+        "round": 1,
+        "target_directory": str(target),
+        "prompt": "initial",
+        "user_requests": [],
+        "backend": "claude",
+        "backend_command": "claude",
+        "claude_sessions": {"implementer": "igor-session"},
+        "implementer_id": "igor-session",
+        "reviewer_id": None,
+    }
+    app, _state_file, _panes = app_stub(tmp_path, record)
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        app,
+        "fork_codex",
+        lambda command, _environment, _cwd=None: (
+            commands.append(command) or (123, os.open("/dev/null", os.O_RDWR))
+        ),
+    )
+    monkeypatch.setattr(app, "set_master_reader", lambda _session: None)
+    monkeypatch.setattr(app, "resize_session", lambda _session: None)
+    monkeypatch.setattr(app, "update_layout", lambda: None)
+    monkeypatch.setattr(app, "update_status", lambda _message: None)
+
+    app.launch_role("reviewer")
+
+    assert commands
+    assert "--resume" not in commands[0]
+    assert "Review the target project's current worktree" in commands[0][-1]
+
+
+def test_claude_nonzero_exit_is_child_failure_even_with_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    record: dict[str, object] = {
+        "status": "active",
+        "phase": "reviewer",
+        "round": 1,
+        "target_directory": str(target),
+        "backend": "claude",
+        "handoffs": [],
+        "reviewer_id": "claude-test",
+    }
+    app, state_file, panes = app_stub(tmp_path, record)
+    app.exit = lambda: None
+    app.update_status = lambda _message: None
+    session = orc.ChildSession(
+        "reviewer",
+        1,
+        1,
+        panes["reviewer"],
+        backend="claude",
+        session_id="claude-test",
+        final_response="Status: COMPLETE",
+        stream_events=[
+            {
+                "type": "result",
+                "session_id": "claude-test",
+                "result": "Status: COMPLETE",
+            }
+        ],
+    )
+
+    state = orc.load_state(state_file)
+    app.handle_claude_exit(session, state, state["TASK-003"], 256)
+
+    saved = orc.load_state(state_file)["TASK-003"]
+    assert saved["stop_reason"] == "child_failure"
+    assert saved["child_failure"]["reason"] == "Claude exited with status 1"
+    assert not saved["handoffs"]
+
+
+def test_claude_unavailable_command_has_clear_diagnostic() -> None:
+    with pytest.raises(SystemExit, match="cannot run Claude backend"):
+        orc.probe_claude(["missing-claude-command"])
+
+
+@pytest.mark.integration
+def test_claude_real_pty_clean_exit_records_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    fake = tmp_path / "fake claude"
+    make_fake_claude(fake)
+    record: dict[str, object] = {
+        "status": "active",
+        "phase": "reviewer",
+        "round": 1,
+        "target_directory": str(target),
+        "prompt": "initial",
+        "user_requests": [],
+        "backend": "claude",
+        "backend_command": str(fake),
+        "backend_version": "Claude Code test 1.2.3",
+        "claude_session_id": None,
+        "claude_sessions": {},
+        "reviewer_id": None,
+        "handoffs": [],
+    }
+    app, state_file, _panes = app_stub(tmp_path, record)
+    app.exit = lambda: None
+    app.set_master_reader = lambda _session: None
+    app.resize_session = lambda _session: None
+    app.update_layout = lambda: None
+    app.update_status = lambda _message: None
+    app.launch_role("reviewer")
+    session = app.sessions["reviewer"]
+    _pid, status = os.waitpid(session.pid, 0)
+    assert os.WIFEXITED(status)
+    # The bytes remain readable from the PTY after the child exits.
+    app.read_session(session)
+    monkeypatch.setattr(
+        orc.os,
+        "waitpid",
+        lambda *_: (_ for _ in ()).throw(ChildProcessError()),
+    )
+    app.poll_children()
+    saved = orc.load_state(state_file)["TASK-003"]
+    assert saved["reviewer_id"] == "claude-test"
+    assert saved["claude_session_id"] == "claude-test"
+    assert saved["stop_reason"] == "completion"
+
+
+@pytest.mark.integration
+def test_claude_real_pty_resume_uses_role_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    fake = tmp_path / "fake claude"
+    capture = tmp_path / "capture.json"
+    make_fake_claude(fake)
+    monkeypatch.setenv("ORC_CAPTURE", str(capture))
+    monkeypatch.setattr(orc, "AGENTBOX_IDENTITY", tmp_path / "absent")
+    record: dict[str, object] = {
+        "status": "active",
+        "phase": "reviewer",
+        "round": 1,
+        "target_directory": str(target),
+        "prompt": "initial",
+        "user_requests": ["review again"],
+        "backend": "claude",
+        "backend_command": str(fake),
+        "claude_sessions": {"reviewer": "old-reviewer-session"},
+        "reviewer_id": "old-reviewer-session",
+        "handoffs": [],
+    }
+    app, state_file, _panes = app_stub(tmp_path, record)
+    app.exit = lambda: None
+    app.set_master_reader = lambda _session: None
+    app.resize_session = lambda _session: None
+    app.update_layout = lambda: None
+    app.update_status = lambda _message: None
+    app.launch_role("reviewer")
+    session = app.sessions["reviewer"]
+    _pid, status = os.waitpid(session.pid, 0)
+    assert os.WIFEXITED(status)
+    app.read_session(session)
+    monkeypatch.setattr(
+        orc.os,
+        "waitpid",
+        lambda *_: (_ for _ in ()).throw(ChildProcessError()),
+    )
+    app.poll_children()
+
+    argv = json.loads(capture.read_text())
+    assert argv[argv.index("--resume") : argv.index("--resume") + 2] == [
+        "--resume",
+        "old-reviewer-session",
+    ]
+    assert orc.load_state(state_file)["TASK-003"]["stop_reason"] == "completion"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("role", ["implementer", "reviewer"])
+@pytest.mark.parametrize("marker_present", [False, True])
+def test_claude_real_pty_agentbox_launches_both_roles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    role: str,
+    marker_present: bool,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    fake = tmp_path / "fake claude"
+    capture = tmp_path / "capture.json"
+    make_fake_claude(fake)
+    marker = tmp_path / "identity"
+    if marker_present:
+        marker.write_text("")
+    monkeypatch.setattr(orc, "AGENTBOX_IDENTITY", marker)
+    monkeypatch.setattr(orc.sys, "platform", "linux")
+    monkeypatch.setenv("ORC_CAPTURE", str(capture))
+    record: dict[str, object] = {
+        "status": "active",
+        "phase": role,
+        "round": 1,
+        "target_directory": str(target),
+        "prompt": "initial",
+        "user_requests": [],
+        "backend": "claude",
+        "backend_command": str(fake),
+        "claude_sessions": {},
+        f"{role}_id": None,
+        "handoffs": [],
+    }
+    app, _state_file, _panes = app_stub(tmp_path, record)
+    app.exit = lambda: None
+    app.set_master_reader = lambda _session: None
+    app.resize_session = lambda _session: None
+    app.update_layout = lambda: None
+    app.update_status = lambda _message: None
+    app.launch_role(role)
+    session = app.sessions[role]
+    _pid, status = os.waitpid(session.pid, 0)
+    assert os.WIFEXITED(status)
+    app.read_session(session)
+    monkeypatch.setattr(
+        orc.os,
+        "waitpid",
+        lambda *_: (_ for _ in ()).throw(ChildProcessError()),
+    )
+    app.poll_children()
+
+    argv = json.loads(capture.read_text())
+    assert argv.count(orc.CLAUDE_AGENTBOX_FLAG) == int(marker_present)

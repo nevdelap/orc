@@ -1,9 +1,10 @@
 # Orc
 
-Orc is a terminal orchestrator for two interactive Codex roles: Igor, the
-implementer, and Rufus, the reviewer. It keeps both roles in a split Textual
-terminal UI, forwards input to the selected role, and pauses after each
-implement/review round so the work can be inspected or resumed.
+Orc is a terminal orchestrator for two agent roles: Igor, the implementer, and
+Rufus, the reviewer. Codex is the default backend; Claude Code can be selected
+for a task. Orc keeps both roles in a split Textual terminal UI, forwards
+input to the selected role, and pauses after each implement/review round so the
+work can be inspected or resumed.
 
 ## Prerequisites
 
@@ -12,6 +13,9 @@ implement/review round so the work can be inspected or resumed.
 - [uv](https://docs.astral.sh/uv/) for the recommended launch method.
 - The `codex` executable available on `PATH`, or `CODEX_COMMAND` set to its
   path.
+- Claude Code is optional. To use it, the `claude` executable must be on
+  `PATH`, or `ORC_CLAUDE_COMMAND` must name the executable. It must support
+  print mode with stream JSON and session resume.
 - A Git target project is recommended because handoffs record its current
   commit. A target does not need to be the directory containing Orc.
 
@@ -19,10 +23,11 @@ implement/review round so the work can be inspected or resumed.
 
 On Linux, Orc detects the agentbox confinement marker at
 `/etc/agentbox/identity`. When that file exists, every Codex begin and resume
-launch receives `--dangerously-bypass-approvals-and-sandbox`; the marker contents
-are ignored. When it is absent, Orc leaves Codex's normal approval prompts and
-internal sandbox behavior unchanged. This is an agentbox environment signal,
-not a user task option.
+launch receives `--dangerously-bypass-approvals-and-sandbox`, and every Claude
+begin and resume launch receives `--dangerously-skip-permissions`; the marker
+contents are ignored. When it is absent, Orc leaves each backend's normal
+approval and permission behavior unchanged. This is an agentbox environment
+signal, not a user task option.
 
 Agentbox provides the confined Sysbox container as the external safety boundary
 for this mode; see the [agentbox GitHub repository](https://github.com/nevdelap/agentbox)
@@ -41,6 +46,27 @@ The equivalent explicit form is useful when diagnosing the launcher:
 ```console
 uv run --script orc begin DIRECTORY TASK-ID PROMPT
 ```
+
+Select Claude Code explicitly for a new task:
+
+```console
+./orc begin DIRECTORY TASK-ID PROMPT --backend claude
+```
+
+Orc probes the selected Claude executable with `--help` before creating task
+state. The help output must advertise `--print`, `--output-format stream-json`, `--input-format text`, and `--resume`. Claude is run in print
+mode with newline-delimited JSON; its session ID and final response are stored
+in the shared task state. Resume uses the stored backend and session:
+
+```console
+./orc resume DIRECTORY TASK-ID PROMPT
+```
+
+Passing `--backend` to `resume` is optional, but if supplied it must match the
+backend recorded by `begin`. `ORC_CLAUDE_COMMAND` is read at begin and the
+selected executable is retained in task state, so resume does not silently
+switch backends. A clean Claude exit without a session ID and valid handoff is
+recorded as a child failure.
 
 For a managed checkout, install the locked environment first, then use either
 form above:
@@ -70,10 +96,11 @@ the command with `--state-file`:
 uv run --script orc --state-file /tmp/orc-state.json begin DIRECTORY TASK-ID PROMPT
 ```
 
-The task record retains the normalized target directory, role thread IDs,
-round state, user requests, idle events, handoff messages, and the short Git
-commit observed in the target repository. Keep the state file outside the
-target project when the target has its own source-control or backup policy.
+The task record retains the normalized target directory, backend and command,
+backend version, Codex thread IDs or Claude session IDs, round state, user
+requests, idle events, handoff messages, and the short Git commit observed in
+the target repository. Keep the state file outside the target project when
+the target has its own source-control or backup policy.
 
 ## Workflow
 
@@ -155,6 +182,13 @@ the task later with the same target directory.
   at least 80x24 for normal operation.
 - **Codex cannot start:** set `CODEX_COMMAND` or pass `--codex`, and verify the
   executable can run from the target directory.
+- **Claude cannot start:** set `ORC_CLAUDE_COMMAND` to the Claude executable and
+  run it with `--help`. Orc requires the print/stream/resume capability
+  contract; an incompatible or unavailable command is rejected before task
+  state changes.
+- **Claude produced no handoff:** Claude print mode must emit stream JSON with
+  a session ID and a final response containing the shared handoff `Status:`.
+  A clean exit without those fields is intentionally a child failure.
 - **Git commit is `unknown`:** the target may not be a Git worktree or its
   `HEAD` may be unavailable. Orchestration can still retain the handoff.
 

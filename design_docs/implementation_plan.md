@@ -157,7 +157,7 @@ Acceptance criteria:
 
 ## TASK-006 - Support Claude Code as an agent backend
 
-State: NEW
+State: COMPLETED
 
 Goal:
 

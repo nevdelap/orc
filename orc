@@ -7,7 +7,7 @@
 #   "textual>=1.0.0",
 # ]
 # ///
-"""Orchestrate interactive Igor and Rufus Codex sessions in one terminal."""
+"""Orchestrate interactive Igor and Rufus sessions in one terminal."""
 
 from __future__ import annotations
 
@@ -69,6 +69,16 @@ hash.
 ORC_VERSION = "orc v0.0.1"
 AGENTBOX_IDENTITY = Path("/etc/agentbox/identity")
 CODEX_AGENTBOX_FLAG = "--dangerously-bypass-approvals-and-sandbox"
+CLAUDE_AGENTBOX_FLAG = "--dangerously-skip-permissions"
+DEFAULT_CLAUDE_COMMAND = "claude"
+CLAUDE_REQUIRED_HELP = (
+    "--print",
+    "--output-format",
+    "stream-json",
+    "--input-format",
+    "text",
+    "--resume",
+)
 FOCUS_STATUS = "Click a pane to focus · Tab switches panes · Ctrl-Q exits"
 UNABLE_TO_PROCEED = "UNABLE_TO_PROCEED"
 DEFAULT_MAX_ROUNDS = 5
@@ -86,13 +96,13 @@ VALID_STOP_REASONS = {
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Orchestrate Igor and Rufus Codex sessions. "
+            "Orchestrate Igor and Rufus sessions. "
             "Usage: begin DIRECTORY TASK-ID PROMPT or "
             "resume DIRECTORY TASK-ID PROMPT."
         ),
         epilog=(
-            "On Linux, /etc/agentbox/identity enables Codex's external-"
-            "sandbox mode. The marker is detected by file existence only."
+            "On Linux, /etc/agentbox/identity enables the selected backend's "
+            "external-sandbox mode. The marker is detected by file existence only."
         ),
     )
     parser.add_argument(
@@ -118,6 +128,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     begin.add_argument("task_id", help="Task identifier, such as TASK-001.")
     begin.add_argument("prompt", help="Initial request for Igor.")
+    begin.add_argument(
+        "--backend",
+        choices=("codex", "claude"),
+        default="codex",
+        help="Agent backend (default: codex).",
+    )
     begin.add_argument(
         "--auto",
         action="store_true",
@@ -149,6 +165,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     resume.add_argument(
         "prompt",
         help="Follow-up or new request for Igor in this task context.",
+    )
+    resume.add_argument(
+        "--backend",
+        choices=("codex", "claude"),
+        default=None,
+        help="Backend to verify against the backend stored at begin.",
     )
 
     hook = commands.add_parser("idle-hook", help=argparse.SUPPRESS)
@@ -441,6 +463,172 @@ def add_agentbox_codex_flag(command: list[str]) -> list[str]:
     return command
 
 
+def add_agentbox_claude_flag(command: list[str]) -> list[str]:
+    """Add Claude's agentbox permission mode once when running in agentbox."""
+
+    if (
+        sys.platform == "linux"
+        and AGENTBOX_IDENTITY.exists()
+        and CLAUDE_AGENTBOX_FLAG not in command
+    ):
+        # The prompt is always the final argument. Keep the permission flag
+        # among the CLI options so a prompt beginning with a dash is still
+        # treated as input text by Claude Code.
+        command.insert(max(len(command) - 1, 1), CLAUDE_AGENTBOX_FLAG)
+    return command
+
+
+def backend_command_value(value: Any) -> list[str]:
+    """Normalize a configured executable without invoking a shell."""
+
+    if isinstance(value, str) and value:
+        return [value]
+    if (
+        isinstance(value, list)
+        and value
+        and all(isinstance(item, str) and item for item in value)
+    ):
+        return list(value)
+    raise SystemExit("backend command must be a non-empty executable")
+
+
+def claude_command() -> list[str]:
+    return backend_command_value(
+        os.environ.get("ORC_CLAUDE_COMMAND", DEFAULT_CLAUDE_COMMAND)
+    )
+
+
+def probe_claude(command: list[str]) -> str:
+    """Verify Claude Code's print/stream/resume capability contract."""
+
+    try:
+        result = subprocess.run(
+            [*command, "--help"],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+    except OSError as error:
+        raise SystemExit(
+            f"cannot run Claude backend {command[0]!r} for capability check: {error}"
+        ) from error
+    help_text = f"{result.stdout}\n{result.stderr}"
+    missing = [flag for flag in CLAUDE_REQUIRED_HELP if flag not in help_text]
+    if result.returncode != 0 or missing:
+        detail = ", ".join(missing) if missing else f"exit status {result.returncode}"
+        raise SystemExit(
+            f"Claude backend {command[0]!r} is incompatible; "
+            f"--help must expose print stream/resume support (missing {detail})"
+        )
+
+    # Version is useful state, but it is intentionally best-effort: the
+    # capability contract is established by --help and some wrappers do not
+    # implement --version.
+    try:
+        version = subprocess.run(
+            [*command, "--version"],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+    except OSError:
+        return "unknown"
+    value = (version.stdout or version.stderr).strip().splitlines()
+    return value[0][:200] if value else "unknown"
+
+
+def backend_from_record(record: dict[str, Any]) -> str:
+    backend = record.get("backend", "codex")
+    return backend if backend in {"codex", "claude"} else "codex"
+
+
+def stored_backend_command(record: dict[str, Any], backend: str) -> list[str]:
+    value = record.get("backend_command")
+    if value is None:
+        return claude_command() if backend == "claude" else ["codex"]
+    return backend_command_value(value)
+
+
+def claude_session_for_role(record: dict[str, Any], role: str) -> str | None:
+    sessions = record.get("claude_sessions")
+    if isinstance(sessions, dict):
+        value = sessions.get(role)
+        if isinstance(value, str) and value:
+            return value
+    value = record.get(f"{role}_id")
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def child_exit_code(status: int) -> int:
+    try:
+        return os.waitstatus_to_exitcode(status)
+    except (AttributeError, ValueError):
+        return status
+
+
+def backend_launch_command(
+    backend: str,
+    configured_command: list[str],
+    prompt: str,
+    task_id: str,
+    role: str,
+    thread_id: Any,
+    has_request: bool,
+    automatic: bool,
+    state_file: Path,
+) -> list[str]:
+    """Build an argv list for either backend without shell interpretation."""
+
+    if backend == "claude":
+        command = [
+            *configured_command,
+            "--print",
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "text",
+        ]
+        if isinstance(thread_id, str) and thread_id:
+            if not has_request and not automatic:
+                raise SystemExit(
+                    f"cannot resume {role}: no user request recorded for task {task_id}"
+                )
+            command.extend(["--resume", thread_id])
+        full_prompt = (
+            prompt
+            + f"\n\nTask ID: {task_id}\n"
+            + f"Session name: {session_name(task_id, role)}"
+        )
+        command.append(full_prompt)
+        return add_agentbox_claude_flag(command)
+
+    command = list(configured_command)
+    # General Orc testing can keep the agent session in place by setting
+    # ORC_DISABLE_IDLE_HOOK=1 for this launch.
+    if os.environ.get("ORC_DISABLE_IDLE_HOOK") != "1":
+        command.extend(
+            [
+                "-c",
+                f"notify={notify_config(state_file)}",
+            ]
+        )
+    if isinstance(thread_id, str) and thread_id:
+        if not has_request and not automatic:
+            raise SystemExit(
+                f"cannot resume {role}: no user request recorded for task {task_id}"
+            )
+        command.extend(["resume", thread_id, prompt])
+    else:
+        full_prompt = (
+            f"{prompt}\n\nTask ID: {task_id}\n"
+            f"Session name: {session_name(task_id, role)}"
+        )
+        command.append(full_prompt)
+    return add_agentbox_codex_flag(command)
+
+
 def set_pty_size(fd: int, width: int, height: int) -> None:
     width = max(width, 2)
     height = max(height, 2)
@@ -578,11 +766,21 @@ class ChildSession:
     pid: int
     master_fd: int
     pane: SessionPane
+    backend: str = "codex"
+    stream_buffer: str = ""
+    stream_events: list[dict[str, Any]] | None = None
+    session_id: str | None = None
+    final_response: str | None = None
+    stream_error: str | None = None
     exited: bool = False
+
+    def __post_init__(self) -> None:
+        if self.stream_events is None:
+            self.stream_events = []
 
 
 class OrcApp(App[None]):
-    """Own the terminal and multiplex the two interactive Codex PTYs."""
+    """Own the terminal and multiplex the two agent backend PTYs."""
 
     CSS = """
     Screen {
@@ -707,9 +905,29 @@ class OrcApp(App[None]):
             self.exit()
             return
 
+        backend = backend_from_record(record)
+
         requests = record.get("user_requests", [])
+        if not isinstance(requests, list):
+            self.fatal_error(
+                f"cannot launch {role}: invalid user requests for task {self.task_id}"
+            )
+            return
         has_request = isinstance(requests, list) and bool(requests)
         thread_id = record.get(f"{role}_id")
+        if backend == "claude":
+            thread_id = claude_session_for_role(record, role)
+        if (
+            isinstance(thread_id, str)
+            and thread_id
+            and not has_request
+            and not record.get("automatic_rounds")
+        ):
+            self.fatal_error(
+                f"cannot resume {role}: no user request recorded for task "
+                f"{self.task_id}"
+            )
+            return
         auto_continuation = bool(record.get("automatic_rounds")) and bool(
             isinstance(thread_id, str) and thread_id
         )
@@ -743,42 +961,22 @@ class OrcApp(App[None]):
         else:
             prompt = reviewer_prompt(record) + "\n\n" + HANDOFF_PROMPT
 
-        configured_command = self.args.codex
-        command = (
-            [configured_command]
-            if isinstance(configured_command, str)
-            else list(configured_command)
+        configured_command = (
+            stored_backend_command(record, backend)
+            if backend == "claude"
+            else getattr(self.args, "codex", "codex")
         )
-        # General Orc testing can keep the agent session in place by setting
-        # ORC_DISABLE_IDLE_HOOK=1 for this launch.
-        if os.environ.get("ORC_DISABLE_IDLE_HOOK") != "1":
-            command.extend(
-                [
-                    "-c",
-                    f"notify={notify_config(self.args.state_file)}",
-                ]
-            )
-        if isinstance(thread_id, str) and thread_id:
-            if not isinstance(requests, list):
-                self.fatal_error(
-                    f"cannot resume {role}: invalid user requests for task "
-                    f"{self.task_id}"
-                )
-                return
-            if not requests and not record.get("automatic_rounds"):
-                self.fatal_error(
-                    f"cannot resume {role}: no user request recorded for task "
-                    f"{self.task_id}"
-                )
-                return
-            command.extend(["resume", thread_id, prompt])
-        else:
-            full_prompt = (
-                f"{prompt}\n\nTask ID: {self.task_id}\n"
-                f"Session name: {session_name(self.task_id, role)}"
-            )
-            command.append(full_prompt)
-        add_agentbox_codex_flag(command)
+        command = backend_launch_command(
+            backend,
+            backend_command_value(configured_command),
+            prompt,
+            self.task_id,
+            role,
+            thread_id,
+            bool(requests),
+            bool(record.get("automatic_rounds")),
+            self.args.state_file,
+        )
 
         environment = os.environ.copy()
         # The child is connected to Orc's ANSI-capable terminal emulator, not
@@ -792,6 +990,8 @@ class OrcApp(App[None]):
         environment["ORC_ROUND"] = str(record.get("round", 0))
         environment["ORC_ROLE_GENERATION"] = str(generation)
         environment["ORC_TARGET_DIRECTORY"] = str(target_directory)
+        environment["ORC_BACKEND"] = backend
+        environment["ORC_STATE_FILE"] = str(self.args.state_file)
         try:
             pid, master_fd = self.fork_codex(command, environment, target_directory)
         except OSError as error:
@@ -801,7 +1001,7 @@ class OrcApp(App[None]):
         os.set_blocking(master_fd, False)
         pane = self.pane(role)
         pane.show_message(f"Starting {role.title()}…")
-        session = ChildSession(role, pid, master_fd, pane)
+        session = ChildSession(role, pid, master_fd, pane, backend=backend)
         self.sessions[role] = session
         self.started_roles.add(role)
         self.active_role = role
@@ -844,6 +1044,210 @@ class OrcApp(App[None]):
             return
         if data:
             session.pane.feed(data)
+            if getattr(session, "backend", "codex") == "claude":
+                self.read_claude_stream(session, data)
+
+    @staticmethod
+    def _claude_event_text(event: dict[str, Any]) -> str | None:
+        result = event.get("result")
+        if isinstance(result, str) and result:
+            return result
+        message = event.get("message")
+        if isinstance(message, str) and message:
+            return message
+        if isinstance(message, dict):
+            content = message.get("content")
+            if isinstance(content, str) and content:
+                return content
+            if isinstance(content, list):
+                parts = []
+                for item in content:
+                    if isinstance(item, dict) and isinstance(item.get("text"), str):
+                        parts.append(item["text"])
+                if parts:
+                    return "".join(parts)
+        return None
+
+    @classmethod
+    def read_claude_stream(cls, session: ChildSession, data: bytes) -> None:
+        session.stream_buffer += data.decode("utf-8", errors="replace")
+        lines = session.stream_buffer.splitlines(keepends=True)
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            session.stream_buffer = lines.pop()
+        else:
+            session.stream_buffer = ""
+        for line in lines:
+            try:
+                value = json.loads(line.strip())
+            except json.JSONDecodeError:
+                # PTY output can contain terminal noise. Preserve it in the
+                # pane, but only JSON objects participate in the backend
+                # protocol.
+                continue
+            if not isinstance(value, dict):
+                continue
+            if session.stream_events is None:
+                session.stream_events = []
+            session.stream_events.append(value)
+            session_id = session_id_from_payload(value)
+            if session_id:
+                session.session_id = session_id
+            if value.get("is_error") is True or value.get("subtype") == "error":
+                session.stream_error = cls._claude_event_text(value) or "Claude error"
+            text = cls._claude_event_text(value)
+            if text:
+                session.final_response = text
+
+    def drain_session(self, session: ChildSession) -> None:
+        """Read output that arrived just before a child exited."""
+
+        while True:
+            try:
+                data = os.read(session.master_fd, 65536)
+            except BlockingIOError:
+                return
+            except OSError as error:
+                if error.errno not in (errno.EIO, errno.EBADF):
+                    self.update_status(f"{session.role.title()} PTY error: {error}")
+                return
+            if not data:
+                return
+            session.pane.feed(data)
+            if getattr(session, "backend", "codex") == "claude":
+                self.read_claude_stream(session, data)
+
+    @staticmethod
+    def claude_handoff(session: ChildSession) -> dict[str, Any] | None:
+        events = session.stream_events or []
+        if session.stream_buffer.strip():
+            OrcApp.read_claude_stream(session, b"\n")
+            events = session.stream_events or []
+        if not session.session_id:
+            for event in events:
+                session.session_id = session_id_from_payload(event)
+                if session.session_id:
+                    break
+        final_response = session.final_response
+        for event in reversed(events):
+            if event.get("type") == "result":
+                result = event.get("result")
+                if isinstance(result, str) and result:
+                    final_response = result
+                break
+        if not session.session_id or not final_response or session.stream_error:
+            return None
+        payload: dict[str, Any] = {
+            "session_id": session.session_id,
+            "last-assistant-message": final_response,
+        }
+        status = handoff_status(payload)
+        if status is None:
+            return None
+        return payload
+
+    def handle_claude_exit(
+        self,
+        session: ChildSession,
+        state: dict[str, Any],
+        record: dict[str, Any],
+        status: int,
+    ) -> bool:
+        """Turn a Claude stream's final message into the shared idle event."""
+
+        exit_code = child_exit_code(status)
+        if exit_code != 0:
+            record["child_failure"] = {
+                "role": session.role,
+                "backend": "claude",
+                "exit_status": status,
+                "reason": f"Claude exited with status {exit_code}",
+                "time": iso_now(),
+            }
+            set_stop_reason(record, "child_failure")
+            save_state(self.args.state_file, state)
+            self.update_status(f"Stopped: {session.role.title()} Claude failure")
+            self.exit()
+            return True
+
+        payload = self.claude_handoff(session)
+        if payload is None:
+            record["child_failure"] = {
+                "role": session.role,
+                "backend": "claude",
+                "exit_status": status,
+                "reason": session.stream_error
+                or "clean Claude exit without a valid handoff",
+                "time": iso_now(),
+            }
+            set_stop_reason(record, "child_failure")
+            save_state(self.args.state_file, state)
+            self.update_status(
+                f"Stopped: {session.role.title()} Claude handoff failure"
+            )
+            self.exit()
+            return True
+
+        session_id = session.session_id
+        if session_id:
+            record["claude_session_id"] = session_id
+            record["claude_final_response"] = session.final_response
+            sessions = record.setdefault("claude_sessions", {})
+            if not isinstance(sessions, dict):
+                sessions = {}
+                record["claude_sessions"] = sessions
+            sessions[session.role] = session_id
+            record[f"{session.role}_id"] = session_id
+            save_state(self.args.state_file, state)
+
+        previous_task = os.environ.get("ORC_TASK_ID")
+        previous_role = os.environ.get("ORC_ROLE")
+        previous_round = os.environ.get("ORC_ROUND")
+        previous_generation = os.environ.get("ORC_ROLE_GENERATION")
+        os.environ["ORC_TASK_ID"] = self.task_id
+        os.environ["ORC_ROLE"] = session.role
+        os.environ["ORC_ROUND"] = str(record.get("round", 0))
+        generations = record.get("role_generations")
+        if isinstance(generations, dict) and session.role in generations:
+            os.environ["ORC_ROLE_GENERATION"] = str(generations[session.role])
+        else:
+            os.environ.pop("ORC_ROLE_GENERATION", None)
+        try:
+            idle_hook(
+                argparse.Namespace(
+                    state_file=self.args.state_file,
+                    payload=json.dumps(payload),
+                )
+            )
+        except SystemExit as error:
+            record["child_failure"] = {
+                "role": session.role,
+                "backend": "claude",
+                "exit_status": status,
+                "reason": str(error),
+                "time": iso_now(),
+            }
+            set_stop_reason(record, "child_failure")
+            save_state(self.args.state_file, state)
+            self.update_status(f"Stopped: {session.role.title()} handoff error")
+            self.exit()
+        finally:
+            if previous_task is None:
+                os.environ.pop("ORC_TASK_ID", None)
+            else:
+                os.environ["ORC_TASK_ID"] = previous_task
+            if previous_role is None:
+                os.environ.pop("ORC_ROLE", None)
+            else:
+                os.environ["ORC_ROLE"] = previous_role
+            if previous_round is None:
+                os.environ.pop("ORC_ROUND", None)
+            else:
+                os.environ["ORC_ROUND"] = previous_round
+            if previous_generation is None:
+                os.environ.pop("ORC_ROLE_GENERATION", None)
+            else:
+                os.environ["ORC_ROLE_GENERATION"] = previous_generation
+        return True
 
     def write_active(self, data: bytes) -> None:
         session = self.sessions.get(self.active_role)
@@ -908,8 +1312,18 @@ class OrcApp(App[None]):
         self.on_terminal_resize(_event)
 
     def active_status(self) -> str:
+        backend = "codex"
+        try:
+            record = load_state(self.args.state_file).get(self.task_id)
+            if isinstance(record, dict):
+                backend = backend_from_record(record)
+        except (AttributeError, SystemExit):
+            pass
         layout = f" · layout: {self.layout_mode}" if self.layout_mode else ""
-        return f"{self.active_role.title()} active{layout} · {FOCUS_STATUS}"
+        return (
+            f"{self.active_role.title()} active · backend: {backend}"
+            f"{layout} · {FOCUS_STATUS}"
+        )
 
     def update_layout(self) -> None:
         if not self.is_running:
@@ -983,6 +1397,7 @@ class OrcApp(App[None]):
                 pid, _status = os.waitpid(session.pid, os.WNOHANG)
             except ChildProcessError:
                 pid = session.pid
+                _status = 0
             if pid == session.pid:
                 session.exited = True
                 try:
@@ -992,6 +1407,13 @@ class OrcApp(App[None]):
                     pass
                 state = load_state(self.args.state_file)
                 record = state.get(self.task_id)
+                if (
+                    isinstance(record, dict)
+                    and getattr(session, "backend", "codex") == "claude"
+                ):
+                    self.drain_session(session)
+                    self.handle_claude_exit(session, state, record, _status)
+                    continue
                 expected_handoff = (
                     isinstance(record, dict) and record.get("phase") != session.role
                 )
@@ -1130,6 +1552,16 @@ def begin(args: argparse.Namespace) -> None:
     if args.task_id in state:
         raise SystemExit(f"task already exists: {args.task_id}")
 
+    backend = getattr(args, "backend", "codex")
+    configured_command = (
+        claude_command() if backend == "claude" else backend_command_value(args.codex)
+    )
+    backend_version = (
+        probe_claude(configured_command) if backend == "claude" else "unknown"
+    )
+    stored_command: str | list[str] = (
+        configured_command[0] if len(configured_command) == 1 else configured_command
+    )
     automatic = bool(getattr(args, "auto", False))
     max_rounds = int(getattr(args, "max_rounds", DEFAULT_MAX_ROUNDS))
     deadline_seconds = int(getattr(args, "deadline_minutes", 60) * 60)
@@ -1158,6 +1590,12 @@ def begin(args: argparse.Namespace) -> None:
         "last_commit": None,
         "role_generations": {"implementer": 0, "reviewer": 0},
         "stop_reason": None,
+        "backend": backend,
+        "backend_command": stored_command,
+        "backend_version": backend_version,
+        "claude_session_id": None,
+        "claude_final_response": None,
+        "claude_sessions": {},
     }
     save_state(args.state_file, state)
     run_app(args, args.task_id)
@@ -1169,6 +1607,14 @@ def resume(args: argparse.Namespace) -> None:
     record = state.get(args.task_id)
     if not isinstance(record, dict):
         raise SystemExit(f"unknown task: {args.task_id}")
+
+    backend = backend_from_record(record)
+    selected_backend = getattr(args, "backend", None)
+    if selected_backend is not None and selected_backend != backend:
+        raise SystemExit(
+            f"task {args.task_id} uses backend {backend}; "
+            f"cannot resume with backend {selected_backend}"
+        )
 
     stored_target = record.get("target_directory")
     if not isinstance(stored_target, str) or not stored_target:
@@ -1200,6 +1646,9 @@ def resume(args: argparse.Namespace) -> None:
         raise SystemExit(f"Orc state for {args.task_id} has invalid user_requests")
     if deadline_expired(record):
         raise SystemExit(f"task {args.task_id} deadline has expired")
+
+    if backend == "claude":
+        probe_claude(stored_backend_command(record, backend))
 
     child_failure = record.get("child_failure")
     reviewer_rollout_failed = (
