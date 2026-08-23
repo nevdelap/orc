@@ -3,17 +3,26 @@ from __future__ import annotations
 import argparse
 import asyncio
 import fcntl
+import importlib.util
 import json
 import os
 import struct
 import subprocess
 import sys
 import termios
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 import pytest
 
-import orc
+ORC_SOURCE = Path(__file__).parents[1] / "orc"
+orc_spec = importlib.util.spec_from_loader(
+    "orc", SourceFileLoader("orc", str(ORC_SOURCE))
+)
+assert orc_spec is not None and orc_spec.loader is not None
+orc = importlib.util.module_from_spec(orc_spec)
+sys.modules["orc"] = orc
+orc_spec.loader.exec_module(orc)
 
 
 class Event:
@@ -65,7 +74,7 @@ def make_git_target(path: Path) -> str:
 
 def test_direct_script_help_invocation() -> None:
     result = subprocess.run(
-        [str(Path(__file__).parents[1] / "orc.py"), "--help"],
+        [str(Path(__file__).parents[1] / "orc"), "--help"],
         capture_output=True,
         text=True,
         check=False,
@@ -775,6 +784,184 @@ def test_orc_app_launches_roles_with_target_cwd_and_resume_prompt(
     assert launched[1][0][3:5] == ["resume", "rufus-thread"]
     assert "Target project directory" in launched[1][0][-1]
     assert statuses
+
+
+@pytest.mark.parametrize("role", ["implementer", "reviewer"])
+@pytest.mark.parametrize("marker_contents", [None, "", "agentbox marker contents"])
+@pytest.mark.parametrize("resuming", [False, True])
+def test_agentbox_flag_applies_to_both_roles_and_launch_modes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    role: str,
+    marker_contents: str | None,
+    resuming: bool,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    marker = tmp_path / "identity"
+    if marker_contents is not None:
+        marker.write_text(marker_contents)
+    monkeypatch.setattr(orc, "AGENTBOX_IDENTITY", marker)
+    monkeypatch.setattr(orc.sys, "platform", "linux")
+    thread_key = f"{role}_id"
+    record: dict[str, object] = {
+        "target_directory": str(target),
+        "prompt": "initial",
+        "user_requests": ["follow up"] if resuming else [],
+        "implementer_id": None,
+        "reviewer_id": None,
+    }
+    if resuming:
+        record[thread_key] = f"{role}-thread"
+    app, _state_file, _panes = app_stub(tmp_path, record)
+    launched: list[list[str]] = []
+    monkeypatch.setattr(
+        app,
+        "fork_codex",
+        lambda command, _environment, _cwd=None: (
+            launched.append(command) or (123, os.open("/dev/null", os.O_RDWR))
+        ),
+    )
+    monkeypatch.setattr(app, "set_master_reader", lambda _session: None)
+    monkeypatch.setattr(app, "resize_session", lambda _session: None)
+    monkeypatch.setattr(app, "update_layout", lambda: None)
+    monkeypatch.setattr(app, "update_status", lambda _message: None)
+
+    app.launch_role(role)
+
+    command = launched[0]
+    assert command[0] == "codex"
+    expected_flags = 1 if marker_contents is not None else 0
+    assert command.count(orc.CODEX_AGENTBOX_FLAG) == expected_flags
+    if resuming:
+        assert "resume" in command
+
+
+def test_agentbox_flag_is_not_duplicated_in_configured_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    marker = tmp_path / "identity"
+    marker.write_text("")
+    monkeypatch.setattr(orc, "AGENTBOX_IDENTITY", marker)
+    app, _state_file, _panes = app_stub(
+        tmp_path,
+        {
+            "target_directory": str(target),
+            "prompt": "initial",
+            "user_requests": [],
+            "implementer_id": None,
+            "reviewer_id": None,
+        },
+    )
+    app.args.codex = ["codex executable with spaces", orc.CODEX_AGENTBOX_FLAG]
+    launched: list[list[str]] = []
+    monkeypatch.setattr(
+        app,
+        "fork_codex",
+        lambda command, _environment, _cwd=None: (
+            launched.append(command) or (123, os.open("/dev/null", os.O_RDWR))
+        ),
+    )
+    monkeypatch.setattr(app, "set_master_reader", lambda _session: None)
+    monkeypatch.setattr(app, "resize_session", lambda _session: None)
+    monkeypatch.setattr(app, "update_layout", lambda: None)
+    monkeypatch.setattr(app, "update_status", lambda _message: None)
+
+    app.launch_role("implementer")
+
+    assert launched[0][0] == "codex executable with spaces"
+    assert launched[0].count(orc.CODEX_AGENTBOX_FLAG) == 1
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("role", ["implementer", "reviewer"])
+@pytest.mark.parametrize("marker_present", [False, True])
+@pytest.mark.parametrize("resuming", [False, True])
+@pytest.mark.parametrize("selector", ["--codex", "CODEX_COMMAND"])
+def test_agentbox_launch_executes_spaced_codex_through_real_pty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    role: str,
+    marker_present: bool,
+    resuming: bool,
+    selector: str,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    fake_codex = tmp_path / "fake codex"
+    capture = tmp_path / "capture.json"
+    fake_codex.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, pathlib, sys\n"
+        "pathlib.Path(os.environ['ORC_CAPTURE']).write_text(\n"
+        "    json.dumps({'argv': sys.argv, 'cwd': os.getcwd()})\n"
+        ")\n"
+        "print('fake codex', flush=True)\n"
+    )
+    fake_codex.chmod(0o755)
+    marker = tmp_path / "identity"
+    if marker_present:
+        marker.write_text("")
+    monkeypatch.setattr(orc, "AGENTBOX_IDENTITY", marker)
+    monkeypatch.setattr(orc.sys, "platform", "linux")
+    monkeypatch.setenv("ORC_CAPTURE", str(capture))
+
+    thread_key = f"{role}_id"
+    record: dict[str, object] = {
+        "target_directory": str(target),
+        "prompt": "initial",
+        "user_requests": ["follow up"] if resuming else [],
+        "implementer_id": None,
+        "reviewer_id": None,
+    }
+    if resuming:
+        record[thread_key] = f"{role}-thread"
+    app, state_file, _panes = app_stub(tmp_path, record)
+    if selector == "CODEX_COMMAND":
+        monkeypatch.setenv("CODEX_COMMAND", str(fake_codex))
+        cli = [
+            "--state-file",
+            str(state_file),
+            "begin",
+            str(target),
+            "TASK-003",
+            "initial",
+        ]
+    else:
+        cli = [
+            "--state-file",
+            str(state_file),
+            "--codex",
+            str(fake_codex),
+            "begin",
+            str(target),
+            "TASK-003",
+            "initial",
+        ]
+    app.args = orc.parse_args(cli)
+    app.set_master_reader = lambda _session: None
+    app.resize_session = lambda _session: None
+    app.update_layout = lambda: None
+    app.update_status = lambda _message: None
+
+    app.launch_role(role)
+    session = app.sessions[role]
+    _pid, status = os.waitpid(session.pid, 0)
+    os.close(session.master_fd)
+
+    assert os.WIFEXITED(status)
+    captured = json.loads(capture.read_text())
+    assert captured["cwd"] == str(target)
+    assert captured["argv"][0] == str(fake_codex)
+    assert captured["argv"].count(orc.CODEX_AGENTBOX_FLAG) == int(marker_present)
+    if resuming:
+        resume_index = captured["argv"].index("resume")
+        assert captured["argv"][resume_index : resume_index + 2] == [
+            "resume",
+            f"{role}-thread",
+        ]
 
 
 def test_launch_can_disable_idle_hook_for_orc_testing(

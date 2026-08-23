@@ -17,7 +17,7 @@ diff review.
 
 For Orc, the applicable checks may include:
 
-- `uv run --script orc.py --help`
+- `uv run --script orc --help`
 - syntax or compile checks for Python files;
 - focused state, prompt, PTY, TUI, and handoff checks;
 - diff-integrity and clean-worktree checks.

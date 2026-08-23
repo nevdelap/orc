@@ -25,7 +25,7 @@ Dependencies:
 
 Scope:
 
-- `orc.py`: handoff status parsing, persisted task states, resume validation,
+- `orc`: handoff status parsing, persisted task states, resume validation,
   bounded round scheduling, deadline handling, and status rendering.
 - `tests/test_orc.py` and fake-agent/PTY fixtures: both-role blocker states,
   clarification resumes, automatic cycles, limits, failures, and duplicate
@@ -83,7 +83,7 @@ Acceptance criteria:
 
 ## TASK-007 - Use agentbox identity and provide the `orc` launcher
 
-State: NEW
+State: COMPLETED
 
 Goal:
 

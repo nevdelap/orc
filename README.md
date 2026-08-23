@@ -15,18 +15,31 @@ implement/review round so the work can be inspected or resumed.
 - A Git target project is recommended because handoffs record its current
   commit. A target does not need to be the directory containing Orc.
 
+## Agentbox mode
+
+On Linux, Orc detects the agentbox confinement marker at
+`/etc/agentbox/identity`. When that file exists, every Codex begin and resume
+launch receives `--dangerously-bypass-approvals-and-sandbox`; the marker contents
+are ignored. When it is absent, Orc leaves Codex's normal approval prompts and
+internal sandbox behavior unchanged. This is an agentbox environment signal,
+not a user task option.
+
+Agentbox provides the confined Sysbox container as the external safety boundary
+for this mode; see the [agentbox GitHub repository](https://github.com/nevdelap/agentbox)
+for that confinement model. The marker-based behavior is Linux-only.
+
 ## Launch
 
 From an executable checkout, run Orc directly through its uv shebang:
 
 ```console
-./orc.py begin DIRECTORY TASK-ID PROMPT
+./orc begin DIRECTORY TASK-ID PROMPT
 ```
 
 The equivalent explicit form is useful when diagnosing the launcher:
 
 ```console
-uv run --script orc.py begin DIRECTORY TASK-ID PROMPT
+uv run --script orc begin DIRECTORY TASK-ID PROMPT
 ```
 
 For a managed checkout, install the locked environment first, then use either
@@ -34,14 +47,14 @@ form above:
 
 ```console
 uv sync --locked
-./orc.py begin DIRECTORY TASK-ID PROMPT
+./orc begin DIRECTORY TASK-ID PROMPT
 ```
 
 `DIRECTORY` must already exist and be a directory. Orc resolves it to an
 absolute path before creating state or launching a child. For example:
 
 ```console
-uv run --script orc.py begin /work/my-project TASK-003 "Implement the next task"
+uv run --script orc begin /work/my-project TASK-003 "Implement the next task"
 ```
 
 The target can be outside Orc's own repository. Igor and Rufus start with that
@@ -54,7 +67,7 @@ Orc stores state in `~/.orc/codex-state.json` by default. Override it before
 the command with `--state-file`:
 
 ```console
-uv run --script orc.py --state-file /tmp/orc-state.json begin DIRECTORY TASK-ID PROMPT
+uv run --script orc --state-file /tmp/orc-state.json begin DIRECTORY TASK-ID PROMPT
 ```
 
 The task record retains the normalized target directory, role thread IDs,
@@ -71,7 +84,7 @@ After the review becomes idle, Orc pauses the round. Use `resume` to send Igor a
 follow-up or to ask for another implementation round:
 
 ```console
-uv run --script orc.py resume DIRECTORY TASK-ID PROMPT
+uv run --script orc resume DIRECTORY TASK-ID PROMPT
 ```
 
 The resume directory is mandatory and must resolve to exactly the directory
@@ -83,7 +96,7 @@ passed to Igor and is recorded exactly once.
 For bounded automatic cycles, opt in explicitly at begin:
 
 ```console
-uv run --script orc.py begin DIRECTORY TASK-ID PROMPT --auto \
+uv run --script orc begin DIRECTORY TASK-ID PROMPT --auto \
   --max-rounds 5 --deadline-minutes 60
 ```
 
@@ -132,9 +145,9 @@ the task later with the same target directory.
 - **Resume directory mismatch:** inspect the task record and pass its
   normalized `target_directory`; Orc intentionally rejects a different path.
 - **No interactive terminal:** run `begin` or `resume` from a real POSIX
-  terminal rather than redirecting standard input or output. If `./orc.py` is
-  not executable in a checkout, run `chmod +x orc.py` once or use the explicit
-  `uv run --script orc.py` form.
+  terminal rather than redirecting standard input or output. If `./orc` is
+  not executable in a checkout, run `chmod +x orc` once or use the explicit
+  `uv run --script orc` form.
 - **Resize or blank pane:** Orc measures the rendered pane after layout and
   sends that width and height to the child PTY. If a pane looks blank after a
   terminal resize, wait for the redraw, then click the pane to make its focus
@@ -145,7 +158,7 @@ the task later with the same target directory.
 - **Git commit is `unknown`:** the target may not be a Git worktree or its
   `HEAD` may be unavailable. Orchestration can still retain the handoff.
 
-Use `./orc.py --help` for the complete CLI help. The hidden
+Use `./orc --help` for the complete CLI help. The help text also describes the Linux-only agentbox marker behavior. The hidden
 `idle-hook` command is invoked by Codex notifications and is not normally run
 by hand. Set `ORC_DISABLE_IDLE_HOOK=1` for general Orc testing when you
 need to keep an agent session available without an automatic handoff.

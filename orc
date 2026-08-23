@@ -67,6 +67,8 @@ hash.
 """.strip()
 
 ORC_VERSION = "orc v0.0.1"
+AGENTBOX_IDENTITY = Path("/etc/agentbox/identity")
+CODEX_AGENTBOX_FLAG = "--dangerously-bypass-approvals-and-sandbox"
 FOCUS_STATUS = "Click a pane to focus · Tab switches panes · Ctrl-Q exits"
 UNABLE_TO_PROCEED = "UNABLE_TO_PROCEED"
 DEFAULT_MAX_ROUNDS = 5
@@ -87,7 +89,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Orchestrate Igor and Rufus Codex sessions. "
             "Usage: begin DIRECTORY TASK-ID PROMPT or "
             "resume DIRECTORY TASK-ID PROMPT."
-        )
+        ),
+        epilog=(
+            "On Linux, /etc/agentbox/identity enables Codex's external-"
+            "sandbox mode. The marker is detected by file existence only."
+        ),
     )
     parser.add_argument(
         "--state-file",
@@ -423,6 +429,18 @@ def notify_config(state_file: Path) -> str:
     return json.dumps(hook, separators=(",", ":"))
 
 
+def add_agentbox_codex_flag(command: list[str]) -> list[str]:
+    """Add the agentbox Codex mode flag once when running inside agentbox."""
+
+    if (
+        sys.platform == "linux"
+        and AGENTBOX_IDENTITY.exists()
+        and CODEX_AGENTBOX_FLAG not in command
+    ):
+        command.insert(max(len(command) - 1, 1), CODEX_AGENTBOX_FLAG)
+    return command
+
+
 def set_pty_size(fd: int, width: int, height: int) -> None:
     width = max(width, 2)
     height = max(height, 2)
@@ -725,7 +743,12 @@ class OrcApp(App[None]):
         else:
             prompt = reviewer_prompt(record) + "\n\n" + HANDOFF_PROMPT
 
-        command = [self.args.codex]
+        configured_command = self.args.codex
+        command = (
+            [configured_command]
+            if isinstance(configured_command, str)
+            else list(configured_command)
+        )
         # General Orc testing can keep the agent session in place by setting
         # ORC_DISABLE_IDLE_HOOK=1 for this launch.
         if os.environ.get("ORC_DISABLE_IDLE_HOOK") != "1":
@@ -755,6 +778,7 @@ class OrcApp(App[None]):
                 f"Session name: {session_name(self.task_id, role)}"
             )
             command.append(full_prompt)
+        add_agentbox_codex_flag(command)
 
         environment = os.environ.copy()
         # The child is connected to Orc's ANSI-capable terminal emulator, not

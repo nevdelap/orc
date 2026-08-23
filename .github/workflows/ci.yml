@@ -45,8 +45,9 @@ jobs:
       - run: uv sync --locked
       - run: uv run ruff check .
       - run: uv run ruff format --check .
-      - run: uv run mypy orc.py
-      - run: uv run python -m compileall -q orc.py tests
+      - run: uv run mypy orc
+      - run: uv run python -c "from pathlib import Path; compile(Path('orc').read_text(), 'orc', 'exec')"
+      - run: uv run python -m compileall -q tests
 
   integration:
     name: Integration and PTY
