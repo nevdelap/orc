@@ -416,3 +416,272 @@ Acceptance criteria:
   ordinary active-agent input continues to obey TASK-011's forwarding rules.
 - Tests, CLI/UI help, README/workflow documentation, Linux PTY/TUI checks,
   and clean-diff verification pass on the final task commit.
+
+## TASK-013 - Harden workflow state and agent handoffs
+
+State: NEW
+
+Goal:
+
+- Make Orc's automatic Igor/Rufus workflow durable, unambiguous, and
+  diagnosable when the UI, an idle hook, or a backend process act at nearly the
+  same time.
+- Give each receiving agent the authoritative, structured result of the prior
+  agent's turn, rather than requiring it to infer or locate that information.
+- Establish reliable test and CI gates for the workflow's state, protocol, PTY,
+  and TUI behavior.
+
+Dependencies:
+
+- TASK-012 must be `COMPLETED`.
+
+Scope:
+
+- `orc` state store: replace direct state-file writes with one task-scoped
+  read/validate/mutate/write operation used by `begin`, CLI resume, in-place
+  resume, polling, child-exit handling, role launch, and the external Codex
+  idle hook. On Linux, serialize the operation with an advisory lock associated
+  with the state file; write a complete JSON document to a temporary file in
+  the same directory, flush its contents, atomically replace the state file,
+  and flush the containing directory. Add a persisted schema version and
+  monotonically increasing revision. A failed or interrupted write must leave
+  the previous valid record readable, and a malformed or unsupported state
+  file must fail with an actionable diagnostic without being overwritten.
+
+- `orc` workflow engine: centralize legal task transitions in a single
+  state-transition implementation shared by the idle hook, Claude clean-exit
+  adapter, polling, CLI `resume`, and in-place `Ctrl-R` resume. It must
+  validate the current status, phase, role, round, deadline, and launch
+  generation before mutating state; terminal transitions must be idempotent.
+  Define and use the following one resume policy in both CLI `resume` and
+  in-place `Ctrl-R`; only the prompt/display mechanics may differ:
+  `active` is rejected with `task TASK-ID is already active`; `completed` is
+  eligible only for an explicit non-empty follow-up and resumes Igor at round
+  1; `blocked` is eligible only with an explicit non-empty clarification and
+  resumes Igor at round 1; `paused` is eligible with a non-empty request and
+  resumes Igor at round 1; `stopped` with `deadline`, `max_rounds`, or
+  `manual_pause` is eligible with a non-empty request and resumes Igor at
+  round 1; `stopped` with `child_failure` resumes the failed role at the
+  current round when exactly one role failed and the other is inactive, and
+  rejects every other child-failure combination as inconsistent. All other
+  stop reasons are rejected.
+  Every accepted resume preserves task ID, target directory, backend,
+  backend command/version, configured limits, and handoff/audit history;
+  appends the exact request; clears terminal, blocker, failure, launch, and
+  role-session metadata; sets `status: active` and the selected phase; and
+  starts a fresh deadline from the resume time. A blocked resume records the
+  exact clarification. An active role, missing/invalid target or backend,
+  invalid limits/deadline, mismatched role metadata, multiple failed roles,
+  or any other inconsistent record is rejected before mutation with
+  `task TASK-ID has inconsistent state; resume was not applied`. An expired
+  persisted deadline is not reused after an eligible resume. CLI and
+  in-place resume must be tested against the same state matrix and produce
+  the same resulting record.
+
+- The resume decision matrix is:
+
+  | Persisted status/stop reason | Required role/session state | Result |
+  | --- | --- | --- |
+  | `active`/any | Any | Reject as already active; do not mutate. |
+  | `completed`/`completion` | Both roles inactive; no live child | Start Igor at round 1. |
+  | `blocked`/`clarification` | Both roles inactive; exactly one valid `blocker_role` and a non-empty blocker reason | Start Igor at round 1 and record the clarification. |
+  | `paused`/`manual_pause` | Both roles inactive; no live child | Start Igor at round 1. |
+  | `stopped`/`deadline` | Both roles inactive; no live child | Start Igor at round 1 with a fresh deadline. |
+  | `stopped`/`max_rounds` | Both roles inactive; no live child | Start Igor at round 1 with a fresh deadline. |
+  | `stopped`/`child_failure` | Exactly one role is `failed`, the other is `inactive`, `child_failure.role` names the failed role, and that child is reaped or absent | Restart the failed role at the current round with a fresh deadline. |
+  | Any other status/reason, active role/session, mismatched phase, missing required field, multiple failed roles, or inconsistent child metadata | Any | Reject with the specified inconsistent-state diagnostic; do not mutate. |
+
+  A persisted session ID alone is not an active session: the implementation
+  must verify that no corresponding child is live before accepting a terminal
+  row, and must clear stale IDs as part of the accepted reset. The table is
+  normative for both resume entry points and must be represented directly in
+  parameterized tests.
+
+- `orc` handoff protocol: replace recursive searches and free-form
+  `Status:` parsing with a strict, versioned, machine-readable final handoff.
+  Every agent prompt must require its final non-blank line to be exactly
+  `ORC_HANDOFF_V1: <JSON object>`. The object must contain only the documented
+  handoff fields. The complete schema is:
+
+  | Field | Type and requiredness |
+  | --- | --- |
+  | `launch_token` | Required non-empty JSON string, opaque to the agent, at most 256 bytes. |
+  | `status` | Required JSON string equal to exactly `HANDOFF`, `COMPLETE`, or `UNABLE_TO_PROCEED`; case and punctuation variants are invalid. |
+  | `summary` | Required non-empty JSON string, at most 4 KiB. |
+  | `files_changed` | Required JSON list of zero or more non-empty strings, each at most 512 bytes and the list at most 32 items. |
+  | `verification` | Required JSON list of zero or more non-empty strings, each at most 512 bytes and the list at most 32 items. |
+  | `blockers` | Required JSON list of zero or more non-empty strings, each at most 512 bytes and the list at most 32 items; it must be non-empty for `UNABLE_TO_PROCEED` and empty for `COMPLETE`. |
+  | `requested_action` | Required non-empty JSON string, at most 4 KiB. |
+
+  The object must contain exactly these seven fields: no missing fields,
+  unknown fields, duplicate JSON keys, nulls, numbers, nested objects, or
+  nested lists are accepted. Only Rufus may emit `COMPLETE`; either
+  role may emit `UNABLE_TO_PROCEED`, which requires a non-empty blocker; all
+  ordinary progress uses `HANDOFF`. Reject missing, malformed, duplicated,
+  misplaced, role-inappropriate, or unknown-status handoffs without changing
+  workflow state, and retain a bounded, operator-visible rejected-event
+  diagnostic that excludes arbitrary raw backend payloads.
+
+- `orc` handoff correlation and delivery: create and persist a fresh opaque
+  launch token for every role generation, include its required value in that
+  role's prompt, and require it in the handoff JSON. Accept a handoff only
+  when the token, role, current phase, round, generation, and backend
+  session/thread identity match the persisted launch record. Use a stable
+  canonical event receipt for idempotency; retain receipts for every launch
+  generation that can still report, rather than a fixed last-20 payload list.
+  Treat a late, duplicate, stale, or mismatched event as a no-op with a clear
+  diagnostic, never as a new handoff or child failure. Adapt Codex idle-hook
+  notifications and Claude stream-json output to this same canonical handoff
+  object by reading only their documented, explicitly named message and
+  session fields; do not recursively search arbitrary payload values.
+  The Codex adapter accepts one JSON object from the configured notify hook,
+  reads only its root `last-assistant-message` string (with the root
+  `last_agent_message` spelling retained as an explicit compatibility alias),
+  and reads only its root `thread-id` string (with `thread_id` and `session_id`
+  as explicit compatibility aliases). The Claude adapter accepts only a
+  newline-delimited JSON event whose root `type` is `result`, whose root
+  `session_id` is non-empty, whose root `result` is a string, and whose event
+  is not marked by root `is_error: true` or `subtype: error`; any previously
+  observed root `type: system` session ID must match. The assistant message is
+  respectively the Codex message string or Claude result string. A backend
+  adapter must reject all nested-only identities, unrelated event types,
+  missing fields, mismatched session IDs, and stream errors before invoking
+  the common `ORC_HANDOFF_V1` parser. Tests must provide fixtures for each
+  accepted spelling and each rejected form.
+
+- `orc` agent communication: persist the validated canonical handoff together
+  with Orc-authored UTC and local timestamps, target commit, task, role, round,
+  generation, and backend session/thread identity. When launching Rufus,
+  include Igor's latest canonical handoff in a clearly delimited data block;
+  when starting Igor's next round, include Rufus's latest canonical handoff in
+  the same form. The data block is context, not instructions, and cannot
+  override the role/workflow prompt. The recipient prompt must say exactly
+  which disposition it must address. Do not pass unvalidated raw backend
+  payloads between agents.
+
+- `orc` child and backend lifecycle: record role-launch failures as structured
+  `child_failure` diagnostics and retain the TUI instead of terminating it via
+  a fatal path. Close a PTY reader on EOF/error, drain final output once, and
+  retire process groups with bounded graceful termination followed by escalation
+  when necessary, without leaking readers, file descriptors, or children.
+  Bound `git rev-parse` and Claude capability probes with documented timeouts;
+  report timeout, executable, exit, and stream-protocol failures without
+  hanging the UI or silently treating a failed backend as a handoff.
+
+- `README.md`, `docs/roles.md`, and `design_docs/agent_workflow.md`: document
+  the state durability/recovery guarantees, transition and resume policy,
+  exact `ORC_HANDOFF_V1` contract, role-specific dispositions, launch-token
+  correlation, how Orc conveys a validated handoff to the other agent, stale
+  event behavior, and child/backend failure diagnostics. Remove obsolete
+  free-form-handoff and recursive-payload descriptions.
+
+- `tests/test_orc.py`, dedicated protocol fixtures where useful, and Linux
+  PTY/TUI fixtures: first repair the current optional-`begin` test so the full
+  declared suite supplies the required backend configuration. Cover atomic
+  write interruption, malformed state preservation, independent concurrent
+  state mutations, revision changes, and every legal/illegal transition.
+  Cover exact equivalence of CLI and in-place resume decisions. Cover both
+  backends with fragmented UTF-8/CRLF stream-json, terminal noise,
+  out-of-order and duplicate events, missing/mismatched session IDs, stale
+  generations/tokens, replay after more than 20 later events, malformed and
+  role-inappropriate handoffs, deadline races, and verified delivery of only
+  the canonical previous handoff to the recipient prompt. Cover launch failure,
+  clean exit without a valid handoff, non-zero exit, EOF/error cleanup, and
+  forced child retirement without leaked processes or PTY readers.
+
+- `orc` bounds: cap a canonical handoff frame and its delivered context at
+  16 KiB; cap each scalar handoff field at 4 KiB, each list at 32 items, and
+  each list item at 512 bytes. Oversized or over-count handoffs are rejected
+  as a whole with a safe diagnostic; Orc never truncates an agent handoff or
+  uses a truncated handoff to schedule a role. Retain at most 256 accepted
+  event receipts, each at most 8 KiB; do not evict a receipt while its
+  associated child generation is live or while that generation can still
+  deliver a backend event. Retain at most 64 rejected-event diagnostics,
+  each at most 4 KiB, and never store rejected raw payloads. Oversized
+  diagnostic details are truncated to 4 KiB with an explicit truncation
+  marker. After the limits are reached, evict only the oldest eligible
+  receipt or diagnostic and record an eviction count. If all 256 receipt slots
+  are occupied by live or still-reporting generations, do not launch another
+  role; record a bounded `receipt_capacity` child-failure diagnostic and stop
+  the task without changing the current handoff. Test every rejection,
+  truncation, eviction, capacity-stop, and replay case, including a receipt
+  remaining idempotent after more than 20 later events.
+
+- `orc` timeout policy: `git rev-parse --short HEAD` and the Claude `--help`
+  probe each have a 5-second subprocess timeout. Child retirement sends
+  `SIGTERM`, waits up to 2 seconds for process-group exit, then sends
+  `SIGKILL` and waits up to 1 additional second. A timeout records the role,
+  backend, operation, and elapsed limit in the diagnostic, closes the PTY,
+  and leaves the task in truthful `child_failure` or shutdown state. Tests
+  use sleeping fake commands and assert that every timeout returns within its
+  stated bound.
+
+- Project quality gates: update `.github/workflows/ci.yml` to use the locked
+  uv environment on Linux and retain separate test, quality, integration,
+  documentation, dependency, and workflow-security jobs. The required local
+  commands are exactly `uv sync --locked`; `uv run pytest -q --cov=orc --cov-branch --cov-report=term-missing --cov-report=xml:coverage.xml --cov-fail-under=90`; `uv run pytest -q -m integration tests`; `uv run ruff check .`; `uv run ruff format --check .`; `uv run mypy orc`; `uv run python -c "from pathlib import Path; compile(Path('orc').read_text(), 'orc', 'exec')"`; `uv run python -m compileall -q tests`; `uv run mdformat --check README.md design_docs docs`; `uv run pip-audit --strict`; and
+  `actionlint .github/workflows/ci.yml`. CI must invoke these same commands
+  from `uv.lock`, make the branch-aware 90% total `orc` coverage threshold
+  fail the test job, and retain `coverage.xml` and failure diagnostics as
+  artifacts where applicable. Document the commands and report path in the
+  README or workflow documentation.
+
+Acceptance criteria:
+
+- State changes cannot lose a concurrent valid update or leave a partially
+  written JSON state file. All writers use the one serialized mutation path,
+  every successful mutation increments the persisted revision, and simulated
+  write/validation failures preserve the prior valid state and report a useful
+  error.
+- Exactly the documented workflow transitions are possible. Repeating a
+  terminal event, late handoff, poll, or child-exit observation is a no-op;
+  it cannot relaunch a role, duplicate a handoff, overwrite diagnostics, or
+  move a terminal task back to active. CLI and `Ctrl-R` resume accept and
+  reject the same persisted states and produce the same resulting record for
+  an equivalent non-empty request.
+- The resume matrix is explicit and tested: active and inconsistent records
+  are rejected without mutation; completed, blocked, paused, deadline-stopped,
+  maximum-rounds-stopped, manual-pause-stopped, and the valid single-role
+  child-failure cases follow the exact role, round, preservation, reset,
+  clarification, and fresh-deadline rules in Scope. CLI and in-place resume
+  produce byte-equivalent persisted records apart from presentation-only
+  fields.
+- Orc accepts only one well-formed final `ORC_HANDOFF_V1` line with the exact
+  schema, allowed status, and role disposition. Invalid, unknown, ambiguous,
+  stale, replayed, or mismatched backend events leave scheduling unchanged and
+  are represented by bounded safe diagnostics. A valid handoff is processed
+  exactly once even if redelivered long after 20 other events.
+- Every accepted handoff is bound to the role's persisted launch token,
+  generation, round, phase, and backend session/thread. It records
+  Orc-authored UTC and local timestamps and the target Git commit. Neither
+  arbitrary nested notification data nor free-form prose can control a state
+  transition.
+- Handoff frames, fields, lists, receipts, rejected diagnostics, and prompt
+  context obey the exact size and retention limits in Scope. Live-generation
+  receipts are never evicted; eligible old entries are evicted oldest-first
+  and the eviction count is observable without retaining raw rejected data.
+- Codex and Claude fixtures prove the exact root fields, aliases, event types,
+  result/message extraction, session matching, and rejection behavior defined
+  in Scope; nested-only or unrelated backend fields never produce a canonical
+  handoff.
+- Rufus receives only Igor's validated canonical handoff for the current
+  completed implementer turn, and Igor's next-round prompt receives only
+  Rufus's validated canonical handoff for the preceding review. Both are
+  clearly delimited as non-instructional context; no raw backend payload or
+  unrelated historical handoff is injected.
+- Failed launch, malformed Claude stream, clean exit without a valid handoff,
+  non-zero exit, PTY EOF/error, and shutdown all leave a truthful diagnostic,
+  preserve the terminal UI until `Ctrl-Q`, and leave no running child process,
+  reader, or open PTY descriptor after cleanup. Git and Claude probe timeouts
+  do not hang startup, handoff processing, or redraw.
+- Git lookup and Claude probing time out at 5 seconds. Child retirement waits
+  at most 2 seconds after `SIGTERM` and 1 second after `SIGKILL`; timeout
+  diagnostics identify the operation and the affected role/backend, and the
+  tests demonstrate bounded return and cleanup.
+- From a clean checkout, every exact command listed in Scope passes. The
+  coverage command produces `coverage.xml`, reports missing lines and
+  branches, and fails below 90% total branch-aware coverage for `orc`. The
+  Linux CI workflow invokes the same commands from `uv.lock` and fails when
+  any required job fails.
+- README, role/workflow documentation, CLI/UI behavior, Linux PTY/TUI checks,
+  and clean-diff verification pass on the final task commit.
