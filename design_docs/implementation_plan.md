@@ -7,6 +7,14 @@ transitions, commit contract, handoff procedures, review-document format, and
 verification workflow are defined in `design_docs/agent_workflow.md`; role
 responsibilities are defined in `docs/roles.md`.
 
+Compatibility is forward-only. The private pre-release `v0.0.1` is not a
+compatibility baseline, so persisted data and behavior from before the first
+public release need not be migrated, projected, or preserved. Igor must reject
+unsupported pre-baseline state before mutation or launch. Every later task
+that changes a public schema or behavior must identify the established public
+baseline, preserve its declared compatibility contract, and specify any
+explicit migration or rejection behavior.
+
 ## Tasks
 
 ### Verification profiles
@@ -279,6 +287,9 @@ Scope:
 - Update the versioned task-state schema and every state mutation path in
   `orc`, including idle hooks, child exits, resume, handoff transitions,
   deadline/max-round stops, and cleanup.
+- Update the normative state and workflow protocol in
+  `design_docs/agent_workflow.md` so its schema, audit, timing, and
+  compatibility rules match the implementation.
 - Add state, concurrency, lifecycle, and failure-path tests in `tests/`.
 - Document the audit event schema, retention, and redaction rules.
 - Persist `audit_events` as a chronological rolling list of at most 256
@@ -291,8 +302,50 @@ Scope:
   new event in one atomic write. Sequence numbers never repeat, even after
   every earlier event has been evicted. Saturate `audit_dropped_count` at
   1,000,000 rather than overflowing. TASK-017 advances the state schema
-  from version 2 to version 3; version 2 records migrate by adding these
-  fields, and all other versions are rejected before mutation.
+  from version 2 to version 3. Because `v0.0.1` is private pre-release,
+  version-2 records are not part of the compatibility baseline: version-2
+  and all other unsupported records are rejected before mutation with the
+  bounded diagnostic `unsupported pre-baseline state schema`, and are never
+  migrated, repaired, or launched. New schema-3 records add these fields and
+  initialize `timing` with the current valid task start, a null
+  `task_finished_at`, zero wall and role totals, zero unattributed time, and
+  an empty generation list.
+- Persist a bounded `timing` object for analytics consumers. Its exact fields
+  are `task_started_at` (the immutable first-begin UTC timestamp),
+  `task_finished_at` (the UTC timestamp of the current terminal transition or
+  null while active), `wall_seconds` (the non-negative total from task start
+  to finish, or from task start to the current UTC time while active),
+  `agent_wall_seconds` (an object with exactly `implementer` and `reviewer`
+  non-negative integer totals), `unattributed_wall_seconds` (a non-negative
+  integer for task wall time not assigned to an agent generation), and
+  `generations` (at most 256 records). Records are chronological by
+  successful `launch_spawned`. When appending at the cap, evict the oldest
+  record whose `ended_at` is non-null; open generations are never evicted.
+  If all 256 retained records are open, reject the new launch before child
+  spawn with the bounded diagnostic `timing generation retention full`, leave
+  the state, revision, and history unchanged, and do not add a dropped
+  counter. Each generation record has exactly
+  `role`, `round`, `generation`, `launched_at`, `spawned_at`, `ended_at`,
+  `end_event`, and `wall_seconds`; timestamps use the audit UTC format,
+  `spawned_at`/`ended_at` may be null, `end_event` is null or one of
+  `handoff_accepted`, `child_exit`, and `cleanup`, and `wall_seconds` is a
+  non-negative integer or null while the generation is open. Retain the
+  aggregate totals when old generation records are evicted.
+- Define timing boundaries exactly: a generation starts at its successful
+  `launch_spawned` event, ends at the first accepted handoff or its terminal
+  `child_exit`/`cleanup`, and is counted once even if later retirement emits
+  another child event. A task starts at its first `begin`; accepted resume
+  starts a new active cycle without changing `task_started_at`, and clears
+  `task_finished_at` until the next terminal transition. `wall_seconds` is
+  the clamped non-negative whole-second difference between the relevant UTC
+  timestamps; a backward wall-clock adjustment records a bounded diagnostic
+  and contributes zero rather than a negative duration. At a terminal
+  transition, `unattributed_wall_seconds` is
+  `max(0, wall_seconds - implementer_seconds - reviewer_seconds)` and
+  represents Orc/operator waiting or other time outside an open generation.
+  CPU time, token usage, and model billing time are not inferred from these
+  wall-clock values and are reported as unavailable unless a later task adds
+  resource telemetry.
 - Every event has this exact schema: `sequence` is a positive integer;
   `time` is a UTC RFC3339 timestamp with `Z` and second precision; `event` is
   one of `launch_started`, `launch_spawned`, `handoff_accepted`,
@@ -334,6 +387,10 @@ Acceptance criteria:
 - Tests assert the exact event fields and event order for a complete
   implementer-to-reviewer round, a rejected/stale handoff, a child failure,
   deadline stop, resume, and shutdown cleanup.
+- Timing tests assert task wall time, per-role and per-generation elapsed wall
+  time, handoff-versus-child-exit closure, aggregate preservation after
+  generation eviction, resume cycles, unattributed time, and backward-clock
+  handling. They prove a generation is never counted twice.
 - Concurrent writers using the real state lock preserve monotonic sequence
   numbers, valid JSON, task revisions, and all non-evicted events.
 - The 256-event cap and dropped counter are tested, including a full history
@@ -343,10 +400,155 @@ Acceptance criteria:
   greater than every retained sequence, retained sequences must be strictly
   increasing; `audit_dropped_count` must be an integer from 0 through
   1,000,000; and `last_terminal_event_key` must be null or a valid canonical
-  JSON tuple string of at most 512 UTF-8 bytes. Old valid state is migrated
+  JSON tuple string of at most 512 UTF-8 bytes. New schema-3 state starts
   with `audit_events: []`, `audit_next_sequence: 1`,
   `audit_dropped_count: 0`, `last_terminal_event_key: null`, and an explicit
-  schema revision.
+  schema revision. Pre-baseline schema-2 records are rejected before
+  mutation; migration is not required.
+- Verification Profile A passes on Linux, with every command and result
+  recorded in the handoff and review document.
+
+## TASK-021 - Serve historical task analytics
+
+State: NEW
+
+Goal:
+
+- Provide a safe local web view of completed and active Orc tasks, including
+  timing, rounds, outcomes, handoffs, commits, and workflow health.
+
+Dependencies:
+
+- TASK-017 must be `COMPLETED`.
+- TASK-019 must be `COMPLETED`.
+
+Scope:
+
+- Add `orc web` using the existing global `--state-file` option. It binds only
+  to `127.0.0.1` by default, listens on an optional explicitly supplied port
+  (default `8765`), and remains running until the operator interrupts it.
+  There is no directory or task argument; the page reads every task in the
+  selected state file.
+- Update `README.md`, `design_docs/agent_workflow.md`, and the CLI help in
+  `orc` with the `web` command, endpoint, pagination, redaction, content-type,
+  bound, and read-only operator contracts.
+- Implement the server with bounded standard-library HTTP handling and the
+  existing state-file lock. Every request takes a consistent read snapshot,
+  never mutates or migrates state, never launches a child, and returns a
+  deterministic error rather than partial data for an invalid state file.
+  Concurrent writers must not produce a mixed-task snapshot.
+- Serve `/` as a self-contained UTF-8 HTML page with no external scripts,
+  fonts, images, or outbound network requests. Its only script is inline and
+  its only network access is same-origin `fetch` to Orc's read-only
+  `/api/tasks?page=N` endpoint. Escape all state-derived text before HTML
+  insertion and send this exact restrictive policy:
+  `default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`. Refresh data
+  through the read-only JSON API without requiring a page restart.
+- Serve `GET /api/tasks?page=N` with a JSON object containing `tasks`,
+  `generated_at`, `schema_version`, `aggregates`, `page`, `page_size`,
+  `page_count`, and `total_tasks`, in that order. `page` is a one-based
+  integer with a default of 1, `page_size` is the fixed integer 64,
+  `page_count` is `max(1, ceil(total_tasks / 64))`, and `total_tasks` is the
+  integer count across the complete state snapshot. `tasks` contains only
+  that page's task summaries in lexicographic `task_id` order; every retained
+  task is therefore reachable through pagination. `generated_at` is an
+  RFC3339 UTC timestamp with `Z` and second precision, and
+  `schema_version` is the integer `3`. `aggregates` has exactly
+  `task_counts_by_status` (integer counts for `active`, `paused`, `blocked`,
+  `stopped`, and `completed`), `task_counts_by_backend` (integer counts for
+  `codex` and `claude`), `completion_rate`, `blocked_rate`, and
+  `stopped_rate` (JSON numbers from 0.0 through 1.0, using 0.0 when there
+  are no tasks), `total_finished_wall_seconds` and
+  `average_finished_wall_seconds` (JSON numbers, zero when there are no
+  finished tasks), `agent_wall_seconds` (integer `implementer` and
+  `reviewer` values), `unattributed_wall_seconds` (an integer),
+  `rounds_per_task` (objects with exactly `task_id` and `round`, sorted by
+  `task_id`, containing only the tasks on the requested page), and
+  `most_recent_task_activity` (an RFC3339 UTC timestamp or null). All other
+  aggregate values are computed across the complete state snapshot. The root
+  combines the page-local `rounds_per_task` lists while it loads pages. Each
+  task summary has exactly `task_id`, `status`, `phase`,
+  `backend`, `backend_version`, `target_directory`, `round`, `max_rounds`,
+  `task_started_at`, `task_finished_at`, `wall_seconds`,
+  `agent_wall_seconds`, `unattributed_wall_seconds`, `last_commit`, and
+  `last_handoff_time`. `GET /api/tasks/TASK-ID` returns an object with the
+  summary fields first, followed by exactly `timing_generations`, `handoffs`,
+  `git_evidence`, `audit_events`, `generated_at`, and `schema_version`.
+  `timing_generations` contains the exact bounded generation records from
+  TASK-017 in chronological order. `handoffs` is the chronological list of
+  accepted handoffs, each using exactly the redacted `last_handoff` object
+  defined by TASK-019; it contains no canonical frame, launch token, prompt,
+  backend command, raw payload, or transcript. `git_evidence` is the exact
+  TASK-018 object or null. `audit_events` is the retained chronological list
+  of TASK-017 events with its exact event fields and redaction rules.
+  `generated_at` and `schema_version` have the same types and values as the
+  collection response. A page outside `1..page_count` returns HTTP 404 with
+  a bounded JSON diagnostic. Missing tasks return 404; invalid state returns
+  500 with a bounded JSON diagnostic; successful API responses are
+  `application/json; charset=utf-8` with no ANSI formatting. The server
+  computes aggregate values across all tasks, not just the requested page.
+- Only schema-3 records are accepted by the web view. A schema-2 record is
+  private pre-baseline data and returns the bounded HTTP 500 diagnostic
+  `unsupported pre-baseline state schema`; the server does not migrate,
+  project, write, or revise it. Other unsupported versions and malformed
+  schema-3 records return the same bounded HTTP 500 error without mutation.
+- Compute dashboard aggregates from the complete state snapshot: task counts
+  by status and backend, completion/blocked/stopped rates, total and average
+  wall time for finished tasks, total wall time per role, total unattributed
+  time, rounds per task, and the most recent task activity. The denominator
+  for each rate is `total_tasks`; completed, blocked, and stopped are the
+  respective numerators, and every rate is 0.0 when there are no tasks.
+  Finished tasks are those whose current status is `completed`, `blocked`,
+  or `stopped`; `active` and `paused` tasks are not finished, and a resumed
+  task contributes only its current status and timing. The finished-time
+  average divides by the count of those finished tasks and is zero when that
+  count is zero. `most_recent_task_activity` is the maximum valid non-null
+  `activity.implementer.last_activity_at` or
+  `activity.reviewer.last_activity_at` value when TASK-020 metadata is
+  present; if no such value exists, it is the latest valid
+  `last_handoff_time`, otherwise null. Show timing as wall-clock elapsed time
+  at the persisted whole-second precision; label CPU time, token usage, and
+  billing data as unavailable rather than estimating them.
+- Display a task table, status/backend filters, summary cards, and a task
+  detail timeline. Show role durations, round transitions, accepted and
+  rejected handoffs, bounded diagnostics, commit/Git evidence, and verification
+  results when available. Do not display prompts, launch tokens, backend
+  command argv, raw backend payloads, or transcript text. Optional fields from
+  later Git, status, or health tasks are displayed when present and otherwise
+  shown as unavailable.
+- Add HTTP, HTML, API-schema, state-lock, escaping, redaction, empty-state,
+  invalid-state, missing-task, concurrent-writer, and read-only regression
+  tests. Tests use an ephemeral localhost port, prove the server handles
+  multiple requests, and prove file bytes, revisions, timestamps, and child
+  process state are unchanged.
+- Bound each web response while preserving access to every retained task.
+  The fixed page size is 64; the complete selected state snapshot is
+  validated under the state lock, and each page is serialized independently.
+  If the UTF-8 JSON response would exceed 1,048,576 bytes for
+  `/api/tasks?page=N` or 262,144 bytes for `/api/tasks/TASK-ID`, return HTTP
+  413 with the JSON object
+  `{"error":"web response exceeds configured bound"}` and no partial data.
+  The root page is a bounded static self-contained HTML shell that follows
+  the same-origin paginated API until all pages are loaded, then applies its
+  filters; it
+  displays the same bounded error instead of partial task data when a page
+  limit is reached. `GET /` success responses use
+  `text/html; charset=utf-8`; root errors use `text/plain; charset=utf-8`.
+  API successes and all API 404, 413, and 500 errors use
+  `application/json; charset=utf-8` and a bounded `error` string.
+
+Acceptance criteria:
+
+- A local browser can view all retained tasks and filter them without exposing
+  sensitive agent or operator data.
+- API responses have stable keys and types, bounded payloads, correct 404/500
+  behavior, and timing values matching TASK-017's timing contract.
+- Dashboard aggregates are correct for empty, active, completed, blocked,
+  stopped, resumed, multi-round, and mixed-backend task fixtures.
+- The server binds to localhost by default, does not make outbound requests,
+  and exits cleanly on Ctrl-C without changing task state.
+- README, CLI help, and workflow documentation describe the same web contract
+  and pass the applicable documentation verification.
 - Verification Profile A passes on Linux, with every command and result
   recorded in the handoff and review document.
 
@@ -498,7 +700,8 @@ Acceptance criteria:
   nested handoff/event projections, redaction, chronological event limits,
   and exit code for every supported task status.
 - Tests cover missing task, missing/corrupt/invalid state, concurrent writer,
-  lock timeout, legacy migration rejection, and a target with Git evidence.
+  lock timeout, pre-baseline schema rejection, and a target with Git
+  evidence.
 - Running `uv run --script orc status TASK-ID` never changes file bytes,
   revision, timestamps, or child process state.
 - Verification Profile A passes on Linux, with every command and result
