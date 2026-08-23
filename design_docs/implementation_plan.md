@@ -246,8 +246,13 @@ Scope:
   mutation; resume never guesses a backend.
 - `orc` UI and status bar: remove the pane-switching hint and all
   focus-selection terminology, keep the quit hint, and remove any redundant
-  layout text. Preserve the task/status, role-state, backend, agentbox, and
-  right-anchored version information established by TASK-009.
+  layout text. Extend the TASK-009 task segment deliberately to include the
+  current automatic round in the exact form
+  `<TASK-ID>: <status> · round N/M`, where `N` is the one-based current round
+  and `M` is the configured maximum. Render the persisted round at terminal
+  states, initialize the first visible round as `1`, and preserve the
+  role-state, backend, agentbox, and right-anchored version information from
+  TASK-009.
 - `README.md`, `design_docs/agent_workflow.md`, and CLI help: document the
   automatic-only lifecycle, exact begin/resume syntax, selector precedence,
   `ORC_BACKEND` values and required-error behavior, persisted-directory
@@ -259,7 +264,8 @@ Scope:
   persisted backend and target-directory resume, automatic defaults and
   limits, rejection of removed syntax, pass-through of click/Tab/
   Shift-Tab/1/2, active-agent border transitions, and the constrained status
-  bar after the hint changes. Verify both Codex and Claude selection paths.
+  bar after the hint and round-segment changes. Verify both Codex and Claude
+  selection paths.
 
 Acceptance criteria:
 
@@ -274,6 +280,11 @@ Acceptance criteria:
 - `resume TASK-ID PROMPT` loads the original target directory and backend
   from state, rejects the old directory-taking form, and performs all
   validation before state mutation or child launch.
+- The status bar renders the task segment exactly as
+  `<TASK-ID>: <status> · round N/M`, with one-based `N` for the current
+  automatic round and `M` equal to the configured maximum. The first visible
+  round is `1`, and completed, paused, blocked, and stopped states retain the
+  last persisted round value.
 - Mouse clicks cannot switch panes, alter the active role, or reach an agent.
   When `active/implementer` or `active/reviewer` is persisted, `Tab`,
   `Shift-Tab`, `1`, and `2` reach only that role's PTY using the exact byte or
