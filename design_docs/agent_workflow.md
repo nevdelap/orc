@@ -264,13 +264,30 @@ checks the deadline before launching and while waiting for idle children, never
 runs more than five automatic rounds, and ignores duplicate idle events and
 stale role notifications.
 
-The compact status bar reports the task name and current task status,
-`Igor: <state>`, `Rufus: <state>`, the backend, Orc version, and pane-switch
-hint. Role states are `not started`, `active`, `waiting`, `inactive`, and
-`failed`. A role with a recorded normal handoff is `waiting` until the next
-workflow transition; a live child does not make that role `active`. Once
-completion is recorded, both roles are `inactive` and Orc keeps the final panes
-and status visible until the user quits with `Ctrl-Q`.
+The compact status bar is ordered left to right as `<TASK-ID>: <status>`,
+`Igor: <state>`, `Rufus: <state>`, `backend: <name>`, optional
+`agentbox: no-permissions`, and `Tab switches panes · Ctrl-Q exits`. A fixed
+right rail contains a separating space and the complete `orc v0.0.1` segment.
+At 120x40, 80x40, and 80x24, left-side segments retain their complete logical
+text and overflow is clipped at the fixed rail boundary; backend text yields
+to an enabled no-permissions warning. Segments do not wrap, and the version
+segment is never clipped or displaced. Terminals smaller than 80x24 are
+outside this support contract.
+
+Task states use green for `active` and `completed`, and amber for `paused`,
+`blocked`, and `stopped`. Role states use grey for `inactive`, `not started`,
+and `waiting`, green for active roles, and light red for `failed`. Both backend
+labels and values stay white, and the no-permissions
+warning uses light red. The labels remain explicit when color is unavailable.
+Labels and colons stay white; only the value after each label carries the
+semantic color.
+Shown segments are separated by spaces and a center dot (`·`); the task
+segment itself remains exactly `<TASK-ID>: <status>`.
+Role states are `not started`, `active`, `waiting`, `inactive`, and `failed`. A
+role with a recorded normal handoff is `waiting` until the next workflow
+transition; a live child does not make that role `active`. Once completion is
+recorded, both roles are `inactive` and Orc keeps the final panes and status
+visible until the user quits with `Ctrl-Q`.
 
 The begin prompt is optional: `begin DIRECTORY TASK-ID` uses only the built-in
 implementer prompt, while an omitted prompt is persisted as empty and is never

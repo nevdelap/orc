@@ -2198,7 +2198,7 @@ def test_status_bar_derives_both_role_states_and_agentbox_indicator(
     assert app.role_state(record, "implementer") == "waiting"
     assert app.role_state(record, "reviewer") == "not started"
     rendered = app.status_text(record)
-    assert "TASK-003 · active" in rendered
+    assert "TASK-003: active" in rendered
     assert "Igor: waiting" in rendered
     assert "Rufus: not started" in rendered
     assert "agentbox: no-permissions" in rendered
@@ -2209,6 +2209,370 @@ def test_status_bar_derives_both_role_states_and_agentbox_indicator(
     record["phase"] = "complete"
     assert app.role_state(record, "implementer") == "inactive"
     assert app.role_state(record, "reviewer") == "inactive"
+
+
+@pytest.mark.parametrize(
+    ("status", "color"),
+    [
+        ("active", "#7ee787"),
+        ("paused", "#f2cc60"),
+        ("blocked", "#f2cc60"),
+        ("stopped", "#f2cc60"),
+        ("completed", "#7ee787"),
+    ],
+)
+def test_status_bar_task_status_format_and_colors(
+    tmp_path: Path, status: str, color: str
+) -> None:
+    app, _state_file, _panes = app_stub(
+        tmp_path,
+        {"status": status, "phase": "complete" if status == "completed" else "stopped"},
+    )
+    record = orc.load_state(app.args.state_file)["TASK-003"]
+    segments = app.status_segments(record)
+    assert segments["task"] == f"TASK-003: {status}"
+    assert "Click a pane to focus" not in app.status_text(record)
+    assert app._status_color("task", status) == color
+
+
+@pytest.mark.parametrize(
+    ("state", "color"),
+    [
+        ("inactive", "#8b949e"),
+        ("not started", "#8b949e"),
+        ("active", "#7ee787"),
+        ("waiting", "#8b949e"),
+        ("failed", "#ff7b72"),
+    ],
+)
+def test_status_bar_role_state_colors(
+    tmp_path: Path, state: str, color: str
+) -> None:
+    app, _state_file, panes = app_stub(tmp_path, {"status": "active"})
+    record = {"status": "active"}
+    if state == "inactive":
+        record.update(status="completed", phase="complete")
+    elif state == "active":
+        app.sessions["implementer"] = orc.ChildSession(
+            "implementer", 1, 1, panes["implementer"]
+        )
+    elif state == "waiting":
+        record["handoffs"] = [{"role": "implementer"}]
+    elif state == "failed":
+        record["child_failure"] = {"role": "implementer"}
+    assert app._status_color("role", state) == color
+
+
+def test_status_bar_backend_and_warning_styles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "identity"
+    marker.write_text("")
+    monkeypatch.setattr(orc, "AGENTBOX_IDENTITY", marker)
+    monkeypatch.setattr(orc.sys, "platform", "linux")
+    app, _state_file, _panes = app_stub(
+        tmp_path,
+        {
+            "status": "active",
+            "phase": "implementer",
+            "backend": "claude",
+            "launch_command": ["claude", orc.CLAUDE_AGENTBOX_FLAG],
+        },
+    )
+    record = orc.load_state(app.args.state_file)["TASK-003"]
+    segments = app.status_segments(record)
+    assert segments["backend"] == "backend: claude"
+    assert segments["agentbox"] == "agentbox: no-permissions"
+    assert orc.STATUS_COLORS["backend"] == "#d0d7de"
+    assert orc.STATUS_COLORS["agentbox"] == "#ff7b72"
+
+
+def test_status_bar_composed_widgets_follow_size_priority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    state_file = tmp_path / "state.json"
+    record = {
+        "status": "active",
+        "phase": "implementer",
+        "target_directory": str(target),
+        "backend": "codex",
+    }
+    orc.save_state(state_file, {"TASK-009": record})
+    args = argparse.Namespace(state_file=state_file, codex="codex")
+    app = orc.OrcApp(args, "TASK-009")
+    monkeypatch.setattr(app, "launch_role", lambda _role: None)
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            assert app.layout_mode == "side-by-side"
+            assert app.query_one("#status-message", orc.Static).render().plain == (
+                "TASK-009: active"
+            )
+            assert app.query_one("#status-version", orc.Static).render().plain == (
+                f"{orc.STATUS_VERSION_SEPARATOR}{orc.ORC_VERSION}"
+            )
+            assert app.query_one("#status-hint", orc.Static).styles.display == "block"
+            assert app.query_one("#status-hint", orc.Static).render().plain == (
+                f"{orc.STATUS_SEGMENT_SEPARATOR}{orc.FOCUS_STATUS}"
+            )
+            assert (
+                "#7ee787"
+                in str(
+                    app.query_one("#status-message", orc.Static)
+                    ._Static__content
+                    .spans[-1]
+                    .style
+                )
+            )
+
+            await pilot.resize_terminal(80, 40)
+            await pilot.pause()
+            assert app.layout_mode == "stacked"
+            assert (
+                app.query_one("#status-message", orc.Static).styles.display == "block"
+            )
+            assert (
+                app.query_one("#status-igor", orc.Static).styles.display == "block"
+            )
+            assert (
+                app.query_one("#status-rufus", orc.Static).styles.display == "block"
+            )
+            assert (
+                app.query_one("#status-backend", orc.Static).styles.display == "block"
+            )
+            assert app.query_one("#status-hint", orc.Static).styles.display == "block"
+
+            await pilot.resize_terminal(80, 24)
+            await pilot.pause()
+            assert app.layout_mode == "single"
+            assert (
+                app.query_one("#status-message", orc.Static).styles.display == "block"
+            )
+            assert (
+                app.query_one("#status-igor", orc.Static).styles.display == "block"
+            )
+            assert (
+                app.query_one("#status-rufus", orc.Static).styles.display == "block"
+            )
+            assert app.query_one("#status-version", orc.Static).render().plain == (
+                f"{orc.STATUS_VERSION_SEPARATOR}{orc.ORC_VERSION}"
+            )
+
+            marker = tmp_path / "identity"
+            marker.write_text("")
+            monkeypatch.setattr(orc, "AGENTBOX_IDENTITY", marker)
+            monkeypatch.setattr(orc.sys, "platform", "linux")
+            record["launch_command"] = ["codex", orc.CODEX_AGENTBOX_FLAG]
+            record["handoffs"] = [
+                {"role": "implementer"},
+                {"role": "reviewer"},
+            ]
+            orc.save_state(state_file, {"TASK-009": record})
+            app.refresh_status()
+            await pilot.pause()
+            assert app.query_one("#status-backend", orc.Static).styles.display == "none"
+            assert (
+                app.query_one("#status-agentbox", orc.Static).styles.display == "block"
+            )
+            assert app.query_one("#status-hint", orc.Static).render().plain == (
+                f"{orc.STATUS_SEGMENT_SEPARATOR}{orc.FOCUS_STATUS}"
+            )
+            app.exit()
+
+    asyncio.run(exercise())
+
+
+def test_status_bar_renders_all_states_order_and_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    state_file = tmp_path / "state.json"
+    record: dict[str, object] = {
+        "status": "active",
+        "phase": "implementer",
+        "target_directory": str(target),
+        "backend": "codex",
+        "handoffs": [],
+    }
+    orc.save_state(state_file, {"TASK-009": record})
+    args = argparse.Namespace(state_file=state_file, codex="codex")
+    app = orc.OrcApp(args, "TASK-009")
+    monkeypatch.setattr(app, "launch_role", lambda _role: None)
+    # The fixture renders in-memory records directly; keep the live poll from
+    # replacing those records with the initial state-file snapshot.
+    monkeypatch.setattr(app, "poll_state", lambda: None)
+    monkeypatch.setattr(app, "poll_children", lambda: None)
+
+    task_colors = {
+        "active": "#7ee787",
+        "paused": "#f2cc60",
+        "blocked": "#f2cc60",
+        "stopped": "#f2cc60",
+        "completed": "#7ee787",
+    }
+    role_colors = {
+        "inactive": "#8b949e",
+        "not started": "#8b949e",
+        "active": "#7ee787",
+        "waiting": "#8b949e",
+        "failed": "#ff7b72",
+    }
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+
+            def widget(widget_id: str) -> orc.Static:
+                return app.query_one(f"#{widget_id}", orc.Static)
+
+            def color(widget_id: str) -> str:
+                return str(widget(widget_id)._Static__content.spans[-1].style)
+
+            def label_color(widget_id: str) -> str:
+                return str(widget(widget_id)._Static__content.style)
+
+            for status, expected_color in task_colors.items():
+                record["status"] = status
+                record["phase"] = "complete" if status == "completed" else "implementer"
+                record["handoffs"] = []
+                record.pop("child_failure", None)
+                app.sessions = {}
+                app.render_status_bar(record)
+                await pilot.pause()
+                assert widget("status-message").render().plain == (
+                    f"TASK-009: {status}"
+                )
+                assert expected_color in color("status-message")
+                assert "#d0d7de" in label_color("status-message")
+
+            role_cases = {
+                "not started": {"handoffs": []},
+                "active": {"sessions": {"implementer": False, "reviewer": False}},
+                "waiting": {
+                    "handoffs": [
+                        {"role": "implementer"},
+                        {"role": "reviewer"},
+                    ]
+                },
+                "inactive": {"status": "completed", "phase": "complete"},
+                "failed": {"child_failure": {"role": "implementer"}},
+            }
+            for state, changes in role_cases.items():
+                record.update(changes)
+                if state != "inactive":
+                    record["status"] = "active"
+                    record["phase"] = "implementer"
+                if state != "failed":
+                    record.pop("child_failure", None)
+                app.sessions = {
+                    role: argparse.Namespace(
+                        exited=False, retired=False, handoff_count=0
+                    )
+                    for role in changes.get("sessions", {})
+                }
+                app.render_status_bar(record)
+                await pilot.pause()
+                assert role_colors[state] in color("status-igor")
+                assert "#d0d7de" in label_color("status-igor")
+                assert "#d0d7de" in label_color("status-rufus")
+                if state == "inactive":
+                    assert widget("status-rufus").render().plain == " · Rufus: inactive"
+                elif state == "waiting":
+                    assert widget("status-rufus").render().plain == " · Rufus: waiting"
+
+            record["child_failure"] = {"role": "reviewer"}
+            app.render_status_bar(record)
+            await pilot.pause()
+            assert role_colors["failed"] in color("status-rufus")
+
+            for backend in ("codex", "claude"):
+                record["status"] = "active"
+                record["phase"] = "implementer"
+                record["backend"] = backend
+                record.pop("child_failure", None)
+                record["handoffs"] = []
+                app.render_status_bar(record)
+                await pilot.pause()
+                assert widget("status-backend").render().plain == (
+                    f" · backend: {backend}"
+                )
+                assert "#d0d7de" in color("status-backend")
+                assert "#d0d7de" in label_color("status-backend")
+
+            marker = tmp_path / "identity"
+            marker.write_text("")
+            monkeypatch.setattr(orc, "AGENTBOX_IDENTITY", marker)
+            monkeypatch.setattr(orc.sys, "platform", "linux")
+            record["backend"] = "codex"
+            record["launch_command"] = ["codex", orc.CODEX_AGENTBOX_FLAG]
+            record["handoffs"] = [
+                {"role": "implementer"},
+                {"role": "reviewer"},
+            ]
+            app.render_status_bar(record)
+            await pilot.pause()
+            assert widget("status-agentbox").render().plain == (
+                " · agentbox: no-permissions"
+            )
+            assert "#ff7b72" in color("status-agentbox")
+            assert "#d0d7de" in label_color("status-agentbox")
+
+            record["status"] = "completed"
+            record["phase"] = "complete"
+            app.render_status_bar(record)
+            await pilot.pause()
+            assert widget("status-agentbox").styles.display == "block"
+            assert widget("status-backend").styles.display == "none"
+
+            expected_order = (
+                "status-message",
+                "status-igor",
+                "status-rufus",
+                "status-agentbox",
+                "status-hint",
+            )
+            regions = [widget(widget_id).region for widget_id in expected_order]
+            left_region = app.query_one("#status-left", orc.Container).region
+            version_region = widget("status-version").region
+            assert all(
+                left.x + left.width <= right.x
+                for left, right in zip(regions[:-1], regions[1:], strict=True)
+            )
+            assert left_region.x + left_region.width == version_region.x
+            assert version_region.x + version_region.width == app.size.width
+            assert widget("status-version").render().plain == (
+                f"{orc.STATUS_VERSION_SEPARATOR}{orc.ORC_VERSION}"
+            )
+            assert widget("status-backend").styles.display == "none"
+
+            for width, height, layout in (
+                (120, 40, "side-by-side"),
+                (80, 40, "stacked"),
+                (80, 24, "single"),
+            ):
+                await pilot.resize_terminal(width, height)
+                await pilot.pause()
+                assert app.layout_mode == layout
+                left_region = app.query_one("#status-left", orc.Container).region
+                version_region = widget("status-version").region
+                visible = [
+                    widget(widget_id).region
+                    for widget_id in expected_order
+                    if widget(widget_id).styles.display == "block"
+                ]
+                assert left_region.x + left_region.width == version_region.x
+                assert all(region.x >= left_region.x for region in visible)
+                assert version_region.x + version_region.width == width
+                assert widget("status-version").render().plain == (
+                    f"{orc.STATUS_VERSION_SEPARATOR}{orc.ORC_VERSION}"
+                )
+            app.exit()
+
+    asyncio.run(exercise())
 
 
 def test_auto_handoff_retires_live_child_before_next_launch(
@@ -2302,7 +2666,7 @@ def test_stop_status_keeps_compact_status_bar(
     app.poll_state()
 
     assert rendered
-    assert "TASK-003 · " + status in rendered[-1]
+    assert "TASK-003: " + status in rendered[-1]
     assert "Igor:" in rendered[-1]
     assert "Rufus:" in rendered[-1]
     assert orc.ORC_VERSION in rendered[-1]
@@ -2340,7 +2704,7 @@ def test_codex_nonzero_exit_after_handoff_is_child_failure(
     assert saved["child_failure"]["reason"] == "Codex exited with status 1"
     assert exited
     assert rendered
-    assert "TASK-003 · stopped" in rendered[-1]
+    assert "TASK-003: stopped" in rendered[-1]
     assert "Igor: failed" in rendered[-1]
     assert "Rufus:" in rendered[-1]
     assert orc.ORC_VERSION in rendered[-1]

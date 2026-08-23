@@ -136,12 +136,29 @@ settings are saved with the task and reused by `resume`. Without `--auto`, Orc
 keeps the manual one-round pause after Rufus. The automatic mode never resumes
 after a clarification pause.
 
-The compact status bar shows the task and current task status, Igor and Rufus
-states, the selected backend, Orc's version, and the pane-switch hint. Role
-states are `not started`, `active`, `waiting`, `inactive`, and `failed`. A role
-that has handed off is `waiting` until the next workflow transition, even if
-its child process is still alive. A completed task leaves both roles `inactive`
-and keeps the UI visible until `Ctrl-Q`.
+The compact status bar uses this left-to-right order: `<TASK-ID>: <status>`,
+`Igor: <state>`, `Rufus: <state>`, `backend: <name>`, the optional
+`agentbox: no-permissions` warning, and `Tab switches panes · Ctrl-Q exits`.
+The complete `orc v0.0.1` segment is fixed at the far right with a reserved
+separating space. At 120x40, 80x40, and 80x24, left-side segments retain their
+complete logical text and overflow is clipped at the fixed rail boundary;
+backend text yields to an enabled no-permissions warning. Segments never wrap,
+and the version segment is never clipped or displaced. Terminals smaller than
+80x24 are outside the supported status-bar matrix.
+
+Task colors are green for `active` and `completed`, and amber for `paused`,
+`blocked`, and `stopped`. Role colors are grey for `inactive`, `not started`,
+and `waiting`, green for `active`, and light red for `failed`. Both backend
+labels and values stay white; the no-permissions warning
+uses light red. Labels remain visible so color is not the only state signal.
+Labels and colons stay white; only the value after each label carries the
+semantic color.
+Shown segments are separated by spaces and a center dot (`·`); the task
+segment itself remains exactly `<TASK-ID>: <status>`.
+Role states are `not started`, `active`, `waiting`, `inactive`, and `failed`. A
+role that has handed off is `waiting` until the next workflow transition, even
+if its child process is still alive. A completed task leaves both roles
+`inactive` and keeps the UI visible until `Ctrl-Q`.
 
 When the agentbox marker is present and the selected launch actually includes
 the backend's no-permission flag, the bar also shows `agentbox: no-permissions`. Orc retires a normally handed-off child before launching the

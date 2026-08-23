@@ -79,7 +79,31 @@ CLAUDE_REQUIRED_HELP = (
     "text",
     "--resume",
 )
-FOCUS_STATUS = "Click a pane to focus · Tab switches panes · Ctrl-Q exits"
+FOCUS_STATUS = "Tab switches panes · Ctrl-Q exits"
+STATUS_SEGMENT_SEPARATOR = " · "
+STATUS_VERSION_SEPARATOR = " "
+STATUS_COLORS = {
+    "task:active": "#7ee787",
+    "task:completed": "#7ee787",
+    "task:paused": "#f2cc60",
+    "task:blocked": "#f2cc60",
+    "task:stopped": "#f2cc60",
+    "role:inactive": "#8b949e",
+    "role:not started": "#8b949e",
+    "role:active": "#7ee787",
+    "role:waiting": "#8b949e",
+    "role:failed": "#ff7b72",
+    "backend": "#d0d7de",
+    "agentbox": "#ff7b72",
+}
+STATUS_SEGMENT_IDS = (
+    "status-message",
+    "status-igor",
+    "status-rufus",
+    "status-backend",
+    "status-agentbox",
+    "status-hint",
+)
 UNABLE_TO_PROCEED = "UNABLE_TO_PROCEED"
 DEFAULT_MAX_ROUNDS = 5
 DEFAULT_DEADLINE_SECONDS = 60 * 60
@@ -821,11 +845,31 @@ class OrcApp(App[None]):
         background: $boost;
         color: $text;
         layout: horizontal;
+        overflow: hidden;
     }
 
-    #status-message {
+    #status-left {
         width: 1fr;
+        height: 1;
+        layout: horizontal;
+        overflow: hidden;
+    }
+
+    .status-segment {
+        width: auto;
+        height: 1;
         padding: 0 1;
+        content-align: left middle;
+        overflow: hidden;
+        text-wrap: nowrap;
+    }
+
+    #status-version {
+        width: 11;
+        height: 1;
+        padding: 0 0 0 1;
+        content-align: left middle;
+        text-wrap: nowrap;
     }
 
     """
@@ -852,11 +896,46 @@ class OrcApp(App[None]):
             id="panes",
         )
         yield Container(
-            Static(
-                f"{self.task_id} · Starting Orc…",
-                id="status-message",
-                markup=False,
+            Container(
+                Static(
+                    f"{self.task_id}: starting",
+                    id="status-message",
+                    classes="status-segment",
+                    markup=False,
+                ),
+                Static(
+                    "Igor: not started",
+                    id="status-igor",
+                    classes="status-segment",
+                    markup=False,
+                ),
+                Static(
+                    "Rufus: not started",
+                    id="status-rufus",
+                    classes="status-segment",
+                    markup=False,
+                ),
+                Static(
+                    "backend: codex",
+                    id="status-backend",
+                    classes="status-segment",
+                    markup=False,
+                ),
+                Static(
+                    "agentbox: no-permissions",
+                    id="status-agentbox",
+                    classes="status-segment",
+                    markup=False,
+                ),
+                Static(
+                    FOCUS_STATUS,
+                    id="status-hint",
+                    classes="status-segment",
+                    markup=False,
+                ),
+                id="status-left",
             ),
+            Static(ORC_VERSION, id="status-version", markup=False),
             id="status",
         )
 
@@ -944,17 +1023,137 @@ class OrcApp(App[None]):
         )
         return isinstance(command, list) and expected in command
 
-    def status_text(self, record: dict[str, Any]) -> str:
+    @staticmethod
+    def _status_color(kind: str, value: str) -> str:
+        return STATUS_COLORS.get(f"{kind}:{value}", "#d0d7de")
+
+    def status_segments(self, record: dict[str, Any]) -> dict[str, str]:
+        """Return the status bar's ordered, human-readable segments."""
+
         backend = backend_from_record(record)
-        indicator = (
-            " · agentbox: no-permissions" if self.agentbox_enabled(record) else ""
+        segments = {
+            "task": f"{self.task_id}: {record.get('status', 'unknown')}",
+            "igor": f"Igor: {self.role_state(record, 'implementer')}",
+            "rufus": f"Rufus: {self.role_state(record, 'reviewer')}",
+            "backend": f"backend: {backend}",
+            "hint": FOCUS_STATUS,
+        }
+        if self.agentbox_enabled(record):
+            segments["agentbox"] = "agentbox: no-permissions"
+        return segments
+
+    def status_text(self, record: dict[str, Any]) -> str:
+        segments = self.status_segments(record)
+        ordered = [segments[key] for key in ("task", "igor", "rufus", "backend")]
+        if "agentbox" in segments:
+            ordered.append(segments["agentbox"])
+        ordered.extend((segments["hint"], ORC_VERSION))
+        return STATUS_SEGMENT_SEPARATOR.join(ordered)
+
+    @staticmethod
+    def _status_text(value: str, color: str) -> Text:
+        separator = value.find(": ")
+        if separator < 0:
+            return Text(value, style=Style(color="#d0d7de"))
+        label_end = separator + 2
+        rendered = Text(value[:label_end], style=Style(color="#d0d7de"))
+        rendered.append(value[label_end:], style=Style(color=color))
+        return rendered
+
+    def _status_width(self) -> int:
+        size = getattr(self, "size", None)
+        width = getattr(size, "width", 0)
+        return max(width, 0)
+
+    @staticmethod
+    def _status_padding(width: int, segments: dict[str, str]) -> int:
+        # Separators provide the visual gutter. Keeping CSS padding at zero
+        # lets the width calculation reserve those cells explicitly.
+        return 0
+
+    def _visible_status_keys(
+        self, segments: dict[str, str], width: int
+    ) -> tuple[set[str], str]:
+        """Select ordered segments while the left rail clips overflow."""
+
+        visible = {"task", "igor", "rufus"}
+        if "agentbox" in segments:
+            visible.add("agentbox")
+        else:
+            visible.add("backend")
+        # The left rail owns overflow handling. Keep the full logical hint and
+        # let the rail clip it at the fixed version boundary when necessary.
+        return visible, segments["hint"]
+
+    def render_status_bar(self, record: dict[str, Any]) -> None:
+        """Render composed, styled segments and the fixed version rail."""
+
+        segments = self.status_segments(record)
+        width = self._status_width()
+        visible, hint = self._visible_status_keys(segments, width)
+        padding = self._status_padding(width, segments)
+        task_color = self._status_color(
+            "task", str(record.get("status", "unknown"))
         )
-        return (
-            f"{self.task_id} · {record.get('status', 'unknown')} · "
-            f"Igor: {self.role_state(record, 'implementer')} · "
-            f"Rufus: {self.role_state(record, 'reviewer')} · "
-            f"backend: {backend}{indicator} · {ORC_VERSION} · {FOCUS_STATUS}"
-        )
+        values = {
+            "status-message": (segments["task"], task_color),
+            "status-igor": (
+                segments["igor"],
+                self._status_color("role", self.role_state(record, "implementer")),
+            ),
+            "status-rufus": (
+                segments["rufus"],
+                self._status_color("role", self.role_state(record, "reviewer")),
+            ),
+            "status-backend": (segments["backend"], STATUS_COLORS["backend"]),
+            "status-agentbox": (
+                segments.get("agentbox", ""),
+                STATUS_COLORS["agentbox"],
+            ),
+            "status-hint": (hint, "#d0d7de"),
+        }
+        visible_order = ("task", "igor", "rufus", "backend", "agentbox", "hint")
+        shown_keys = [
+            key
+            for key in visible_order
+            if key in visible or (key == "hint" and bool(hint))
+        ]
+        separator_keys = set(shown_keys[1:])
+        for widget_id in STATUS_SEGMENT_IDS:
+            try:
+                widget = self.query_one(f"#{widget_id}", Static)
+            except Exception:
+                continue
+            value, color = values[widget_id]
+            key = {
+                "status-message": "task",
+                "status-igor": "igor",
+                "status-rufus": "rufus",
+                "status-backend": "backend",
+                "status-agentbox": "agentbox",
+                "status-hint": "hint",
+            }[widget_id]
+            if key in separator_keys and value:
+                value = f"{STATUS_SEGMENT_SEPARATOR}{value}"
+            widget.update(self._status_text(value, color))
+            styles = getattr(widget, "styles", None)
+            if styles is not None and hasattr(styles, "display"):
+                if hasattr(styles, "padding"):
+                    styles.padding = (0, padding // 2)
+                if hasattr(styles, "width"):
+                    styles.width = "auto"
+                shown = key in visible or (key == "hint" and bool(hint))
+                styles.display = "block" if shown and value else "none"
+        try:
+            version = self.query_one("#status-version", Static)
+        except Exception:
+            version = None
+        if version is not None:
+            version.update(
+                self._status_text(
+                    f"{STATUS_VERSION_SEPARATOR}{ORC_VERSION}", "#d0d7de"
+                )
+            )
 
     def refresh_status(self) -> None:
         state = load_state(self.args.state_file)
@@ -1462,7 +1661,7 @@ class OrcApp(App[None]):
         state = load_state(args.state_file)
         record = state.get(self.task_id)
         if not isinstance(record, dict):
-            return f"{self.task_id} · unknown · {ORC_VERSION} · {FOCUS_STATUS}"
+            return f"{self.task_id}: unknown · {ORC_VERSION} · {FOCUS_STATUS}"
         return self.status_text(record)
 
     def update_layout(self) -> None:
@@ -1502,12 +1701,18 @@ class OrcApp(App[None]):
     def update_status(self, message: str) -> None:
         self.last_status = message
         if getattr(self, "_running", False):
-            rendered = (
-                message
-                if message.startswith(f"{self.task_id} ·")
-                else f"{self.task_id} · {message}"
-            )
-            self.query_one("#status-message", Static).update(rendered)
+            state = load_state(self.args.state_file)
+            record = state.get(self.task_id)
+            if isinstance(record, dict) and message == self.status_text(record):
+                self.render_status_bar(record)
+                return
+            # Keep transient PTY errors visible while retaining the composed
+            # status widgets for normal workflow updates.
+            try:
+                widget = self.query_one("#status-message", Static)
+            except Exception:
+                return
+            widget.update(message)
 
     def poll_state(self) -> None:
         state = load_state(self.args.state_file)
