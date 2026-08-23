@@ -231,3 +231,103 @@ Acceptance criteria:
 - README examples match the implemented Linux command line and configuration.
 - Applicable product, PTY/integration, documentation, and clean-diff checks
   pass.
+
+## TASK-008 - Make workflow status truthful and advance rounds reliably
+
+State: NEW
+
+Goal:
+
+- Make Orc's status bar accurately show the current state of both Igor and
+  Rufus while using the available space efficiently.
+- Make automatic implementation/review rounds advance after a normal handoff,
+  even when the completed agent process remains alive waiting for input.
+
+Dependencies:
+
+- TASK-006 must be `COMPLETED`.
+
+Scope:
+
+- `orc`: derive separate implementer and reviewer display states from the
+  persisted workflow phase, handoff events, child-session lifecycle, and
+  current backend activity; refresh the status bar whenever any of those
+  values changes.
+- Make the begin prompt optional: support
+  `begin DIRECTORY TASK-ID [PROMPT]`, persist an empty user prompt when it is
+  omitted, and rely on Orc's built-in implementer prompt without appending an
+  empty user-request section. Keep `resume DIRECTORY TASK-ID PROMPT` strict:
+  a resume request or clarification must remain non-empty.
+- Replace the current single active-role/layout status with a compact status
+  bar that retains the task name, Orc version, pane-switch hint, both role
+  states, the current task status, and an agentbox permission-mode indicator.
+  Format the task segment as the task name plus its current status. Remove the
+  layout label; the visible pane arrangement already communicates the layout.
+- Define and display these role states consistently: `not started`, `active`,
+  `waiting`, `inactive`, and `failed`. A role that has handed off and is
+  waiting for the next workflow transition must not be shown as active merely
+  because its Codex or Claude child process still exists. Once the task is
+  complete, both roles display `inactive`.
+- When `/etc/agentbox/identity` exists and the selected backend launch
+  command contains the exact no-permission flag for that backend, show an
+  explicit `agentbox: no-permissions` indicator. Use
+  `--dangerously-bypass-approvals-and-sandbox` for Codex and
+  `--dangerously-skip-permissions` for Claude; do not show the indicator when
+  the marker is absent or the launch mode is not actually enabled.
+- On a normal handoff, retire or reset the completed child session before
+  scheduling the next role. Its ordinary completion must not be recorded as a
+  `child_failure`, and a live completed child must not block the next
+  automatic round or cause duplicate concurrent launches.
+- When the task reaches its normal completion state, keep Orc's UI alive after
+  the final reviewer handoff. Do not call `exit` merely because the task is
+  complete; leave both panes and the final status visible until the user
+  explicitly quits with `Ctrl-Q`. Completion must not launch another role.
+- Preserve the existing manual-pause, clarification, deadline, max-round,
+  completion, backend, PTY, and resume semantics.
+- `tests/test_orc.py` and Linux PTY/integration fixtures: cover both roles,
+  both Codex and Claude backend modes where applicable, normal and failed
+  child exits, automatic round transitions, status refresh, pane focus, and
+  terminal resize.
+- `README.md` and `design_docs/agent_workflow.md`: document the compact status
+  bar, role-state meanings, agentbox indicator, and completed-child lifecycle.
+- Update CLI help, README examples, workflow documentation, and tests to show
+  both begin forms and the unchanged non-empty resume requirement.
+
+Acceptance criteria:
+
+- The status bar simultaneously shows current implementer and reviewer states
+  and refreshes after launch, handoff, child exit, idle-hook processing, and
+  workflow stop/completion events.
+- A completed Igor handoff displays Igor as `waiting` while the task remains
+  active, and does not display Rufus as `active` until Rufus has actually been
+  launched.
+- A completed Rufus handoff displays Rufus as `waiting` while Orc is waiting
+  to launch the next Igor round, and does not display Rufus as `active`.
+- The layout label is absent while task name, Orc version, pane-switch hint,
+  both role states, and the relevant agentbox indicator remain visible at the
+  supported terminal sizes; the task name also includes current task status.
+- `begin DIRECTORY TASK-ID` is accepted and uses only the built-in implementer
+  prompt until a user request is supplied; `begin DIRECTORY TASK-ID PROMPT`
+  continues to record and deliver the supplied prompt exactly.
+- An omitted begin prompt does not create an empty user request, and
+  `resume DIRECTORY TASK-ID PROMPT` still rejects an empty or whitespace-only
+  request before changing state.
+- After normal task completion, the status bar reports the completed task
+  status and both roles as `inactive`; Orc remains alive with the final panes
+  visible and exits only after the user presses `Ctrl-Q`.
+- With `/etc/agentbox/identity` present, Codex shows
+  `agentbox: no-permissions` only when
+  `--dangerously-bypass-approvals-and-sandbox` is in its launch argv, and
+  Claude shows it only when `--dangerously-skip-permissions` is in its launch
+  argv. Outside agentbox, neither indicator is shown.
+- In automatic mode, a normal Igor handoff followed by Rufus review starts
+  the next Igor round without manual input, even if the prior child process
+  has not exited on its own.
+- Normal completed child sessions are retired without `child_failure`; real
+  non-zero or unexpected child exits still produce the existing failure stop.
+- Duplicate handoffs, stale events, repeated polling, and terminal resize do
+  not produce duplicate launches or incorrect role states.
+- Manual one-round mode, clarification pauses, deadline/max-round limits,
+  Codex behavior, Claude behavior, and resume behavior remain unchanged.
+- Tests, Linux PTY/integration checks, documentation checks, and clean-diff
+  verification pass on the final commit.

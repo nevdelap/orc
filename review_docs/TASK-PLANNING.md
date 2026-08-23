@@ -183,21 +183,47 @@ Resolution:
 - Igor's corrected planning snapshot changed only
   `design_docs/implementation_plan.md`; this reviewer amendment adds the
   permitted review record.
-- Its `Reviewed:` section records an open independent review item for Rufus;
-  this review now records the final decision.
+- The submitted planning snapshot recorded an open independent review item;
+  this review amendment resolves it without changing `Implemented:`.
 
 Evidence:
 
 - `git diff --name-status HEAD^ HEAD` lists the implementation plan and this
   reviewer-owned review record, with no source or test changes.
-- `git show -s --format=%B HEAD` contains the pending review item.
+- `git show -s --format=%B HEAD` preserves `Implemented:` and records the
+  addressed review findings.
+
+### R008
+
+Status: ADDRESSED
+
+TASK-008 defines the role-state vocabulary as `not started`, `active`,
+`waiting`, `inactive`, and `failed`, but its acceptance criteria also allow a
+completed handoff to display `complete`. `complete` is not defined as a valid
+state, so the implementer cannot determine which labels are required or how
+to verify the handoff display. Resolve the ambiguity by either adding
+`complete` to the defined role-state contract or removing it from the
+acceptance criteria and specifying the intended defined state.
+
+Resolution:
+
+- The acceptance criteria now use `waiting` while the task remains active and
+  reserve `inactive` for normal task completion, matching the five-state
+  vocabulary in Scope.
+
+Evidence:
+
+- `design_docs/implementation_plan.md:266-270` defines five role states and
+  uses `waiting` for an in-progress completed handoff.
+- `design_docs/implementation_plan.md:301-305` now requires `waiting` for both
+  completed handoffs and no longer permits the undefined `complete` state.
 
 ## Verification
 
 - `git diff --no-ext-diff --check HEAD^ HEAD`: PASS.
 - Commit subject and body lines are at or below 60 characters: PASS.
-- TASK-003 and TASK-005 are `COMPLETED`; TASK-004, TASK-007, and TASK-006
-  remain valid `NEW` tasks with the required dependency order.
+- TASK-005, TASK-006, and TASK-007 are `COMPLETED`; TASK-008 remains `NEW`
+  with its TASK-006 dependency satisfied.
 - No product-runtime gates were applicable because this planning diff changes
   no application source or tests.
 
