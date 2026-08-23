@@ -182,7 +182,7 @@ Acceptance criteria:
 
 ## TASK-011 - Simplify automatic workflow, CLI, and pane interaction
 
-State: NEW
+State: COMPLETED
 
 Goal:
 

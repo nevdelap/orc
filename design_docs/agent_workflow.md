@@ -241,66 +241,65 @@ Acceptance criteria:
 
 ## Bounded workflow state machine
 
-Orc supports the existing manual one-round workflow and an explicitly enabled
-bounded mode. `begin DIRECTORY TASK-ID [PROMPT]` remains manual: Igor hands off to
-Rufus, then Rufus pauses the task with `stop_reason: manual_pause`. Automatic
-mode is enabled only with `begin ... --auto`; it alternates Igor and Rufus and
-persists `automatic_rounds`, `max_rounds`, `deadline_seconds`,
+Every `begin DIRECTORY TASK-ID [PROMPT]` starts bounded automatic Igor/Rufus
+rounds. It persists `automatic_rounds`, `max_rounds`, `deadline_seconds`,
 `cycle_started_at`, `deadline_at`, `last_role`, `last_commit`, and
 `stop_reason`. `--max-rounds` accepts 1 through 5 and defaults to 5;
 `--deadline-minutes` accepts 1 through 1440 and defaults to 60. Resume reuses
-those values.
+those values. There is no `--auto` option and no manual one-round mode.
+
+Begin selects exactly one backend with `--codex` or `--claude`, or reads the
+exact values `codex` and `claude` from `ORC_BACKEND`. `CODEX_COMMAND` and
+`ORC_CLAUDE_COMMAND` configure executable paths separately. Resume accepts only
+`TASK-ID PROMPT`, resolves the target directory and backend from persisted
+state, and rejects invalid stored data before mutation or child launch.
 
 An idle handoff may report exactly `UNABLE_TO_PROCEED` with a concise reason.
 Orc persists the blocker role, reason, task, round, thread, timestamp, current
 commit, and phase, then stops without launching or retrying another role. A
 resume must provide a non-empty clarification and records that exact request;
-validation happens before any state mutation or child launch. A clarification
-pause is never automatically resumed.
+validation happens before any state mutation or child launch. A legacy record
+with missing or false `automatic_rounds` retains its history, uses valid stored
+limits or the defaults, and receives a fresh deadline from resume time.
 
 The distinct persisted stop reasons are `completion`, `clarification`,
-`deadline`, `max_rounds`, `child_failure`, and `manual_pause`. The scheduler
-checks the deadline before launching and while waiting for idle children, never
-runs more than five automatic rounds, and ignores duplicate idle events and
-stale role notifications.
+`deadline`, `max_rounds`, `child_failure`, and legacy `manual_pause`. The
+scheduler checks the deadline before launching and while waiting for idle
+children, never runs more than five automatic rounds, and ignores duplicate
+idle events and stale role notifications.
 
-The compact status bar is ordered left to right as `<TASK-ID>: <status>`,
-`Igor: <state>`, `Rufus: <state>`, `backend: <name>`, optional
-`agentbox: no-permissions`, and `Tab switches panes · Ctrl-Q exits`. A fixed
-right rail contains a separating space and the complete `orc v0.0.1` segment.
-At 120x40, 80x40, and 80x24, left-side segments retain their complete logical
-text and overflow is clipped at the fixed rail boundary; backend text yields
-to an enabled no-permissions warning. Segments do not wrap, and the version
-segment is never clipped or displaced. Terminals smaller than 80x24 are
-outside this support contract.
+The compact status bar is ordered left to right as
+`<TASK-ID>: <status> · round N/M`, `Igor: <state>`, `Rufus: <state>`,
+`backend: <name>`, optional `agentbox: no-permissions`, and `Ctrl-Q exits`. A
+fixed right rail contains a separating space and the complete `orc v0.0.1`
+segment. At 120x40, 80x40, and 80x24, left-side segments never wrap or overlap
+the rail; constrained content is clipped or deprioritized at its boundary.
+Terminals smaller than 80x24 are outside this support contract.
 
 Task states use green for `active` and `completed`, and amber for `paused`,
 `blocked`, and `stopped`. Role states use grey for `inactive`, `not started`,
 and `waiting`, green for active roles, and light red for `failed`. Both backend
-labels and values stay white, and the no-permissions
-warning uses light red. The labels remain explicit when color is unavailable.
-Labels and colons stay white; only the value after each label carries the
-semantic color.
-Shown segments are separated by spaces and a center dot (`·`); the task
-segment itself remains exactly `<TASK-ID>: <status>`.
-Role states are `not started`, `active`, `waiting`, `inactive`, and `failed`. A
-role with a recorded normal handoff is `waiting` until the next workflow
-transition; a live child does not make that role `active`. Once completion is
-recorded, both roles are `inactive` and Orc keeps the final panes and status
-visible until the user quits with `Ctrl-Q`. Orc likewise keeps the UI alive for
-`paused`, `blocked`, and `stopped` records, including clarification,
-`manual_pause`, `deadline`, `max_rounds`, and `child_failure` stop reasons.
+labels and values stay white, and the no-permissions warning uses light red.
+Labels remain explicit when color is unavailable. The task segment includes
+the one-based persisted round and configured maximum, including terminal
+states.
 
 The begin prompt is optional: `begin DIRECTORY TASK-ID` uses only the built-in
 implementer prompt, while an omitted prompt is persisted as empty and is never
-rendered as an empty user request. Resume remains strict and requires a
-non-empty request or clarification. After a normal handoff Orc retires the
+rendered as an empty user request. After a normal handoff Orc retires the
 completed child before scheduling the next role. Retiring a completed child is
 ordinary workflow cleanup and must not be persisted as `child_failure`.
 Terminal transitions refresh the visible panes and status without scheduling a
 new role. `Ctrl-Q` is the only normal terminal-state exit path; its existing
 PTY, reader, timer, and child cleanup runs when the UI unmounts, and quitting
 does not delete or rewrite the persisted task record.
+
+The active-agent border is derived only from persisted `status: active` and
+`phase`: Igor is active for `implementer`, Rufus for `reviewer`, and neither
+role is active for terminal statuses. Mouse press/release events are consumed.
+`Tab`, `Shift-Tab`, `1`, and `2` are forwarded to the workflow-active PTY as
+`0x09`, `ESC [ Z`, `1`, and `2`; all other input is ignored when no role is
+active.
 
 ## Housekeeping
 

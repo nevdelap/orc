@@ -1,235 +1,117 @@
 # Orc
 
-Orc is a terminal orchestrator for two agent roles: Igor, the implementer, and
-Rufus, the reviewer. Codex is the default backend; Claude Code can be selected
-for a task. Orc keeps both roles in a split Textual terminal UI, forwards
-input to the selected role, and pauses after each implement/review round so the
-work can be inspected or resumed.
+Orc is a terminal orchestrator for Igor, the implementer, and Rufus, the
+reviewer. Every `begin` runs bounded automatic Igor/Rufus rounds in a split
+Textual terminal UI. The workflow-active role receives input and has the
+highlighted active-agent border.
 
 ## Prerequisites
 
 - POSIX terminal with a working PTY.
-- Python 3.11 or newer.
-- [uv](https://docs.astral.sh/uv/) for the recommended launch method.
-- The `codex` executable available on `PATH`, or `CODEX_COMMAND` set to its
-  path.
-- Claude Code is optional. To use it, the `claude` executable must be on
-  `PATH`, or `ORC_CLAUDE_COMMAND` must name the executable. It must support
-  print mode with stream JSON and session resume.
-- A Git target project is recommended because handoffs record its current
-  commit. A target does not need to be the directory containing Orc.
+- Python 3.11 or newer and [uv](https://docs.astral.sh/uv/).
+- A Codex executable on `PATH`, or `CODEX_COMMAND` set to its path.
+- Optionally, a Claude executable on `PATH`, or `ORC_CLAUDE_COMMAND` set to
+  its path. It must support print mode with stream JSON and session resume.
+- A Git target is recommended because handoffs record its current commit.
 
-## Agentbox mode
+## Backend and agentbox mode
 
-On Linux, Orc detects the agentbox confinement marker at
-`/etc/agentbox/identity`. When that file exists, every Codex begin and resume
-launch receives `--dangerously-bypass-approvals-and-sandbox`, and every Claude
-begin and resume launch receives `--dangerously-skip-permissions`; the marker
-contents are ignored. When it is absent, Orc leaves each backend's normal
-approval and permission behavior unchanged. This is an agentbox environment
-signal, not a user task option.
+Select the backend on `begin` with exactly one of `--codex` or `--claude`.
+If neither selector is present, `ORC_BACKEND` must be exactly `codex` or
+`claude`; otherwise Orc fails before creating state or launching a child.
+`CODEX_COMMAND` and `ORC_CLAUDE_COMMAND` configure executable paths and are
+independent of backend selection. The selected backend and executable are
+persisted and reused on resume.
 
-Agentbox provides the confined Sysbox container as the external safety boundary
-for this mode; see the [agentbox GitHub repository](https://github.com/nevdelap/agentbox)
-for that confinement model. The marker-based behavior is Linux-only.
+On Linux, the existence of `/etc/agentbox/identity` adds
+`--dangerously-bypass-approvals-and-sandbox` to Codex or
+`--dangerously-skip-permissions` to Claude. Marker contents are ignored.
 
-## Launch
-
-From an executable checkout, run Orc directly through its uv shebang:
+## Commands
 
 ```console
-./orc begin DIRECTORY TASK-ID [PROMPT]
+./orc begin DIRECTORY TASK-ID [PROMPT] [--max-rounds N]
+  [--deadline-minutes N] [--codex|--claude]
+./orc resume TASK-ID PROMPT
 ```
 
-The equivalent explicit form is useful when diagnosing the launcher:
+The begin prompt is optional. Resume requires a non-empty request and accepts
+no backend or directory selector; it resolves the normalized target directory
+stored by `begin`. The old `resume DIRECTORY TASK-ID PROMPT` form is rejected.
+Use `--state-file PATH` before the command to select a state file.
 
-```console
-uv run --script orc begin DIRECTORY TASK-ID [PROMPT]
-```
+`--max-rounds` accepts 1–5 and defaults to 5. `--deadline-minutes` accepts
+1–1440 and defaults to 60. Both limits are persisted and reused on resume.
+There is no manual one-round mode and no `--auto` option.
 
-Select Claude Code explicitly for a new task:
+For Claude, Orc probes the selected executable with `--help` before creating
+state. The help must expose `--print`, `--output-format stream-json`,
+`--input-format text`, and `--resume`. A clean Claude exit without a session
+ID and valid handoff is recorded as a child failure.
 
-```console
-./orc begin DIRECTORY TASK-ID [PROMPT] --backend claude
-```
+## State and lifecycle
 
-Orc probes the selected Claude executable with `--help` before creating task
-state. The help output must advertise `--print`, `--output-format stream-json`, `--input-format text`, and `--resume`. Claude is run in print
-mode with newline-delimited JSON; its session ID and final response are stored
-in the shared task state. Resume uses the stored backend and session:
+State defaults to `~/.orc/codex-state.json`. A task record retains its
+normalized target directory, selected backend and command, backend version,
+role session IDs, round state, requests, handoffs, diagnostics, and target Git
+commit. Legacy records with missing or false `automatic_rounds` are upgraded
+only after resume validates their target, backend, request, and state. They
+retain history, use valid existing limits or the defaults, and receive a fresh
+deadline from resume time. Missing or invalid target/backend data is rejected
+without state mutation.
 
-```console
-./orc resume DIRECTORY TASK-ID PROMPT
-```
+Igor and Rufus alternate automatically until completion, clarification,
+deadline, maximum rounds, or child failure. A normal handoff retires the old
+child before the next role launches. Orc keeps the final panes and status bar
+mounted in every terminal state; only `Ctrl-Q` exits, and quitting preserves
+the task record and diagnostics.
 
-Passing `--backend` to `resume` is optional, but if supplied it must match the
-backend recorded by `begin`. `ORC_CLAUDE_COMMAND` is read at begin and the
-selected executable is retained in task state, so resume does not silently
-switch backends. A clean Claude exit without a session ID and valid handoff is
-recorded as a child failure.
+## Status bar
 
-For a managed checkout, install the locked environment first, then use either
-form above:
+The left-to-right logical order is:
 
-```console
-uv sync --locked
-./orc begin DIRECTORY TASK-ID [PROMPT]
-```
+`<TASK-ID>: <status> · round N/M` · `Igor: <state>` · `Rufus: <state>` ·
+`backend: <name>` · optional `agentbox: no-permissions` · `Ctrl-Q exits`.
 
-`DIRECTORY` must already exist and be a directory. Orc resolves it to an
-absolute path before creating state or launching a child. For example:
+`N` is the one-based persisted current round, including at terminal states;
+`M` is the configured maximum. The complete `orc v0.0.1` segment is fixed at
+the far right with a reserved separating space. At Linux `xterm-256color`
+sizes 120x40, 80x40, and 80x24, left content never wraps or overlaps that
+rail; constrained content is clipped or deprioritized at the left-rail
+boundary. Terminals smaller than 80x24 are outside the support contract.
 
-```console
-uv run --script orc begin /work/my-project TASK-003 "Implement the next task"
-```
-
-The target can be outside Orc's own repository. Igor and Rufus start with that
-directory as their working directory; Orc's state file and UI remain owned by
-the Orc process.
-
-## State
-
-Orc stores state in `~/.orc/codex-state.json` by default. Override it before
-the command with `--state-file`:
-
-```console
-uv run --script orc --state-file /tmp/orc-state.json begin DIRECTORY TASK-ID [PROMPT]
-```
-
-The task record retains the normalized target directory, backend and command,
-backend version, Codex thread IDs or Claude session IDs, round state, user
-requests, idle events, handoff messages, and the short Git commit observed in
-the target repository. Keep the state file outside the target project when
-the target has its own source-control or backup policy.
-
-## Workflow
-
-`begin DIRECTORY TASK-ID [PROMPT]` validates the target, creates a new task,
-and starts Igor. The prompt is optional; when omitted, Igor receives Orc's
-built-in implementer instructions without an empty user-request section. When
-Igor becomes idle, Orc starts Rufus in the same target. Rufus reviews the target
-worktree and reports findings without implementing fixes. After the review
-becomes idle, Orc pauses the round. Use `resume` to send Igor a follow-up or to
-ask for another implementation round:
-
-```console
-uv run --script orc resume DIRECTORY TASK-ID PROMPT
-```
-
-The resume directory is mandatory and must resolve to exactly the directory
-stored for that task. A conflicting, missing, invalid, or non-directory path is
-rejected before the state record is changed. A resume request must be non-empty;
-when a task is paused for clarification, that request is the clarification
-passed to Igor and is recorded exactly once.
-
-For bounded automatic cycles, opt in explicitly at begin:
-
-```console
-uv run --script orc begin DIRECTORY TASK-ID PROMPT --auto \
-  --max-rounds 5 --deadline-minutes 60
-```
-
-`--auto` runs Igor and Rufus repeatedly until completion, a blocker, child
-failure, the configured round limit, or the persisted deadline. The limit is
-1–5 rounds and the deadline is 1–1440 minutes; both default to 5 and 60. The
-settings are saved with the task and reused by `resume`. Without `--auto`, Orc
-keeps the manual one-round pause after Rufus. The automatic mode never resumes
-after a clarification pause.
-
-The compact status bar uses this left-to-right order: `<TASK-ID>: <status>`,
-`Igor: <state>`, `Rufus: <state>`, `backend: <name>`, the optional
-`agentbox: no-permissions` warning, and `Tab switches panes · Ctrl-Q exits`.
-The complete `orc v0.0.1` segment is fixed at the far right with a reserved
-separating space. At 120x40, 80x40, and 80x24, left-side segments retain their
-complete logical text and overflow is clipped at the fixed rail boundary;
-backend text yields to an enabled no-permissions warning. Segments never wrap,
-and the version segment is never clipped or displaced. Terminals smaller than
-80x24 are outside the supported status-bar matrix.
-
-Task colors are green for `active` and `completed`, and amber for `paused`,
-`blocked`, and `stopped`. Role colors are grey for `inactive`, `not started`,
-and `waiting`, green for `active`, and light red for `failed`. Both backend
-labels and values stay white; the no-permissions warning
-uses light red. Labels remain visible so color is not the only state signal.
-Labels and colons stay white; only the value after each label carries the
-semantic color.
-Shown segments are separated by spaces and a center dot (`·`); the task
-segment itself remains exactly `<TASK-ID>: <status>`.
-Role states are `not started`, `active`, `waiting`, `inactive`, and `failed`. A
-role that has handed off is `waiting` until the next workflow transition, even
-if its child process is still alive. A completed task leaves both roles
-`inactive` and keeps the UI visible until `Ctrl-Q`. The same keep-alive behavior
-applies to `paused`, `blocked`, and `stopped` tasks, including clarification,
-manual-pause, deadline, maximum-round, and child-failure stops.
-
-When the agentbox marker is present and the selected launch actually includes
-the backend's no-permission flag, the bar also shows `agentbox: no-permissions`. Orc retires a normally handed-off child before launching the
-next role or round; that lifecycle is not a `child_failure`.
-
-## Handoffs and stop states
-
-Each idle handoff is persisted with its role, round, thread, target commit,
-UTC/local times, and the handoff fields. An agent may stop only when it cannot
-proceed without a human and must report the exact status
-`UNABLE_TO_PROCEED` plus a concise reason. Orc stores the blocker role, reason,
-task, round, thread, timestamp, commit, and phase, then launches no next role.
-
-The persisted `stop_reason` distinguishes `completion`, `clarification`,
-`deadline`, `max_rounds`, `child_failure`, and `manual_pause`. Duplicate idle
-events and stale notifications are ignored, so they cannot create an extra
-round or concurrent child. Reaching any terminal status refreshes the final
-panes and status bar but does not close the UI or launch another role.
+Task states `active` and `completed` are green; `paused`, `blocked`, and
+`stopped` are amber. Role states `inactive`, `not started`, and `waiting` are
+grey; `failed` is light red. Backend labels and values are white, and the
+agentbox warning is light red. Explicit labels remain visible when color is
+unavailable.
 
 ## Interaction
 
-Both role panes remain visible whenever the terminal supports the selected
-layout. The active pane has a highlighted border and its role is shown in the
-status line. Click either pane or press `Tab` to focus the next pane; focus
-selection updates the border and status without sending the focus command to
-the agent. `Ctrl-Q` is the explicit exit action: Orc stays alive for inspection
-after completion, a pause, a deadline, a round limit, or a child failure until
-the user presses it.
+The active-agent border follows the persisted mapping: only `active` with
+phase `implementer` activates Igor, and only `active` with phase `reviewer`
+activates Rufus. Paused, blocked, stopped, and completed tasks have no active
+role. Mouse presses and releases are consumed and never change roles or reach
+an agent. `Tab`, `Shift-Tab`, `1`, and `2` are forwarded to the workflow-active
+agent as byte `0x09`, `ESC [ Z`, `1`, and `2`. Other ordinary input is also
+forwarded only while a role is active; otherwise it is ignored. `Ctrl-Q` is
+always the explicit exit action.
 
-Ordinary keys, digits, control keys, arrows, Enter, Shift-Tab, paste, and
-terminal resize signals are forwarded to the active Codex PTY. Shift-Tab uses
-the terminal's reported control sequence when available. Orc keeps startup,
-idle, and handoff messages in each pane, and displays the task name and Orc
-version in the status bar. Exiting the UI does not delete task state; resume
-the task later with the same target directory. Closing the UI with `Ctrl-Q`
-leaves the terminal task record and its final diagnostics available in the
-state file.
+## Handoffs and troubleshooting
 
-## Troubleshooting
+An idle handoff includes role, round, thread, target, UTC/local time, commit,
+and handoff fields. A blocker must use the exact status
+`UNABLE_TO_PROCEED` with a concise reason. Duplicate and stale events are
+ignored. Stop reasons are `completion`, `clarification`, `deadline`,
+`max_rounds`, `child_failure`, and the legacy `manual_pause`.
 
-- **Target directory error:** check that the path exists, is accessible, and
-  is a directory. Use an absolute path when diagnosing symlink or mount issues.
-- **Task already exists:** choose a new task ID or use `resume` with the stored
-  target directory.
-- **Unknown task:** use the same `--state-file` that was used for `begin`.
-- **Resume directory mismatch:** inspect the task record and pass its
-  normalized `target_directory`; Orc intentionally rejects a different path.
-- **No interactive terminal:** run `begin` or `resume` from a real POSIX
-  terminal rather than redirecting standard input or output. If `./orc` is
-  not executable in a checkout, run `chmod +x orc` once or use the explicit
-  `uv run --script orc` form.
-- **Resize or blank pane:** Orc measures the rendered pane after layout and
-  sends that width and height to the child PTY. If a pane looks blank after a
-  terminal resize, wait for the redraw, then click the pane to make its focus
-  and border state explicit. Extremely small terminals use a safe minimum; use
-  at least 80x24 for normal operation.
-- **Codex cannot start:** set `CODEX_COMMAND` or pass `--codex`, and verify the
-  executable can run from the target directory.
-- **Claude cannot start:** set `ORC_CLAUDE_COMMAND` to the Claude executable and
-  run it with `--help`. Orc requires the print/stream/resume capability
-  contract; an incompatible or unavailable command is rejected before task
-  state changes.
-- **Claude produced no handoff:** Claude print mode must emit stream JSON with
-  a session ID and a final response containing the shared handoff `Status:`.
-  A clean exit without those fields is intentionally a child failure.
-- **Git commit is `unknown`:** the target may not be a Git worktree or its
-  `HEAD` may be unavailable. Orchestration can still retain the handoff.
+- **Backend selection error:** use `--codex` or `--claude`, or set
+  `ORC_BACKEND` to one exact value. Executable variables configure paths only.
+- **Target or state error:** check the directory and persisted target/backend;
+  resume intentionally guesses neither.
+- **No interactive terminal:** run `begin` or `resume` from a real POSIX PTY.
+- **Resize or blank pane:** use at least 80x24 and wait for redraw after resize.
+- **Claude cannot start:** verify `ORC_CLAUDE_COMMAND` and its `--help`
+  capability contract.
 
-Use `./orc --help` for the complete CLI help. The help text also describes the Linux-only agentbox marker behavior. The hidden
-`idle-hook` command is invoked by Codex notifications and is not normally run
-by hand. Set `ORC_DISABLE_IDLE_HOOK=1` for general Orc testing when you
-need to keep an agent session available without an automatic handoff.
+Use `./orc --help` for complete CLI help.

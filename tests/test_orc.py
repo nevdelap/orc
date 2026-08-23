@@ -42,12 +42,11 @@ def cli_args(
         [
             "--state-file",
             str(state_file),
-            "--codex",
-            "fake-codex",
             "begin",
             str(directory),
             task_id,
             "implement the task",
+            "--codex",
         ]
     )
 
@@ -91,7 +90,7 @@ def test_help_requires_and_describes_directory(
     assert error.value.code == 0
     output = capsys.readouterr().out
     assert "begin DIRECTORY TASK-ID" in output
-    assert "resume DIRECTORY TASK-ID" in output
+    assert "resume TASK-ID PROMPT" in output
     assert "DIRECTORY" in output
 
 
@@ -162,6 +161,7 @@ def test_resume_requires_matching_target_before_mutating_state(
             "round": 2,
             "prompt": "first",
             "target_directory": str(target.resolve()),
+            "backend": "codex",
             "user_requests": [],
         }
     }
@@ -186,6 +186,7 @@ def test_resume_records_request_after_matching_target(
             "round": 2,
             "prompt": "first",
             "target_directory": str(target.resolve()),
+            "backend": "codex",
             "user_requests": [],
         }
     }
@@ -196,7 +197,7 @@ def test_resume_records_request_after_matching_target(
 
     record = orc.load_state(state_file)["TASK-003"]
     assert record["user_requests"] == ["implement the task"]
-    assert record["round"] == 3
+    assert record["round"] == 2
     assert record["phase"] == "implementer"
 
 
@@ -215,6 +216,7 @@ def test_resume_restarts_reviewer_after_child_failure(
             "target_directory": str(target.resolve()),
             "user_requests": ["continue to completion"],
             "reviewer_id": "missing-rollout-thread",
+            "backend": "codex",
             "stop_reason": "child_failure",
             "child_failure": {"role": "reviewer", "exit_status": 256},
         }
@@ -251,6 +253,7 @@ def test_resume_clears_failure_before_role_becomes_active(
             "prompt": "first",
             "target_directory": str(target.resolve()),
             "user_requests": [],
+            "backend": "codex",
             "stop_reason": "child_failure",
             "child_failure": {"role": role, "exit_status": 256},
         }
@@ -542,17 +545,17 @@ def test_live_textual_resize_focus_and_pty_redraw(
 
                 assert await pilot.click("#reviewer")
                 await pilot.pause()
-                assert app.active_role == "reviewer"
+                assert app.active_role == "implementer"
                 await pilot.press("tab")
                 await pilot.pause()
                 assert app.active_role == "implementer"
                 await pilot.click("#reviewer")
                 await pilot.pause()
-                assert app.active_role == "reviewer"
+                assert app.active_role == "implementer"
                 assert "active" in app.last_status
-                assert "Tab switches panes" in app.last_status
-                assert "active-pane" in app.pane("reviewer").classes
-                assert "active-pane" not in app.pane("implementer").classes
+                assert "Ctrl-Q exits" in app.last_status
+                assert "active-pane" not in app.pane("reviewer").classes
+                assert "active-pane" in app.pane("implementer").classes
 
                 await pilot.resize_terminal(80, 40)
                 await pilot.pause(0.1)
@@ -655,12 +658,12 @@ def test_orc_input_forwarding_and_tab_focus(
 
     tab = Event("tab", "\t")
     app.on_key(tab)
-    assert app.active_role == "reviewer"
+    assert app.active_role == "implementer"
     assert tab.stopped
-    assert writes[-1] == b"2"
+    assert writes[-1] == b"\t"
     event = Event("unknown")
     app.on_key(event)
-    assert not event.stopped
+    assert event.stopped
 
 
 def test_paste_click_and_find_task_role(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -697,7 +700,7 @@ def test_paste_click_and_find_task_role(monkeypatch: pytest.MonkeyPatch) -> None
 
     click = ClickEvent()
     app.on_click(click)
-    assert app.active_role == "reviewer" and click.stopped
+    assert app.active_role == "implementer" and click.stopped
     assert orc.find_task_role({"T": {"reviewer_id": "r"}}, "r") == ("T", "reviewer")
     assert orc.find_task_role({}, "missing") == (None, None)
 
@@ -758,6 +761,10 @@ def app_stub(
     tmp_path: Path, record: dict[str, object]
 ) -> tuple[object, Path, dict[str, FakePane]]:
     state_file = tmp_path / "state.json"
+    record.setdefault("backend", "codex")
+    record.setdefault("automatic_rounds", True)
+    record.setdefault("max_rounds", 5)
+    record.setdefault("round", 1)
     orc.save_state(state_file, {"TASK-003": record})
     args = argparse.Namespace(state_file=state_file, codex="codex")
     app = orc.OrcApp.__new__(orc.OrcApp)
@@ -954,6 +961,7 @@ def test_agentbox_launch_executes_spaced_codex_through_real_pty(
     app, state_file, _panes = app_stub(tmp_path, record)
     if selector == "CODEX_COMMAND":
         monkeypatch.setenv("CODEX_COMMAND", str(fake_codex))
+        monkeypatch.setenv("ORC_BACKEND", "codex")
         cli = [
             "--state-file",
             str(state_file),
@@ -963,17 +971,19 @@ def test_agentbox_launch_executes_spaced_codex_through_real_pty(
             "initial",
         ]
     else:
+        monkeypatch.setenv("CODEX_COMMAND", str(fake_codex))
+        monkeypatch.setenv("ORC_BACKEND", "invalid")
         cli = [
             "--state-file",
             str(state_file),
-            "--codex",
-            str(fake_codex),
             "begin",
             str(target),
             "TASK-003",
             "initial",
+            "--codex",
         ]
     app.args = orc.parse_args(cli)
+    assert orc.selected_backend(app.args) == "codex"
     app.set_master_reader = lambda _session: None
     app.resize_session = lambda _session: None
     app.update_layout = lambda: None
@@ -1047,7 +1057,12 @@ def test_orc_app_launch_error_and_invalid_records(
     assert len(errors) == 0
 
     app.started_roles.clear()
-    record = {"target_directory": str(tmp_path), "prompt": "p", "user_requests": []}
+    record = {
+        "target_directory": str(tmp_path),
+        "backend": "codex",
+        "prompt": "p",
+        "user_requests": [],
+    }
     orc.save_state(app.args.state_file, {"TASK-003": record})
     monkeypatch.setattr(
         app, "fork_codex", lambda *_args: (_ for _ in ()).throw(OSError("no"))
@@ -1055,7 +1070,10 @@ def test_orc_app_launch_error_and_invalid_records(
     app.launch_role("reviewer")
     assert any("could not launch reviewer" in value for value in errors)
 
-    orc.save_state(app.args.state_file, {"TASK-003": {"prompt": "p"}})
+    orc.save_state(
+        app.args.state_file,
+        {"TASK-003": {"backend": "codex", "prompt": "p"}},
+    )
     app.started_roles.clear()
     app.launch_role("implementer")
     assert any("no target directory" in value for value in errors)
@@ -1230,7 +1248,13 @@ def test_resume_rejects_bad_requests_and_unknown_task(tmp_path: Path) -> None:
         orc.resume(args)
     orc.save_state(
         state_file,
-        {"TASK-003": {"target_directory": str(target), "user_requests": "bad"}},
+        {
+            "TASK-003": {
+                "target_directory": str(target),
+                "backend": "codex",
+                "user_requests": "bad",
+            }
+        },
     )
     with pytest.raises(SystemExit, match="invalid user_requests"):
         orc.resume(args)
@@ -1373,7 +1397,7 @@ def test_launch_resume_and_poll_edge_branches(
     errors: list[str] = []
     monkeypatch.setattr(app, "fatal_error", errors.append)
     app.launch_role("implementer")
-    assert any("no user request" in value for value in errors)
+    assert not errors
 
     # A task missing from state is a fatal launch condition.
     orc.save_state(app.args.state_file, {})
@@ -1461,7 +1485,13 @@ def test_ctrl_q_action_quit_success_run_and_main_branches(
     state_file = tmp_path / "state.json"
     orc.save_state(
         state_file,
-        {"TASK-003": {"target_directory": str(target), "user_feedback": ["old"]}},
+        {
+            "TASK-003": {
+                "target_directory": str(target),
+                "backend": "codex",
+                "user_feedback": ["old"],
+            }
+        },
     )
     monkeypatch.setattr(orc, "run_app", lambda *_: None)
     orc.resume(cli_args(state_file, target))
@@ -1484,7 +1514,7 @@ def hook_args(state_file: Path, payload: dict[str, object]) -> argparse.Namespac
     return argparse.Namespace(state_file=state_file, payload=json.dumps(payload))
 
 
-def test_auto_cli_bounds_and_invalid_combinations(tmp_path: Path) -> None:
+def test_automatic_cli_bounds_and_removed_manual_syntax(tmp_path: Path) -> None:
     target = tmp_path / "target"
     target.mkdir()
     auto = orc.parse_args(
@@ -1493,19 +1523,19 @@ def test_auto_cli_bounds_and_invalid_combinations(tmp_path: Path) -> None:
             str(target),
             "TASK-005",
             "implement",
-            "--auto",
             "--max-rounds",
             "3",
             "--deadline-minutes",
             "7",
+            "--codex",
         ]
     )
-    assert auto.auto is True
+    assert auto.backend_selector == "codex"
     assert auto.max_rounds == 3
     assert auto.deadline_minutes == 7
     with pytest.raises(SystemExit):
         orc.parse_args(
-            ["begin", str(target), "TASK-005", "implement", "--max-rounds", "2"]
+            ["begin", str(target), "TASK-005", "implement", "--auto"]
         )
     with pytest.raises(SystemExit):
         orc.parse_args(
@@ -1514,9 +1544,9 @@ def test_auto_cli_bounds_and_invalid_combinations(tmp_path: Path) -> None:
                 str(target),
                 "TASK-005",
                 "implement",
-                "--auto",
                 "--max-rounds",
                 "6",
+                "--codex",
             ]
         )
     with pytest.raises(SystemExit):
@@ -1526,9 +1556,9 @@ def test_auto_cli_bounds_and_invalid_combinations(tmp_path: Path) -> None:
                 str(target),
                 "TASK-005",
                 "implement",
-                "--auto",
                 "--deadline-minutes",
                 "1441",
+                "--codex",
             ]
         )
 
@@ -1547,11 +1577,11 @@ def test_begin_persists_bounded_settings(
             str(target),
             "TASK-005",
             "implement",
-            "--auto",
             "--max-rounds",
             "2",
             "--deadline-minutes",
             "3",
+            "--codex",
         ]
     )
     monkeypatch.setattr(orc, "run_app", lambda *_: None)
@@ -1563,6 +1593,82 @@ def test_begin_persists_bounded_settings(
     assert record["cycle_started_at"]
     assert record["deadline_at"]
     assert record["stop_reason"] is None
+
+
+def test_backend_selector_precedence_and_required_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    state_file = tmp_path / "state.json"
+    monkeypatch.delenv("ORC_BACKEND", raising=False)
+    args = orc.parse_args(
+        ["--state-file", str(state_file), "begin", str(target), "TASK-005"]
+    )
+    with pytest.raises(SystemExit, match="select a backend"):
+        orc.begin(args)
+    assert not state_file.exists()
+
+    monkeypatch.setenv("ORC_BACKEND", "claude")
+    selected = orc.parse_args(["begin", str(target), "TASK-005"])
+    assert orc.selected_backend(selected) == "claude"
+    explicit = orc.parse_args(["begin", str(target), "TASK-005", "--codex"])
+    assert orc.selected_backend(explicit) == "codex"
+    monkeypatch.setenv("ORC_BACKEND", "invalid")
+    assert orc.selected_backend(explicit) == "codex"
+    with pytest.raises(SystemExit):
+        orc.parse_args(
+            ["begin", str(target), "TASK-005", "--codex", "--claude"]
+        )
+
+
+def test_resume_parser_has_no_directory_or_backend_selector(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    args = orc.parse_args(["resume", "TASK-005", "continue"])
+    assert args.task_id == "TASK-005"
+    assert args.prompt == "continue"
+    assert not hasattr(args, "directory")
+    with pytest.raises(SystemExit):
+        orc.parse_args(["resume", str(target), "TASK-005", "continue"])
+
+
+def test_legacy_resume_migrates_automatic_settings_after_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    state_file = tmp_path / "state.json"
+    record = {
+        "status": "paused",
+        "phase": "reviewer",
+        "round": 2,
+        "target_directory": str(target),
+        "backend": "codex",
+        "automatic_rounds": False,
+        "max_rounds": 4,
+        "deadline_seconds": 300,
+        "deadline_at": "2000-01-01T00:00:00+00:00",
+        "handoffs": [{"role": "implementer"}],
+        "user_requests": ["old request"],
+    }
+    orc.save_state(state_file, {"TASK-005": record})
+    configured_codex = tmp_path / "configured codex"
+    monkeypatch.setenv("CODEX_COMMAND", str(configured_codex))
+    args = orc.parse_args(
+        ["--state-file", str(state_file), "resume", "TASK-005", "continue"]
+    )
+    monkeypatch.setattr(orc, "run_app", lambda *_: None)
+    orc.resume(args)
+    saved = orc.load_state(state_file)["TASK-005"]
+    assert saved["automatic_rounds"] is True
+    assert saved["max_rounds"] == 4
+    assert saved["deadline_seconds"] == 300
+    assert saved["backend_command"] == str(configured_codex)
+    assert saved["round"] == 2
+    assert saved["handoffs"] == [{"role": "implementer"}]
+    assert saved["user_requests"] == ["old request", "continue"]
+    assert orc.parse_timestamp(saved["deadline_at"]) > orc.utc_now()
 
 
 @pytest.mark.parametrize("role", ["implementer", "reviewer"])
@@ -1577,6 +1683,7 @@ def test_unable_to_proceed_persists_blocker_and_does_not_transition(
         "phase": role,
         "round": 1,
         "target_directory": str(target),
+        "backend": "codex",
         "handoffs": [],
         "processed_idle_events": [],
         f"{role}_id": f"{role}-thread",
@@ -1602,7 +1709,7 @@ def test_unable_to_proceed_persists_blocker_and_does_not_transition(
     before = saved.copy()
     with pytest.raises(SystemExit, match="non-empty"):
         args = orc.parse_args(
-            ["--state-file", str(state_file), "resume", str(target), "TASK-005", " "]
+            ["--state-file", str(state_file), "resume", "TASK-005", " "]
         )
         orc.resume(args)
     assert orc.load_state(state_file)["TASK-005"] == before
@@ -1619,6 +1726,7 @@ def test_resume_delivers_exact_clarification_without_resetting_limits(
         "phase": "blocked",
         "round": 2,
         "target_directory": str(target.resolve()),
+        "backend": "codex",
         "user_requests": [],
         "automatic_rounds": True,
         "max_rounds": 4,
@@ -1632,9 +1740,8 @@ def test_resume_delivers_exact_clarification_without_resetting_limits(
         [
             "--state-file",
             str(state_file),
-            "resume",
-            str(target),
-            "TASK-005",
+                "resume",
+                "TASK-005",
             "Choose option B exactly",
         ]
     )
@@ -1889,26 +1996,20 @@ def test_review_findings_do_not_count_prompt_completion_marker(
 
     saved = orc.load_state(state_file)["TASK-005"]
     assert saved["reviewer_reported_complete"] is False
-    assert saved["status"] == "paused"
-    assert saved["phase"] == "reviewer"
-    assert saved["stop_reason"] == "manual_pause"
+    assert saved["status"] == "active"
+    assert saved["phase"] == "implementer"
+    assert saved["round"] == 3
+    assert saved["stop_reason"] is None
 
 
-def test_explicit_default_limits_require_auto(tmp_path: Path) -> None:
+def test_explicit_default_limits_are_always_available(tmp_path: Path) -> None:
     target = tmp_path / "target"
     target.mkdir()
     for option, value in (("--max-rounds", "5"), ("--deadline-minutes", "60")):
-        with pytest.raises(SystemExit):
-            orc.parse_args(
-                [
-                    "begin",
-                    str(target),
-                    "TASK-005",
-                    "implement",
-                    option,
-                    value,
-                ]
-            )
+        args = orc.parse_args(
+            ["begin", str(target), "TASK-005", "implement", option, value, "--codex"]
+        )
+        assert getattr(args, option[2:].replace("-", "_")) == int(value)
 
 
 def test_resume_rejects_completion_as_terminal(
@@ -1921,19 +2022,19 @@ def test_resume_rejects_completion_as_terminal(
         "TASK-005": {
             "status": "paused",
             "phase": "complete",
-            "stop_reason": "completion",
-            "target_directory": str(target.resolve()),
-            "user_requests": [],
+                "stop_reason": "completion",
+                "target_directory": str(target.resolve()),
+                "backend": "codex",
+                "user_requests": [],
         }
     }
     orc.save_state(state_file, state)
     args = orc.parse_args(
         [
             "--state-file",
-            str(state_file),
-            "resume",
-            str(target),
-            "TASK-005",
+                str(state_file),
+                "resume",
+                "TASK-005",
             "continue",
         ]
     )
@@ -1987,8 +2088,7 @@ def test_claude_cli_selection_and_probe_before_state_mutation(
             str(target),
             "TASK-006",
             "implement",
-            "--backend",
-            "claude",
+            "--claude",
         ]
     )
     monkeypatch.setattr(orc, "run_app", lambda *_: None)
@@ -2011,8 +2111,7 @@ def test_claude_cli_selection_and_probe_before_state_mutation(
             str(target),
             "TASK-006-BAD",
             "implement",
-            "--backend",
-            "claude",
+            "--claude",
         ]
     )
     with pytest.raises(SystemExit, match="incompatible"):
@@ -2038,20 +2137,17 @@ def test_claude_resume_reuses_stored_backend_and_rejects_conflict(
         }
     }
     orc.save_state(state_file, state)
-    conflict = orc.parse_args(
-        [
-            "--state-file",
-            str(state_file),
-            "resume",
-            str(target),
-            "TASK-006",
-            "continue",
-            "--backend",
-            "codex",
-        ]
-    )
-    with pytest.raises(SystemExit, match="cannot resume with backend"):
-        orc.resume(conflict)
+    with pytest.raises(SystemExit):
+        orc.parse_args(
+            [
+                "--state-file",
+                str(state_file),
+                "resume",
+                "TASK-006",
+                "continue",
+                "--codex",
+            ]
+        )
     assert orc.load_state(state_file) == state
 
 
@@ -2196,11 +2292,11 @@ def test_status_bar_derives_both_role_states_and_agentbox_indicator(
     state = orc.load_state(state_file)
     record = state["TASK-003"]
     assert app.role_state(record, "implementer") == "waiting"
-    assert app.role_state(record, "reviewer") == "not started"
+    assert app.role_state(record, "reviewer") == "active"
     rendered = app.status_text(record)
     assert "TASK-003: active" in rendered
     assert "Igor: waiting" in rendered
-    assert "Rufus: not started" in rendered
+    assert "Rufus: active" in rendered
     assert "agentbox: no-permissions" in rendered
     assert "layout:" not in rendered
     assert orc.ORC_VERSION in rendered
@@ -2230,7 +2326,7 @@ def test_status_bar_task_status_format_and_colors(
     )
     record = orc.load_state(app.args.state_file)["TASK-003"]
     segments = app.status_segments(record)
-    assert segments["task"] == f"TASK-003: {status}"
+    assert segments["task"] == f"TASK-003: {status} · round 1/5"
     assert "Click a pane to focus" not in app.status_text(record)
     assert app._status_color("task", status) == color
 
@@ -2283,7 +2379,7 @@ def test_status_bar_backend_and_warning_styles(
     segments = app.status_segments(record)
     assert segments["backend"] == "backend: claude"
     assert segments["agentbox"] == "agentbox: no-permissions"
-    assert orc.STATUS_COLORS["backend"] == "#d0d7de"
+    assert orc.STATUS_COLORS["backend"] == "#ffffff"
     assert orc.STATUS_COLORS["agentbox"] == "#ff7b72"
 
 
@@ -2309,7 +2405,7 @@ def test_status_bar_composed_widgets_follow_size_priority(
             await pilot.pause()
             assert app.layout_mode == "side-by-side"
             assert app.query_one("#status-message", orc.Static).render().plain == (
-                "TASK-009: active"
+                "TASK-009: active · round 1/5"
             )
             assert app.query_one("#status-version", orc.Static).render().plain == (
                 f"{orc.STATUS_VERSION_SEPARATOR}{orc.ORC_VERSION}"
@@ -2341,9 +2437,9 @@ def test_status_bar_composed_widgets_follow_size_priority(
                 app.query_one("#status-rufus", orc.Static).styles.display == "block"
             )
             assert (
-                app.query_one("#status-backend", orc.Static).styles.display == "block"
+                app.query_one("#status-backend", orc.Static).styles.display == "none"
             )
-            assert app.query_one("#status-hint", orc.Static).styles.display == "block"
+            assert app.query_one("#status-hint", orc.Static).styles.display == "none"
 
             await pilot.resize_terminal(80, 24)
             await pilot.pause()
@@ -2375,11 +2471,9 @@ def test_status_bar_composed_widgets_follow_size_priority(
             await pilot.pause()
             assert app.query_one("#status-backend", orc.Static).styles.display == "none"
             assert (
-                app.query_one("#status-agentbox", orc.Static).styles.display == "block"
+                app.query_one("#status-agentbox", orc.Static).styles.display == "none"
             )
-            assert app.query_one("#status-hint", orc.Static).render().plain == (
-                f"{orc.STATUS_SEGMENT_SEPARATOR}{orc.FOCUS_STATUS}"
-            )
+            assert app.query_one("#status-hint", orc.Static).styles.display == "none"
             app.exit()
 
     asyncio.run(exercise())
@@ -2444,7 +2538,7 @@ def test_status_bar_renders_all_states_order_and_boundaries(
                 app.render_status_bar(record)
                 await pilot.pause()
                 assert widget("status-message").render().plain == (
-                    f"TASK-009: {status}"
+                    f"TASK-009: {status} · round 1/5"
                 )
                 assert expected_color in color("status-message")
                 assert "#d0d7de" in label_color("status-message")
@@ -2463,9 +2557,16 @@ def test_status_bar_renders_all_states_order_and_boundaries(
             }
             for state, changes in role_cases.items():
                 record.update(changes)
-                if state != "inactive":
+                if state == "inactive":
+                    record["status"] = "completed"
+                    record["phase"] = "complete"
+                else:
                     record["status"] = "active"
-                    record["phase"] = "implementer"
+                    record["phase"] = (
+                        "reviewer"
+                        if state in {"not started", "waiting"}
+                        else "implementer"
+                    )
                 if state != "failed":
                     record.pop("child_failure", None)
                 app.sessions = {
@@ -2482,7 +2583,7 @@ def test_status_bar_renders_all_states_order_and_boundaries(
                 if state == "inactive":
                     assert widget("status-rufus").render().plain == " · Rufus: inactive"
                 elif state == "waiting":
-                    assert widget("status-rufus").render().plain == " · Rufus: waiting"
+                    assert widget("status-rufus").render().plain == " · Rufus: active"
 
             record["child_failure"] = {"role": "reviewer"}
             app.render_status_bar(record)
@@ -2500,7 +2601,7 @@ def test_status_bar_renders_all_states_order_and_boundaries(
                 assert widget("status-backend").render().plain == (
                     f" · backend: {backend}"
                 )
-                assert "#d0d7de" in color("status-backend")
+                assert "#ffffff" in color("status-backend")
                 assert "#d0d7de" in label_color("status-backend")
 
             marker = tmp_path / "identity"
@@ -2673,12 +2774,54 @@ def test_terminal_task_stays_mounted_until_ctrl_q_and_preserves_state(
             await pilot.pause()
             assert app.is_running
             assert app.query_one("#status-message", orc.Static).render().plain == (
-                "TASK-003: completed"
+                "TASK-003: completed · round 1/5"
             )
             app.exit()
 
     asyncio.run(exercise())
     assert orc.load_state(state_file)["TASK-003"] == record
+
+
+@pytest.mark.parametrize(
+    "terminal_status", ["paused", "blocked", "stopped", "completed"]
+)
+def test_terminal_transition_clears_active_agent_border(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_status: str,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    state_file = tmp_path / "state.json"
+    record: dict[str, object] = {
+        "status": "active",
+        "phase": "implementer",
+        "round": 1,
+        "max_rounds": 5,
+        "backend": "codex",
+        "target_directory": str(target),
+        "handoffs": [],
+    }
+    orc.save_state(state_file, {"TASK-003": record})
+    app = orc.OrcApp(argparse.Namespace(state_file=state_file), "TASK-003")
+    monkeypatch.setattr(app, "launch_role", lambda _role: None)
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            assert "active-pane" in app.pane("implementer").classes
+            record["status"] = terminal_status
+            record["phase"] = (
+                "complete" if terminal_status == "completed" else "stopped"
+            )
+            orc.save_state(state_file, {"TASK-003": record})
+            app.poll_state()
+            await pilot.pause()
+            assert "active-pane" not in app.pane("implementer").classes
+            assert "active-pane" not in app.pane("reviewer").classes
+            app.exit()
+
+    asyncio.run(exercise())
 
 
 def test_paused_task_stays_mounted_without_mount_time_launch(
@@ -2711,7 +2854,7 @@ def test_paused_task_stays_mounted_without_mount_time_launch(
             assert app.is_running
             assert app.sessions == {}
             assert app.query_one("#status-message", orc.Static).render().plain == (
-                "TASK-003: paused"
+                "TASK-003: paused · round 1/5"
             )
             app.exit()
 

@@ -33,7 +33,7 @@ from rich.style import Style
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Container
-from textual.events import Click, Paste
+from textual.events import Click, MouseDown, MouseRelease, MouseUp, Paste
 from textual.geometry import Size
 from textual.screen import Screen
 from textual.widgets import Static
@@ -79,7 +79,7 @@ CLAUDE_REQUIRED_HELP = (
     "text",
     "--resume",
 )
-FOCUS_STATUS = "Tab switches panes · Ctrl-Q exits"
+FOCUS_STATUS = "Ctrl-Q exits"
 STATUS_SEGMENT_SEPARATOR = " · "
 STATUS_VERSION_SEPARATOR = " "
 STATUS_COLORS = {
@@ -93,7 +93,7 @@ STATUS_COLORS = {
     "role:active": "#7ee787",
     "role:waiting": "#8b949e",
     "role:failed": "#ff7b72",
-    "backend": "#d0d7de",
+    "backend": "#ffffff",
     "agentbox": "#ff7b72",
 }
 STATUS_SEGMENT_IDS = (
@@ -122,8 +122,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Orchestrate Igor and Rufus sessions. "
-            "Usage: begin DIRECTORY TASK-ID [PROMPT] or "
-            "resume DIRECTORY TASK-ID PROMPT."
+            "Usage: begin DIRECTORY TASK-ID [PROMPT] [limits] or "
+            "resume TASK-ID PROMPT."
         ),
         epilog=(
             "On Linux, /etc/agentbox/identity enables the selected backend's "
@@ -136,12 +136,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=Path.home() / ".orc" / "codex-state.json",
         help="Path for Orc state (default: %(default)s).",
     )
-    parser.add_argument(
-        "--codex",
-        default=os.environ.get("CODEX_COMMAND", "codex"),
-        help="Codex executable to invoke (default: %(default)s).",
-    )
-
     commands = parser.add_subparsers(dest="command", required=True)
 
     begin = commands.add_parser("begin", help="Begin a task in DIRECTORY.")
@@ -158,16 +152,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="",
         help="Optional initial request for Igor.",
     )
-    begin.add_argument(
-        "--backend",
-        choices=("codex", "claude"),
-        default="codex",
-        help="Agent backend (default: codex).",
+    backend = begin.add_mutually_exclusive_group()
+    backend.add_argument(
+        "--codex",
+        dest="backend_selector",
+        action="store_const",
+        const="codex",
+        help="Use the Codex backend.",
     )
-    begin.add_argument(
-        "--auto",
-        action="store_true",
-        help="Run bounded Igor/Rufus cycles automatically.",
+    backend.add_argument(
+        "--claude",
+        dest="backend_selector",
+        action="store_const",
+        const="claude",
+        help="Use the Claude backend.",
     )
     begin.add_argument(
         "--max-rounds",
@@ -183,24 +181,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     resume = commands.add_parser(
-        "resume", help="Resume a task in its stored DIRECTORY."
-    )
-    resume.add_argument(
-        "directory",
-        metavar="DIRECTORY",
-        type=Path,
-        help="Existing target project directory matching the task state.",
+        "resume", help="Resume a task in its persisted target directory."
     )
     resume.add_argument("task_id", help="Task identifier, such as TASK-001.")
     resume.add_argument(
         "prompt",
         help="Follow-up or new request for Igor in this task context.",
-    )
-    resume.add_argument(
-        "--backend",
-        choices=("codex", "claude"),
-        default=None,
-        help="Backend to verify against the backend stored at begin.",
     )
 
     hook = commands.add_parser("idle-hook", help=argparse.SUPPRESS)
@@ -212,10 +198,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         deadline_minutes = (
             60 if args.deadline_minutes is None else args.deadline_minutes
         )
-        if not args.auto and (
-            args.max_rounds is not None or args.deadline_minutes is not None
-        ):
-            parser.error("--max-rounds and --deadline-minutes require --auto")
         if not 1 <= max_rounds <= DEFAULT_MAX_ROUNDS:
             parser.error("--max-rounds must be an integer from 1 through 5")
         if not 1 <= deadline_minutes <= 1440:
@@ -526,6 +508,10 @@ def backend_command_value(value: Any) -> list[str]:
     raise SystemExit("backend command must be a non-empty executable")
 
 
+def codex_command() -> list[str]:
+    return backend_command_value(os.environ.get("CODEX_COMMAND", "codex"))
+
+
 def claude_command() -> list[str]:
     return backend_command_value(
         os.environ.get("ORC_CLAUDE_COMMAND", DEFAULT_CLAUDE_COMMAND)
@@ -572,14 +558,67 @@ def probe_claude(command: list[str]) -> str:
 
 
 def backend_from_record(record: dict[str, Any]) -> str:
-    backend = record.get("backend", "codex")
-    return backend if backend in {"codex", "claude"} else "codex"
+    backend = record.get("backend")
+    if backend not in {"codex", "claude"}:
+        raise SystemExit(
+            "task state has no valid backend; resume requires persisted "
+            "backend codex or claude"
+        )
+    return str(backend)
+
+
+def selected_backend(args: argparse.Namespace) -> str:
+    selector = getattr(args, "backend_selector", None)
+    if selector in {"codex", "claude"}:
+        return selector
+    configured = os.environ.get("ORC_BACKEND", "").strip()
+    if configured in {"codex", "claude"}:
+        return configured
+    raise SystemExit(
+        "select a backend with --codex or --claude, or set "
+        "ORC_BACKEND to codex or claude"
+    )
+
+
+def valid_round_limit(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        return None
+    return limit if 1 <= limit <= DEFAULT_MAX_ROUNDS else None
+
+
+def valid_deadline_seconds(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return None
+    return seconds if 60 <= seconds <= 1440 * 60 else None
+
+
+def current_round(record: dict[str, Any]) -> int:
+    value = record.get("round", 1)
+    try:
+        return max(int(value), 1)
+    except (TypeError, ValueError):
+        return 1
+
+
+def workflow_active_role(record: dict[str, Any]) -> str | None:
+    if record.get("status") != "active":
+        return None
+    phase = record.get("phase")
+    return phase if phase in {"implementer", "reviewer"} else None
 
 
 def stored_backend_command(record: dict[str, Any], backend: str) -> list[str]:
     value = record.get("backend_command")
     if value is None:
-        return claude_command() if backend == "claude" else ["codex"]
+        return claude_command() if backend == "claude" else codex_command()
     return backend_command_value(value)
 
 
@@ -882,7 +921,7 @@ class OrcApp(App[None]):
         self.sessions: dict[str, ChildSession] = {}
         self.retired_sessions: list[ChildSession] = []
         self.started_roles: set[str] = set()
-        self.active_role = "implementer"
+        self.active_role: str | None = "implementer"
         self.layout_mode = ""
         self.last_status = "starting"
         self.event_loop: asyncio.AbstractEventLoop | None = None
@@ -899,7 +938,7 @@ class OrcApp(App[None]):
         yield Container(
             Container(
                 Static(
-                    f"{self.task_id}: starting",
+                    f"{self.task_id}: starting · round 1/5",
                     id="status-message",
                     classes="status-segment",
                     markup=False,
@@ -945,6 +984,11 @@ class OrcApp(App[None]):
         phase = record.get("phase")
         return phase if phase in {"implementer", "reviewer"} else "implementer"
 
+    def active_workflow_role(self, record: dict[str, Any]) -> str | None:
+        role = workflow_active_role(record)
+        self.active_role = role
+        return role
+
     def on_mount(self) -> None:
         if os.name != "posix":
             self.fatal_error("Orc's interactive PTY UI currently requires POSIX.")
@@ -982,12 +1026,18 @@ class OrcApp(App[None]):
     def role_state(self, record: dict[str, Any], role: str) -> str:
         """Derive the display state for one role from workflow evidence."""
 
-        if record.get("status") == "completed" or record.get("phase") == "complete":
-            return "inactive"
-
         failure = record.get("child_failure")
         if isinstance(failure, dict) and failure.get("role") == role:
             return "failed"
+
+        if record.get("status") == "completed" or record.get("phase") == "complete":
+            return "inactive"
+
+        if workflow_active_role(record) == role:
+            return "active"
+
+        if record.get("status") != "active":
+            return "waiting" if self._handoffs_for_role(record, role) else "inactive"
 
         session = self.sessions.get(role)
         if (
@@ -1003,7 +1053,7 @@ class OrcApp(App[None]):
                 for handoff in handoffs[session_handoff_count:]
             ):
                 return "waiting"
-            return "active"
+            return "waiting"
 
         if self._handoffs_for_role(record, role):
             return "waiting"
@@ -1013,7 +1063,9 @@ class OrcApp(App[None]):
     def agentbox_enabled(self, record: dict[str, Any]) -> bool:
         if sys.platform != "linux" or not AGENTBOX_IDENTITY.exists():
             return False
-        backend = backend_from_record(record)
+        backend = record.get("backend")
+        if backend not in {"codex", "claude"}:
+            return False
         expected = CODEX_AGENTBOX_FLAG if backend == "codex" else CLAUDE_AGENTBOX_FLAG
         phase = record.get("phase")
         session = self.sessions.get(phase) if isinstance(phase, str) else None
@@ -1031,9 +1083,15 @@ class OrcApp(App[None]):
     def status_segments(self, record: dict[str, Any]) -> dict[str, str]:
         """Return the status bar's ordered, human-readable segments."""
 
-        backend = backend_from_record(record)
+        backend = record.get("backend")
+        if backend not in {"codex", "claude"}:
+            backend = "unknown"
+        maximum = valid_round_limit(record.get("max_rounds")) or DEFAULT_MAX_ROUNDS
         segments = {
-            "task": f"{self.task_id}: {record.get('status', 'unknown')}",
+            "task": (
+                f"{self.task_id}: {record.get('status', 'unknown')} · "
+                f"round {current_round(record)}/{maximum}"
+            ),
             "igor": f"Igor: {self.role_state(record, 'implementer')}",
             "rufus": f"Rufus: {self.role_state(record, 'reviewer')}",
             "backend": f"backend: {backend}",
@@ -1075,16 +1133,32 @@ class OrcApp(App[None]):
     def _visible_status_keys(
         self, segments: dict[str, str], width: int
     ) -> tuple[set[str], str]:
-        """Select ordered segments while the left rail clips overflow."""
+        """Select complete segments that fit before the fixed version rail."""
 
-        visible = {"task", "igor", "rufus"}
-        if "agentbox" in segments:
-            visible.add("agentbox")
-        else:
-            visible.add("backend")
-        # The left rail owns overflow handling. Keep the full logical hint and
-        # let the rail clip it at the fixed version boundary when necessary.
-        return visible, segments["hint"]
+        left_width = max(width - len(STATUS_VERSION_SEPARATOR + ORC_VERSION), 0)
+        visible: list[str] = ["task", "igor", "rufus"]
+
+        def cost(keys: list[str]) -> int:
+            separators = max(len(keys) - 1, 0) * len(STATUS_SEGMENT_SEPARATOR)
+            return sum(len(segments[key]) for key in keys) + separators
+
+        # Keep the warning ahead of the redundant backend label under
+        # constrained widths, while preserving the documented logical order.
+        optional = (
+            ["agentbox", "backend"] if "agentbox" in segments else ["backend"]
+        )
+        for key in optional:
+            if cost(visible + [key]) <= left_width:
+                visible.append(key)
+        if "agentbox" in segments and "agentbox" not in visible:
+            # It is the only optional diagnostic worth displacing the backend
+            # for, so try it explicitly when the backend consumed the rail.
+            candidate = [key for key in visible if key != "backend"] + ["agentbox"]
+            if cost(candidate) <= left_width:
+                visible = candidate
+        if cost(visible + ["hint"]) <= left_width:
+            visible.append("hint")
+        return set(visible), segments["hint"] if "hint" in visible else ""
 
     def render_status_bar(self, record: dict[str, Any]) -> None:
         """Render composed, styled segments and the fixed version rail."""
@@ -1120,6 +1194,9 @@ class OrcApp(App[None]):
             if key in visible or (key == "hint" and bool(hint))
         ]
         separator_keys = set(shown_keys[1:])
+        remaining_width = max(
+            width - len(STATUS_VERSION_SEPARATOR + ORC_VERSION), 0
+        )
         for widget_id in STATUS_SEGMENT_IDS:
             try:
                 widget = self.query_one(f"#{widget_id}", Static)
@@ -1139,12 +1216,14 @@ class OrcApp(App[None]):
             widget.update(self._status_text(value, color))
             styles = getattr(widget, "styles", None)
             if styles is not None and hasattr(styles, "display"):
+                shown = key in visible or (key == "hint" and bool(hint))
+                segment_width = min(len(value), remaining_width) if shown else 0
+                remaining_width -= segment_width
                 if hasattr(styles, "padding"):
                     styles.padding = (0, padding // 2)
                 if hasattr(styles, "width"):
-                    styles.width = "auto"
-                shown = key in visible or (key == "hint" and bool(hint))
-                styles.display = "block" if shown and value else "none"
+                    styles.width = segment_width
+                styles.display = "block" if shown and segment_width else "none"
         try:
             version = self.query_one("#status-version", Static)
         except Exception:
@@ -1162,6 +1241,14 @@ class OrcApp(App[None]):
         if isinstance(record, dict):
             rendered = self.status_text(record)
             self.update_status(rendered)
+
+    def refresh_workflow_ui(self) -> None:
+        """Recompute the active-agent border after persisted state changes."""
+
+        if getattr(self, "_running", False):
+            self.update_layout()
+        else:
+            self.refresh_status()
 
     def launch_role(self, role: str) -> None:
         existing = self.sessions.get(role)
@@ -1191,10 +1278,14 @@ class OrcApp(App[None]):
         if deadline_expired(record):
             set_stop_reason(record, "deadline")
             save_state(self.args.state_file, state)
-            self.refresh_status()
+            self.refresh_workflow_ui()
             return
 
-        backend = backend_from_record(record)
+        try:
+            backend = backend_from_record(record)
+        except SystemExit as error:
+            self.fatal_error(str(error))
+            return
 
         requests = record.get("user_requests", [])
         if not isinstance(requests, list):
@@ -1250,11 +1341,14 @@ class OrcApp(App[None]):
         else:
             prompt = reviewer_prompt(record) + "\n\n" + HANDOFF_PROMPT
 
-        configured_command = (
-            stored_backend_command(record, backend)
-            if backend == "claude"
-            else getattr(self.args, "codex", "codex")
-        )
+        if record.get("backend_command") is None:
+            configured_command = (
+                getattr(self.args, "codex", None) or codex_command()
+                if backend == "codex"
+                else claude_command()
+            )
+        else:
+            configured_command = stored_backend_command(record, backend)
         command = backend_launch_command(
             backend,
             backend_command_value(configured_command),
@@ -1471,7 +1565,7 @@ class OrcApp(App[None]):
             }
             set_stop_reason(record, "child_failure")
             save_state(self.args.state_file, state)
-            self.refresh_status()
+            self.refresh_workflow_ui()
             return True
 
         payload = self.claude_handoff(session)
@@ -1486,7 +1580,7 @@ class OrcApp(App[None]):
             }
             set_stop_reason(record, "child_failure")
             save_state(self.args.state_file, state)
-            self.refresh_status()
+            self.refresh_workflow_ui()
             return True
 
         session_id = session.session_id
@@ -1530,7 +1624,7 @@ class OrcApp(App[None]):
             }
             set_stop_reason(record, "child_failure")
             save_state(self.args.state_file, state)
-            self.refresh_status()
+            self.refresh_workflow_ui()
         finally:
             if previous_task is None:
                 os.environ.pop("ORC_TASK_ID", None)
@@ -1551,7 +1645,16 @@ class OrcApp(App[None]):
         return True
 
     def write_active(self, data: bytes) -> None:
-        session = self.sessions.get(self.active_role)
+        state = load_state(self.args.state_file)
+        record = state.get(self.task_id)
+        if not isinstance(record, dict):
+            return
+        role = workflow_active_role(record)
+        if role is None:
+            self.active_role = None
+            return
+        self.active_role = role
+        session = self.sessions.get(role)
         if session is None or session.exited:
             return
         try:
@@ -1662,7 +1765,7 @@ class OrcApp(App[None]):
         state = load_state(args.state_file)
         record = state.get(self.task_id)
         if not isinstance(record, dict):
-            return f"{self.task_id}: unknown · {ORC_VERSION} · {FOCUS_STATUS}"
+            return f"{self.task_id}: unknown · round 1/5 · {ORC_VERSION}"
         return self.status_text(record)
 
     def update_layout(self) -> None:
@@ -1671,6 +1774,11 @@ class OrcApp(App[None]):
         width = self.size.width
         height = self.size.height - 1
         panes = self.query_one("#panes", Container)
+        state = load_state(self.args.state_file)
+        record = state.get(self.task_id)
+        active_role = (
+            self.active_workflow_role(record) if isinstance(record, dict) else None
+        )
 
         if width >= 120 and width >= height * 1.35:
             mode = "side-by-side"
@@ -1686,12 +1794,14 @@ class OrcApp(App[None]):
             pane = self.pane(role)
             pane.styles.width = "1fr"
             pane.styles.height = "1fr"
-            if role == self.active_role:
+            if role == active_role:
                 pane.add_class("active-pane")
             else:
                 pane.remove_class("active-pane")
             pane.styles.display = (
-                "block" if mode != "single" or role == self.active_role else "none"
+                "block"
+                if mode != "single" or role == (active_role or "implementer")
+                else "none"
             )
 
         if mode != self.layout_mode:
@@ -1725,16 +1835,16 @@ class OrcApp(App[None]):
 
         status = record.get("status")
         if status == "completed":
-            self.refresh_status()
+            self.refresh_workflow_ui()
             return
         if status in {"paused", "blocked", "stopped"}:
-            self.refresh_status()
+            self.refresh_workflow_ui()
             return
 
         if deadline_expired(record):
             set_stop_reason(record, "deadline")
             save_state(self.args.state_file, state)
-            self.refresh_status()
+            self.refresh_workflow_ui()
             return
 
         if record.get("phase") in {"reviewer", "implementer"}:
@@ -1795,7 +1905,7 @@ class OrcApp(App[None]):
                     }
                     set_stop_reason(record, "child_failure")
                     save_state(self.args.state_file, state)
-                    self.refresh_status()
+                    self.refresh_workflow_ui()
                     continue
                 expected_handoff = (
                     isinstance(record, dict) and record.get("phase") != session.role
@@ -1827,7 +1937,7 @@ class OrcApp(App[None]):
                     }
                     set_stop_reason(record, "child_failure")
                     save_state(self.args.state_file, state)
-                    self.refresh_status()
+                    self.refresh_workflow_ui()
                 elif session.role == self.active_role and not expected_handoff:
                     self.refresh_status()
                 self.refresh_status()
@@ -1838,15 +1948,8 @@ class OrcApp(App[None]):
             self.exit()
             event.stop()
             return
-        if key == "tab":
-            roles = ("implementer", "reviewer")
-            index = roles.index(self.active_role)
-            self.active_role = roles[(index + 1) % 2]
-            self.update_layout()
-            self.update_status(self.active_status())
-            event.stop()
-            return
         special_keys = {
+            "tab": b"\x09",
             "enter": b"\r",
             "backspace": b"\x7f",
             "delete": b"\x1b[3~",
@@ -1861,41 +1964,30 @@ class OrcApp(App[None]):
             "escape": b"\x1b",
             "shift+tab": b"\x1b[Z",
         }
-        data = (
-            event.character.encode()
-            if event.character
-            and key
-            in {
-                "tab",
-                "shift+tab",
-            }
-            else special_keys.get(key)
-        )
+        data = special_keys.get(key)
         if data is None and key.startswith("ctrl+") and len(key) == 6:
             data = bytes([ord(key[-1].upper()) - ord("@")])
         if data is None and event.character:
             data = event.character.encode()
         if data:
             self.write_active(data)
-            event.stop()
+        event.stop()
 
     def on_paste(self, event: Paste) -> None:
         self.write_active(event.text.encode())
         event.stop()
 
     def on_click(self, event: Click) -> None:
-        widget = event.widget
-        role = getattr(widget, "id", None)
-        while role not in {"implementer", "reviewer"} and widget is not None:
-            widget = getattr(widget, "parent", None)
-            role = getattr(widget, "id", None)
-        if role in {"implementer", "reviewer"}:
-            self.active_role = role
-            self.update_layout()
-            self.resize_sessions()
-            self.schedule_resize()
-            self.update_status(self.active_status())
-            event.stop()
+        event.stop()
+
+    def on_mouse_down(self, event: MouseDown) -> None:
+        event.stop()
+
+    def on_mouse_up(self, event: MouseUp) -> None:
+        event.stop()
+
+    def on_mouse_release(self, event: MouseRelease) -> None:
+        event.stop()
 
     async def action_quit(self) -> None:
         self.exit()
@@ -1936,9 +2028,11 @@ def begin(args: argparse.Namespace) -> None:
     if args.task_id in state:
         raise SystemExit(f"task already exists: {args.task_id}")
 
-    backend = getattr(args, "backend", "codex")
+    backend = selected_backend(args)
     configured_command = (
-        claude_command() if backend == "claude" else backend_command_value(args.codex)
+        claude_command()
+        if backend == "claude"
+        else backend_command_value(getattr(args, "codex", None) or codex_command())
     )
     backend_version = (
         probe_claude(configured_command) if backend == "claude" else "unknown"
@@ -1946,14 +2040,13 @@ def begin(args: argparse.Namespace) -> None:
     stored_command: str | list[str] = (
         configured_command[0] if len(configured_command) == 1 else configured_command
     )
-    automatic = bool(getattr(args, "auto", False))
     max_rounds = int(getattr(args, "max_rounds", DEFAULT_MAX_ROUNDS))
     deadline_seconds = int(getattr(args, "deadline_minutes", 60) * 60)
     started = utc_now()
     state[args.task_id] = {
         "status": "active",
         "phase": "implementer",
-        "round": 0,
+        "round": 1,
         "prompt": args.prompt,
         "target_directory": str(target_directory),
         "implementer_id": None,
@@ -1963,7 +2056,7 @@ def begin(args: argparse.Namespace) -> None:
         "reviewer_reported_complete": False,
         "handoffs": [],
         "processed_idle_events": [],
-        "automatic_rounds": automatic,
+        "automatic_rounds": True,
         "max_rounds": max_rounds,
         "deadline_seconds": deadline_seconds,
         "cycle_started_at": started.isoformat(timespec="seconds"),
@@ -1986,30 +2079,32 @@ def begin(args: argparse.Namespace) -> None:
 
 
 def resume(args: argparse.Namespace) -> None:
-    target_directory = normalize_target_directory(args.directory)
     state = load_state(args.state_file)
     record = state.get(args.task_id)
     if not isinstance(record, dict):
         raise SystemExit(f"unknown task: {args.task_id}")
-
-    backend = backend_from_record(record)
-    selected_backend = getattr(args, "backend", None)
-    if selected_backend is not None and selected_backend != backend:
-        raise SystemExit(
-            f"task {args.task_id} uses backend {backend}; "
-            f"cannot resume with backend {selected_backend}"
-        )
 
     stored_target = record.get("target_directory")
     if not isinstance(stored_target, str) or not stored_target:
         raise SystemExit(
             f"task {args.task_id} has no stored target directory; begin a new task"
         )
-    if Path(stored_target) != target_directory:
-        raise SystemExit(
-            f"target directory does not match task {args.task_id}: "
-            f"stored {stored_target}, received {target_directory}"
-        )
+    target_directory = normalize_target_directory(Path(stored_target))
+    # Direct callers from older integrations may still provide a directory on
+    # the Namespace. The public parser no longer accepts it; validating it
+    # here keeps the internal function safe during that transition.
+    supplied_directory = getattr(args, "directory", None)
+    if supplied_directory is not None:
+        supplied = normalize_target_directory(supplied_directory)
+        if supplied != target_directory:
+            raise SystemExit(
+                f"target directory does not match task {args.task_id}: "
+                f"stored {target_directory}, received {supplied}"
+            )
+    try:
+        backend = backend_from_record(record)
+    except SystemExit as error:
+        raise SystemExit(f"cannot resume task {args.task_id}: {error}") from error
     if not isinstance(args.prompt, str) or not args.prompt.strip():
         raise SystemExit("resume requires a non-empty clarification or request")
     if record.get("status") == "active":
@@ -2018,21 +2113,37 @@ def resume(args: argparse.Namespace) -> None:
         raise SystemExit(f"task {args.task_id} is already complete")
     if record.get("phase") == "complete" or record.get("stop_reason") == "completion":
         raise SystemExit(f"task {args.task_id} is already complete")
-    if record.get("stop_reason") == "deadline":
-        raise SystemExit(f"task {args.task_id} deadline has expired")
-    if record.get("stop_reason") == "max_rounds":
-        raise SystemExit(f"task {args.task_id} reached its maximum rounds")
-
     requests = record.get("user_requests")
     if requests is None:
         requests = record.get("user_feedback", [])
     if not isinstance(requests, list):
         raise SystemExit(f"Orc state for {args.task_id} has invalid user_requests")
-    if deadline_expired(record):
-        raise SystemExit(f"task {args.task_id} deadline has expired")
+    automatic = bool(record.get("automatic_rounds"))
+    if automatic:
+        max_rounds = valid_round_limit(record.get("max_rounds"))
+        deadline_seconds = valid_deadline_seconds(record.get("deadline_seconds"))
+        if max_rounds is None or deadline_seconds is None:
+            raise SystemExit(
+                f"task {args.task_id} has invalid automatic limits; "
+                "expected 1-5 rounds and 1-1440 minutes"
+            )
+        deadline_at = parse_timestamp(record.get("deadline_at"))
+        if deadline_at is None:
+            raise SystemExit(
+                f"task {args.task_id} has no valid persisted automatic deadline"
+            )
+        if deadline_at <= utc_now():
+            raise SystemExit(f"task {args.task_id} deadline has expired")
+    else:
+        max_rounds = valid_round_limit(record.get("max_rounds")) or DEFAULT_MAX_ROUNDS
+        deadline_seconds = (
+            valid_deadline_seconds(record.get("deadline_seconds"))
+            or DEFAULT_DEADLINE_SECONDS
+        )
 
+    configured_command = stored_backend_command(record, backend)
     if backend == "claude":
-        probe_claude(stored_backend_command(record, backend))
+        probe_claude(configured_command)
 
     child_failure = record.get("child_failure")
     reviewer_rollout_failed = (
@@ -2057,8 +2168,23 @@ def resume(args: argparse.Namespace) -> None:
         record["phase"] = "reviewer"
     else:
         record["phase"] = "implementer"
-    if previous_status == "paused":
-        record["round"] = int(record.get("round", 0)) + 1
+    if not automatic:
+        started = utc_now()
+        record["automatic_rounds"] = True
+        record["max_rounds"] = max_rounds
+        record["deadline_seconds"] = deadline_seconds
+        record["cycle_started_at"] = started.isoformat(timespec="seconds")
+        record["deadline_at"] = (
+            started + timedelta(seconds=deadline_seconds)
+        ).isoformat(timespec="seconds")
+    record["target_directory"] = str(target_directory)
+    record["backend"] = backend
+    record["backend_command"] = (
+        configured_command[0]
+        if len(configured_command) == 1
+        else configured_command
+    )
+    record["round"] = current_round(record)
     record["stop_reason"] = None
     record["clarification_received"] = (
         args.prompt
@@ -2220,19 +2346,15 @@ def idle_hook(args: argparse.Namespace) -> None:
     )
     if record["reviewer_reported_complete"]:
         set_stop_reason(record, "completion", completed=True)
-    elif record.get("automatic_rounds"):
-        maximum = int(record.get("max_rounds", DEFAULT_MAX_ROUNDS))
-        if int(record.get("round", 0)) >= maximum:
+    else:
+        maximum = valid_round_limit(record.get("max_rounds")) or DEFAULT_MAX_ROUNDS
+        if current_round(record) >= maximum:
             set_stop_reason(record, "max_rounds")
         else:
-            record["round"] = int(record.get("round", 0)) + 1
+            record["round"] = current_round(record) + 1
             record["phase"] = "implementer"
             record["status"] = "active"
             record["stop_reason"] = None
-    else:
-        record["status"] = "paused"
-        record["phase"] = "reviewer"
-        record["stop_reason"] = "manual_pause"
     save_state(args.state_file, state)
 
 
