@@ -92,10 +92,24 @@ The active-agent border follows the persisted mapping: only `active` with
 phase `implementer` activates Igor, and only `active` with phase `reviewer`
 activates Rufus. Paused, blocked, stopped, and completed tasks have no active
 role. Mouse presses and releases are consumed and never change roles or reach
-an agent. `Tab`, `Shift-Tab`, `1`, and `2` are forwarded to the workflow-active
-agent as byte `0x09`, `ESC [ Z`, `1`, and `2`. Other ordinary input is also
-forwarded only while a role is active; otherwise it is ignored. `Ctrl-Q` is
-always the explicit exit action.
+an agent. In the retained UI, `Tab` cycles the scroll target between Igor and
+Rufus and is consumed by Orc; `Shift-Tab`, `1`, and `2` remain pass-through
+input. Page Up/Page Down move the selected pane by one viewport, while Home
+and End move it to the oldest and newest retained output. Up and Down remain
+agent prompt-history input. Moving the pointer over a pane changes only the
+scroll target, never the active-agent border or input destination. Each pane
+retains at least 10,000 logical lines, and new output does not move a manually
+scrolled pane. Ordinary keyboard, control, Enter, and paste input first return
+the active agent's pane to the bottom. `Ctrl-Q` is always the explicit exit
+action.
+
+When a task is paused, blocked, completed with both roles inactive, or stopped
+by a child failure with one failed role and one inactive role, `Ctrl-R` opens
+an Orc-owned follow-up prompt in the same process. Enter submits a non-empty
+request and starts Igor at round 1 with a fresh deadline; Escape cancels and an
+empty request leaves task state unchanged. Active or inconsistent workflows do
+not open the prompt. The task identity, target, backend, configured limits,
+and handoff history remain persisted across this in-place resume.
 
 ## Handoffs and troubleshooting
 

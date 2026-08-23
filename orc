@@ -33,10 +33,10 @@ from rich.style import Style
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Container
-from textual.events import Click, MouseDown, MouseRelease, MouseUp, Paste
+from textual.events import Click, MouseDown, MouseMove, MouseRelease, MouseUp, Paste
 from textual.geometry import Size
 from textual.screen import Screen
-from textual.widgets import Static
+from textual.widgets import Input, Static
 
 IMPLEMENTER_PROMPT = """
 Read the docs in design_docs/ and docs/roles.md. You are Igor the implementer.
@@ -82,6 +82,7 @@ CLAUDE_REQUIRED_HELP = (
 FOCUS_STATUS = "Ctrl-Q exits"
 STATUS_SEGMENT_SEPARATOR = " · "
 STATUS_VERSION_SEPARATOR = " "
+STATUS_VERSION_WIDTH = len(STATUS_VERSION_SEPARATOR + ORC_VERSION)
 STATUS_COLORS = {
     "task:active": "#7ee787",
     "task:completed": "#7ee787",
@@ -116,6 +117,7 @@ VALID_STOP_REASONS = {
     "manual_pause",
 }
 TERMINAL_TASK_STATUSES = {"paused", "blocked", "stopped", "completed"}
+SCROLLBACK_LINES = 10_000
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -570,7 +572,7 @@ def backend_from_record(record: dict[str, Any]) -> str:
 def selected_backend(args: argparse.Namespace) -> str:
     selector = getattr(args, "backend_selector", None)
     if selector in {"codex", "claude"}:
-        return selector
+        return str(selector)
     configured = os.environ.get("ORC_BACKEND", "").strip()
     if configured in {"codex", "claude"}:
         return configured
@@ -717,12 +719,15 @@ class SessionPane(Static):
 
     def __init__(self, role: str) -> None:
         self.role = role
-        self.terminal_screen = pyte.Screen(80, 24)
+        self.terminal_screen = pyte.HistoryScreen(
+            80, 24, history=SCROLLBACK_LINES, ratio=1.0
+        )
         self.stream = pyte.Stream(self.terminal_screen)
         self.has_output = False
         self.has_visible_content = False
         self.message: str | None = f"{role.title()} not yet started."
         self.render_timer: Any = None
+        self.scroll_position = 0
         super().__init__(
             self.message,
             id=role,
@@ -731,7 +736,13 @@ class SessionPane(Static):
         )
 
     def feed(self, data: bytes) -> None:
+        history = self.terminal_screen.history
+        was_scrolled = history.position < history.size
+        previous_position = history.position
         self.stream.feed(data.decode("utf-8", errors="replace"))
+        if was_scrolled:
+            self._restore_history_position(previous_position)
+        self._sync_scroll_position()
         has_visible_content = any(line.strip() for line in self.terminal_screen.display)
         if has_visible_content:
             self.has_output = True
@@ -743,9 +754,69 @@ class SessionPane(Static):
     def resize_terminal(self, width: int, height: int) -> None:
         width = max(width, 2)
         height = max(height, 2)
+        history = self.terminal_screen.history
+        previous_position = history.position
         self.terminal_screen.resize(height, width)
-        if self.has_visible_content and self.message is None:
-            self.update(self.render_screen())
+        self._restore_history_position(previous_position)
+        self._sync_scroll_position()
+        self._refresh_render()
+
+    def _restore_history_position(self, position: int) -> None:
+        """Return to a prior history position after output or resize."""
+
+        history = self.terminal_screen.history
+        target = max(0, min(position, history.size))
+        while history.position > target:
+            before = history.position
+            self.terminal_screen.prev_page()
+            if history.position == before:
+                break
+        while history.position < target:
+            before = history.position
+            self.terminal_screen.next_page()
+            if history.position == before:
+                break
+
+    def _sync_scroll_position(self) -> None:
+        history = self.terminal_screen.history
+        self.scroll_position = max(history.size - history.position, 0)
+
+    def _refresh_render(self) -> None:
+        if not self.has_visible_content or self.message is not None:
+            return
+        try:
+            if self.is_attached:
+                self.update(self.render_screen())
+        except Exception:
+            return
+
+    def scroll_page(self, direction: int) -> None:
+        """Move one viewport through the selected pane's history."""
+
+        if direction < 0:
+            self.terminal_screen.prev_page()
+        elif direction > 0:
+            self.terminal_screen.next_page()
+        self._sync_scroll_position()
+        self._refresh_render()
+
+    def scroll_to_home(self) -> None:
+        while True:
+            before = self.terminal_screen.history.position
+            self.terminal_screen.prev_page()
+            if self.terminal_screen.history.position == before:
+                break
+        self._sync_scroll_position()
+        self._refresh_render()
+
+    def scroll_to_end(self) -> None:
+        while True:
+            before = self.terminal_screen.history.position
+            self.terminal_screen.next_page()
+            if self.terminal_screen.history.position == before:
+                break
+        self._sync_scroll_position()
+        self._refresh_render()
 
     def show_message(self, message: str) -> None:
         if self.render_timer is not None:
@@ -907,9 +978,18 @@ class OrcApp(App[None]):
     #status-version {
         width: 11;
         height: 1;
-        padding: 0 0 0 1;
+        padding: 0;
         content-align: left middle;
         text-wrap: nowrap;
+    }
+
+    #resume-prompt {
+        dock: bottom;
+        width: 100%;
+        height: 3;
+        margin-bottom: 1;
+        layer: overlay;
+        display: none;
     }
 
     """
@@ -922,6 +1002,9 @@ class OrcApp(App[None]):
         self.retired_sessions: list[ChildSession] = []
         self.started_roles: set[str] = set()
         self.active_role: str | None = "implementer"
+        self.scroll_target = "implementer"
+        self.resume_prompt_active = False
+        self.resume_prompt_value = ""
         self.layout_mode = ""
         self.last_status = "starting"
         self.event_loop: asyncio.AbstractEventLoop | None = None
@@ -977,6 +1060,10 @@ class OrcApp(App[None]):
             ),
             Static(ORC_VERSION, id="status-version", markup=False),
             id="status",
+        )
+        yield Input(
+            placeholder="Follow-up request (Enter submits, Escape cancels)",
+            id="resume-prompt",
         )
 
     @staticmethod
@@ -1135,7 +1222,7 @@ class OrcApp(App[None]):
     ) -> tuple[set[str], str]:
         """Select complete segments that fit before the fixed version rail."""
 
-        left_width = max(width - len(STATUS_VERSION_SEPARATOR + ORC_VERSION), 0)
+        left_width = max(width - STATUS_VERSION_WIDTH, 0)
         visible: list[str] = ["task", "igor", "rufus"]
 
         def cost(keys: list[str]) -> int:
@@ -1194,9 +1281,7 @@ class OrcApp(App[None]):
             if key in visible or (key == "hint" and bool(hint))
         ]
         separator_keys = set(shown_keys[1:])
-        remaining_width = max(
-            width - len(STATUS_VERSION_SEPARATOR + ORC_VERSION), 0
-        )
+        remaining_width = max(width - STATUS_VERSION_WIDTH, 0)
         for widget_id in STATUS_SEGMENT_IDS:
             try:
                 widget = self.query_one(f"#{widget_id}", Static)
@@ -1249,6 +1334,170 @@ class OrcApp(App[None]):
             self.update_layout()
         else:
             self.refresh_status()
+
+    def scroll_pane(self) -> SessionPane:
+        """Return the pane currently selected for scroll navigation."""
+
+        target = getattr(self, "scroll_target", "implementer")
+        if target not in {"implementer", "reviewer"}:
+            target = "implementer"
+            self.scroll_target = target
+        return self.pane(target)
+
+    def cycle_scroll_target(self) -> None:
+        current = getattr(self, "scroll_target", "implementer")
+        self.scroll_target = (
+            "reviewer" if current == "implementer" else "implementer"
+        )
+
+    @staticmethod
+    def _mouse_role(event: Any) -> str | None:
+        widget = getattr(event, "widget", None)
+        while widget is not None:
+            role = getattr(widget, "role", None) or getattr(widget, "id", None)
+            if role in {"implementer", "reviewer"}:
+                return str(role)
+            widget = getattr(widget, "parent", None)
+        return None
+
+    def select_scroll_target(self, event: Any) -> None:
+        role = self._mouse_role(event)
+        if role is not None:
+            self.scroll_target = role
+
+    def can_resume_in_place(self, record: dict[str, Any]) -> bool:
+        status = record.get("status")
+        implementer_state = self.role_state(record, "implementer")
+        reviewer_state = self.role_state(record, "reviewer")
+        if status in {"paused", "blocked", "completed"}:
+            return implementer_state == reviewer_state == "inactive"
+        if status != "stopped" or record.get("stop_reason") != "child_failure":
+            return False
+        return sorted((implementer_state, reviewer_state)) == [
+            "failed",
+            "inactive",
+        ]
+
+    def _resume_prompt_widget(self) -> Input | None:
+        try:
+            return self.query_one("#resume-prompt", Input)
+        except Exception:
+            return None
+
+    def open_resume_prompt(self) -> bool:
+        state = load_state(self.args.state_file)
+        record = state.get(self.task_id)
+        if not isinstance(record, dict) or not self.can_resume_in_place(record):
+            return False
+        self.resume_prompt_active = True
+        self.resume_prompt_value = ""
+        prompt = self._resume_prompt_widget()
+        if prompt is not None:
+            prompt.value = ""
+            prompt.styles.display = "block"
+            if getattr(self, "_running", False):
+                prompt.focus()
+        self.update_status("Resume request: enter a non-empty request")
+        return True
+
+    def close_resume_prompt(self) -> None:
+        self.resume_prompt_active = False
+        prompt = self._resume_prompt_widget()
+        if prompt is not None:
+            prompt.styles.display = "none"
+        if getattr(self, "_running", False):
+            self.set_focus(None)
+
+    def _retire_all_sessions(self) -> None:
+        sessions = list(self.sessions.values())
+        for session in sessions:
+            if session.exited:
+                self.close_session_fd(session)
+                self.sessions.pop(session.role, None)
+            else:
+                self.retire_session(session)
+
+    @staticmethod
+    def close_session_fd(session: Any) -> None:
+        """Close a session master descriptor once and mark it closed."""
+
+        master_fd = getattr(session, "master_fd", -1)
+        if not isinstance(master_fd, int) or master_fd < 0:
+            return
+        session.master_fd = -1
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+
+    def submit_resume_request(self, request: str | None = None) -> bool:
+        if request is None:
+            request = getattr(self, "resume_prompt_value", "")
+        if not isinstance(request, str) or not request.strip():
+            self.update_status("Resume request cannot be empty")
+            return False
+
+        state = load_state(self.args.state_file)
+        record = state.get(self.task_id)
+        if not isinstance(record, dict) or not self.can_resume_in_place(record):
+            self.close_resume_prompt()
+            return False
+        max_rounds = valid_round_limit(record.get("max_rounds"))
+        deadline_seconds = valid_deadline_seconds(record.get("deadline_seconds"))
+        if max_rounds is None or deadline_seconds is None:
+            self.update_status("Resume request rejected: invalid task limits")
+            return False
+
+        self._retire_all_sessions()
+        requests = record.get("user_requests", [])
+        if not isinstance(requests, list):
+            requests = []
+        record["user_requests"] = [*requests, request]
+        record["last_user_request"] = request
+        for key in (
+            "stop_reason",
+            "child_failure",
+            "failed_role",
+            "blocker_role",
+            "blocker_reason",
+            "blocked_task",
+            "blocked_round",
+            "blocked_thread",
+            "blocked_at",
+            "blocked_commit",
+        ):
+            record.pop(key, None)
+        record["stop_reason"] = None
+        record["status"] = "active"
+        record["phase"] = "implementer"
+        record["round"] = 1
+        record["automatic_rounds"] = True
+        record["reviewer_reported_complete"] = False
+        record["implementer_id"] = None
+        record["reviewer_id"] = None
+        record["role_generations"] = {"implementer": 0, "reviewer": 0}
+        for key in (
+            "claude_session_id",
+            "claude_final_response",
+            "claude_sessions",
+            "launch_command",
+            "launch_backend",
+        ):
+            record.pop(key, None)
+        started = utc_now()
+        record["cycle_started_at"] = started.isoformat(timespec="seconds")
+        record["deadline_at"] = (
+            started + timedelta(seconds=deadline_seconds)
+        ).isoformat(timespec="seconds")
+        save_state(self.args.state_file, state)
+        self.close_resume_prompt()
+        self.active_role = "implementer"
+        if getattr(self, "_running", False):
+            self.update_layout()
+        else:
+            self.refresh_status()
+        self.launch_role("implementer")
+        return True
 
     def launch_role(self, role: str) -> None:
         existing = self.sessions.get(role)
@@ -1657,6 +1906,9 @@ class OrcApp(App[None]):
         session = self.sessions.get(role)
         if session is None or session.exited:
             return
+        scroll_end = getattr(session.pane, "scroll_to_end", None)
+        if callable(scroll_end):
+            scroll_end()
         try:
             os.write(session.master_fd, data)
         except OSError as error:
@@ -1761,7 +2013,8 @@ class OrcApp(App[None]):
     def active_status(self) -> str:
         args = getattr(self, "args", None)
         if args is None or not hasattr(args, "state_file"):
-            return f"{self.active_role.title()} active · {ORC_VERSION} · {FOCUS_STATUS}"
+            role = self.active_role or "No role"
+            return f"{role.title()} active · {ORC_VERSION} · {FOCUS_STATUS}"
         state = load_state(args.state_file)
         record = state.get(self.task_id)
         if not isinstance(record, dict):
@@ -1874,10 +2127,7 @@ class OrcApp(App[None]):
                 state = load_state(self.args.state_file)
                 record = state.get(self.task_id)
                 if getattr(session, "retired", False):
-                    try:
-                        os.close(session.master_fd)
-                    except OSError:
-                        pass
+                    self.close_session_fd(session)
                     if session in getattr(self, "retired_sessions", []):
                         self.retired_sessions.remove(session)
                     self.refresh_status()
@@ -1948,8 +2198,31 @@ class OrcApp(App[None]):
             self.exit()
             event.stop()
             return
+        if getattr(self, "resume_prompt_active", False):
+            if key == "escape":
+                self.close_resume_prompt()
+                event.stop()
+            return
+        if key == "ctrl+r":
+            if self.open_resume_prompt():
+                event.stop()
+                return
+        if key == "tab":
+            self.cycle_scroll_target()
+            event.stop()
+            return
+        scroll_actions = {
+            "pageup": lambda: self.scroll_pane().scroll_page(-1),
+            "pagedown": lambda: self.scroll_pane().scroll_page(1),
+            "home": lambda: self.scroll_pane().scroll_to_home(),
+            "end": lambda: self.scroll_pane().scroll_to_end(),
+        }
+        action = scroll_actions.get(key)
+        if action is not None:
+            action()
+            event.stop()
+            return
         special_keys = {
-            "tab": b"\x09",
             "enter": b"\r",
             "backspace": b"\x7f",
             "delete": b"\x1b[3~",
@@ -1957,10 +2230,6 @@ class OrcApp(App[None]):
             "down": b"\x1b[B",
             "right": b"\x1b[C",
             "left": b"\x1b[D",
-            "home": b"\x1b[H",
-            "end": b"\x1b[F",
-            "pageup": b"\x1b[5~",
-            "pagedown": b"\x1b[6~",
             "escape": b"\x1b",
             "shift+tab": b"\x1b[Z",
         }
@@ -1974,8 +2243,26 @@ class OrcApp(App[None]):
         event.stop()
 
     def on_paste(self, event: Paste) -> None:
+        if getattr(self, "resume_prompt_active", False):
+            self.resume_prompt_value = (
+                getattr(self, "resume_prompt_value", "") + event.text
+            )
+            prompt = self._resume_prompt_widget()
+            if prompt is not None and prompt.value != self.resume_prompt_value:
+                prompt.value = self.resume_prompt_value
+            event.stop()
+            return
         self.write_active(event.text.encode())
         event.stop()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "resume-prompt":
+            self.resume_prompt_value = event.value
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "resume-prompt":
+            self.submit_resume_request(event.value)
+            event.stop()
 
     def on_click(self, event: Click) -> None:
         event.stop()
@@ -1987,6 +2274,10 @@ class OrcApp(App[None]):
         event.stop()
 
     def on_mouse_release(self, event: MouseRelease) -> None:
+        event.stop()
+
+    def on_mouse_move(self, event: MouseMove) -> None:
+        self.select_scroll_target(event)
         event.stop()
 
     async def action_quit(self) -> None:
@@ -2008,10 +2299,7 @@ class OrcApp(App[None]):
                     os.killpg(session.pid, signal.SIGTERM)
                 except ProcessLookupError:
                     pass
-            try:
-                os.close(session.master_fd)
-            except OSError:
-                pass
+            self.close_session_fd(session)
 
 
 def run_app(args: argparse.Namespace, task_id: str) -> None:

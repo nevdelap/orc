@@ -303,7 +303,7 @@ Acceptance criteria:
 
 ## TASK-012 - Improve retained UI, scrolling, and in-place resume
 
-State: NEW
+State: COMPLETED
 
 Goal:
 

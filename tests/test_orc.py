@@ -461,6 +461,24 @@ def test_session_pane_preserves_ansi_and_resizes() -> None:
     assert pane.message == "message"
 
 
+def test_session_pane_retains_and_navigates_independent_scrollback() -> None:
+    pane = orc.SessionPane("implementer")
+    other_pane = orc.SessionPane("reviewer")
+    pane.feed("\n".join(f"line-{index}" for index in range(10_050)).encode())
+    other_pane.feed(b"reviewer-line\n")
+    assert pane.scroll_position == 0
+    assert other_pane.scroll_position == 0
+    pane.scroll_page(-1)
+    assert pane.scroll_position == pane.terminal_screen.lines
+    assert other_pane.scroll_position == 0
+    pane.feed(b"new-output\n")
+    assert pane.scroll_position == pane.terminal_screen.lines
+    pane.scroll_to_home()
+    assert pane.scroll_position >= orc.SCROLLBACK_LINES - 24
+    pane.scroll_to_end()
+    assert pane.scroll_position == 0
+
+
 def test_pty_size_handles_small_values_and_bad_fd() -> None:
     orc.set_pty_size(-1, 0, 0)
 
@@ -633,16 +651,19 @@ def test_resize_uses_rendered_pane_content_size(
     assert rendered_sizes == [(57, 13)]
 
 
-def test_orc_input_forwarding_and_tab_focus(
+def test_orc_input_forwarding_and_scroll_navigation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app = orc.OrcApp.__new__(orc.OrcApp)
     app.active_role = "implementer"
+    app.scroll_target = "implementer"
     app.layout_mode = "side-by-side"
     writes: list[bytes] = []
     monkeypatch.setattr(app, "write_active", writes.append)
     monkeypatch.setattr(app, "update_layout", lambda: None)
     monkeypatch.setattr(app, "update_status", lambda _message: None)
+    panes = {"implementer": FakePane(), "reviewer": FakePane()}
+    app.pane = lambda role: panes[role]
 
     for event, expected in (
         (Event("enter"), b"\r"),
@@ -659,8 +680,21 @@ def test_orc_input_forwarding_and_tab_focus(
     tab = Event("tab", "\t")
     app.on_key(tab)
     assert app.active_role == "implementer"
+    assert app.scroll_target == "reviewer"
     assert tab.stopped
-    assert writes[-1] == b"\t"
+    assert writes == [b"\r", b"c", b"\x03", b"\x1b[Z", b"1", b"2"]
+
+    for key, action in (
+        ("pageup", ("page", -1)),
+        ("pagedown", ("page", 1)),
+        ("home", ("home", None)),
+        ("end", ("end", None)),
+    ):
+        event = Event(key)
+        app.on_key(event)
+        assert event.stopped
+        assert panes["reviewer"].scroll_actions[-1] == action
+    assert writes == [b"\r", b"c", b"\x03", b"\x1b[Z", b"1", b"2"]
     event = Event("unknown")
     app.on_key(event)
     assert event.stopped
@@ -705,6 +739,350 @@ def test_paste_click_and_find_task_role(monkeypatch: pytest.MonkeyPatch) -> None
     assert orc.find_task_role({}, "missing") == (None, None)
 
 
+def test_pointer_selects_scroll_target_and_agent_input_returns_to_bottom(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    app, _state_file, panes = app_stub(
+        tmp_path,
+        {
+            "status": "active",
+            "phase": "implementer",
+            "target_directory": str(target),
+            "user_requests": [],
+        },
+    )
+
+    class Widget:
+        id = "reviewer"
+        parent = None
+
+    class MoveEvent:
+        widget = Widget()
+        stopped = False
+
+        def stop(self) -> None:
+            self.stopped = True
+
+    move = MoveEvent()
+    app.on_mouse_move(move)
+    assert app.scroll_target == "reviewer"
+    assert move.stopped
+
+    app.sessions["implementer"] = argparse.Namespace(
+        role="implementer", master_fd=1, pane=panes["implementer"], exited=False
+    )
+    monkeypatch.setattr(orc.os, "write", lambda *_args: 1)
+    app.write_active(b"input")
+    assert panes["implementer"].scrolls == 1
+
+
+def test_in_place_resume_closes_exited_session_fd_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    app, _state_file, panes = app_stub(
+        tmp_path,
+        {
+            "status": "paused",
+            "phase": "paused",
+            "target_directory": str(target),
+            "user_requests": [],
+        },
+    )
+    session = argparse.Namespace(
+        role="implementer",
+        master_fd=71,
+        pane=panes["implementer"],
+        exited=True,
+    )
+    app.sessions = {"implementer": session}
+    closed: list[int] = []
+    monkeypatch.setattr(orc.os, "close", closed.append)
+
+    app._retire_all_sessions()
+    app._retire_all_sessions()
+
+    assert closed == [71]
+    assert session.master_fd == -1
+    assert app.sessions == {}
+
+
+@pytest.mark.parametrize("status", ["paused", "blocked", "completed"])
+def test_in_place_resume_restarts_inactive_terminal_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    handoffs = (
+        []
+        if status != "completed"
+        else [{"role": "implementer", "commit": "abc"}]
+    )
+    record: dict[str, object] = {
+        "status": status,
+        "phase": "complete" if status == "completed" else status,
+        "stop_reason": "completion" if status == "completed" else "manual_pause",
+        "target_directory": str(target),
+        "backend": "codex",
+        "backend_command": "codex",
+        "backend_version": "version",
+        "max_rounds": 3,
+        "deadline_seconds": 120,
+        "user_requests": ["old"],
+        "handoffs": handoffs,
+        "implementer_id": "old-igor",
+        "reviewer_id": "old-rufus",
+        "blocker_reason": "old blocker",
+        "failed_role": "reviewer",
+    }
+    app, state_file, _panes = app_stub(tmp_path, record)
+    launched: list[str] = []
+    monkeypatch.setattr(app, "launch_role", launched.append)
+    before = orc.load_state(state_file)["TASK-003"]
+
+    assert app.open_resume_prompt()
+    assert app.submit_resume_request("continue")
+
+    saved = orc.load_state(state_file)["TASK-003"]
+    assert launched == ["implementer"]
+    assert saved["status"] == "active"
+    assert saved["phase"] == "implementer"
+    assert saved["round"] == 1
+    assert saved["user_requests"] == ["old", "continue"]
+    assert saved["handoffs"] == handoffs
+    assert saved["target_directory"] == before["target_directory"]
+    assert saved["backend"] == before["backend"]
+    assert saved["backend_command"] == before["backend_command"]
+    assert saved["backend_version"] == before["backend_version"]
+    assert saved["max_rounds"] == before["max_rounds"]
+    assert saved["deadline_seconds"] == before["deadline_seconds"]
+    assert saved.get("stop_reason") is None
+    assert "blocker_reason" not in saved
+    assert "failed_role" not in saved
+    assert saved["implementer_id"] is None
+    assert saved["reviewer_id"] is None
+    assert saved["deadline_at"] != before.get("deadline_at")
+
+
+def test_in_place_resume_restarts_stopped_child_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    record: dict[str, object] = {
+        "status": "stopped",
+        "phase": "stopped",
+        "stop_reason": "child_failure",
+        "child_failure": {"role": "reviewer"},
+        "target_directory": str(target),
+        "backend": "codex",
+        "max_rounds": 5,
+        "deadline_seconds": 120,
+        "user_requests": [],
+        "handoffs": [],
+    }
+    app, state_file, _panes = app_stub(tmp_path, record)
+    launched: list[str] = []
+    monkeypatch.setattr(app, "launch_role", launched.append)
+    assert app.open_resume_prompt()
+    assert app.submit_resume_request("repair the failure")
+    saved = orc.load_state(state_file)["TASK-003"]
+    assert launched == ["implementer"]
+    assert saved["status"] == "active"
+    assert "child_failure" not in saved
+
+
+def test_in_place_resume_empty_cancel_and_inconsistent_requests_are_noops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    record: dict[str, object] = {
+        "status": "paused",
+        "phase": "paused",
+        "target_directory": str(target),
+        "backend": "codex",
+        "max_rounds": 5,
+        "deadline_seconds": 120,
+        "user_requests": [],
+        "handoffs": [],
+    }
+    app, state_file, _panes = app_stub(tmp_path, record)
+    monkeypatch.setattr(app, "launch_role", lambda _role: pytest.fail("launch"))
+    before = orc.load_state(state_file)
+    assert app.open_resume_prompt()
+    assert not app.submit_resume_request("")
+    assert app.resume_prompt_active
+    assert orc.load_state(state_file) == before
+    app.on_key(Event("escape"))
+    assert not app.resume_prompt_active
+    assert orc.load_state(state_file) == before
+
+    record["status"] = "active"
+    record["phase"] = "implementer"
+    orc.save_state(state_file, {"TASK-003": record})
+    assert not app.open_resume_prompt()
+
+
+@pytest.mark.parametrize(
+    "record_updates",
+    [
+        {
+            "status": "paused",
+            "phase": "paused",
+            "handoffs": [{"role": "implementer"}],
+        },
+        {
+            "status": "completed",
+            "phase": "complete",
+            "child_failure": {"role": "reviewer"},
+        },
+        {
+            "status": "stopped",
+            "phase": "stopped",
+            "stop_reason": "child_failure",
+            "child_failure": {"role": "implementer"},
+            "handoffs": [{"role": "reviewer"}],
+        },
+    ],
+)
+def test_in_place_resume_rejects_inconsistent_terminal_roles(
+    tmp_path: Path, record_updates: dict[str, object]
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    record: dict[str, object] = {
+        "target_directory": str(target),
+        "user_requests": [],
+    }
+    record.update(record_updates)
+    app, _state_file, _panes = app_stub(tmp_path, record)
+    assert not app.open_resume_prompt()
+
+
+def test_status_version_rail_reserves_complete_text() -> None:
+    app = orc.OrcApp.__new__(orc.OrcApp)
+    app.task_id = "TASK-012"
+    app.sessions = {}
+    record = {
+        "status": "active",
+        "phase": "implementer",
+        "backend": "claude",
+        "round": 1,
+        "max_rounds": 5,
+    }
+    segments = app.status_segments(record)
+    visible, _hint = app._visible_status_keys(segments, 80)
+    assert orc.STATUS_VERSION_WIDTH == len(" orc v0.0.1")
+    assert len(" orc v0.0.1") == 11
+    assert "task" in visible
+    assert 80 - orc.STATUS_VERSION_WIDTH >= sum(
+        len(segments[key]) for key in visible
+    ) + max(len(visible) - 1, 0) * len(orc.STATUS_SEGMENT_SEPARATOR)
+
+
+@pytest.mark.integration
+def test_textual_in_place_resume_prompt_submits_in_same_app(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_file = tmp_path / "state.json"
+    target = tmp_path / "target"
+    target.mkdir()
+    orc.save_state(
+        state_file,
+        {
+            "TASK-012": {
+                "status": "completed",
+                "phase": "complete",
+                "stop_reason": "completion",
+                "target_directory": str(target),
+                "backend": "codex",
+                "backend_command": "codex",
+                "backend_version": "unknown",
+                "automatic_rounds": True,
+                "max_rounds": 5,
+                "deadline_seconds": 120,
+                "round": 2,
+                "user_requests": [],
+                "handoffs": [],
+                "implementer_id": None,
+                "reviewer_id": None,
+            }
+        },
+    )
+    args = argparse.Namespace(state_file=state_file, codex="codex")
+    app = orc.OrcApp(args, "TASK-012")
+    launched: list[str] = []
+    monkeypatch.setattr(app, "launch_role", launched.append)
+    monkeypatch.setattr(app, "poll_state", lambda: None)
+
+    async def exercise() -> None:
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            launched.clear()
+            await pilot.press("ctrl+r")
+            await pilot.pause()
+            prompt = app.query_one("#resume-prompt", orc.Input)
+            assert app.resume_prompt_active
+            assert prompt.styles.display == "block"
+            await pilot.press(*"continue")
+            await pilot.press("enter")
+            await pilot.pause()
+            assert not app.resume_prompt_active
+            assert launched == ["implementer"]
+            assert (
+                orc.load_state(state_file)["TASK-012"]["status"] == "active"
+            )
+            app.exit()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.integration
+def test_textual_status_version_rail_is_complete_at_supported_sizes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_file = tmp_path / "state.json"
+    target = tmp_path / "target"
+    target.mkdir()
+    orc.save_state(
+        state_file,
+        {
+            "TASK-012": {
+                "status": "completed",
+                "phase": "complete",
+                "target_directory": str(target),
+                "backend": "codex",
+                "round": 1,
+                "max_rounds": 5,
+                "handoffs": [],
+            }
+        },
+    )
+    async def exercise() -> None:
+        for size in ((120, 40), (80, 40), (80, 24)):
+            app = orc.OrcApp(argparse.Namespace(state_file=state_file), "TASK-012")
+            monkeypatch.setattr(app, "launch_role", lambda _role: None)
+            monkeypatch.setattr(app, "poll_state", lambda: None)
+            async with app.run_test(size=size) as pilot:
+                await pilot.pause()
+                left = app.query_one("#status-left", orc.Container)
+                version = app.query_one("#status-version", orc.Static)
+                assert version.render().plain == " orc v0.0.1"
+                assert version.styles.width.value == orc.STATUS_VERSION_WIDTH
+                assert version.region.right == size[0]
+                assert left.region.right == version.region.x
+                for segment_id in orc.STATUS_SEGMENT_IDS:
+                    segment = app.query_one(f"#{segment_id}", orc.Static)
+                    assert segment.region.right <= version.region.x
+                app.exit()
+
+    asyncio.run(exercise())
+
+
 class FakeStyle:
     def __init__(self) -> None:
         self.layout = None
@@ -729,6 +1107,8 @@ class FakePane:
         self.styles = FakeStyle()
         self.classes: set[str] = set()
         self.messages: list[str] = []
+        self.scrolls = 0
+        self.scroll_actions: list[tuple[str, int | None]] = []
 
     def add_class(self, value: str) -> None:
         self.classes.add(value)
@@ -744,6 +1124,16 @@ class FakePane:
 
     def resize_terminal(self, _width: int, _height: int) -> None:
         pass
+
+    def scroll_page(self, direction: int) -> None:
+        self.scroll_actions.append(("page", direction))
+
+    def scroll_to_home(self) -> None:
+        self.scroll_actions.append(("home", None))
+
+    def scroll_to_end(self) -> None:
+        self.scrolls += 1
+        self.scroll_actions.append(("end", None))
 
 
 class FakeLoop:
@@ -1343,7 +1733,7 @@ def test_app_constructor_compose_mount_and_fatal_error(
     args = argparse.Namespace(state_file=tmp_path / "state.json")
     app = orc.OrcApp(args, "TASK-003")
     assert app.active_role == "implementer"
-    assert len(list(app.compose())) == 2
+    assert len(list(app.compose())) == 3
     exited: list[object] = []
     monkeypatch.setattr(app, "exit", lambda *args: exited.append(args))
     app.fatal_error("bad")
@@ -2234,7 +2624,14 @@ def test_begin_prompt_is_optional_and_empty_prompt_uses_built_in_instructions(
     target.mkdir()
     state_file = tmp_path / "state.json"
     args = orc.parse_args(
-        ["--state-file", str(state_file), "begin", str(target), "TASK-008"]
+        [
+            "--state-file",
+            str(state_file),
+            "begin",
+            str(target),
+            "TASK-008",
+            "--codex",
+        ]
     )
     assert args.prompt == ""
     monkeypatch.setattr(orc, "run_app", lambda *_: None)

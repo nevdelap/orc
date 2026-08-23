@@ -297,9 +297,28 @@ does not delete or rewrite the persisted task record.
 The active-agent border is derived only from persisted `status: active` and
 `phase`: Igor is active for `implementer`, Rufus for `reviewer`, and neither
 role is active for terminal statuses. Mouse press/release events are consumed.
-`Tab`, `Shift-Tab`, `1`, and `2` are forwarded to the workflow-active PTY as
-`0x09`, `ESC [ Z`, `1`, and `2`; all other input is ignored when no role is
-active.
+`Shift-Tab`, `1`, and `2` are forwarded to the workflow-active PTY as
+`ESC [ Z`, `1`, and `2`; `Tab` cycles the independent scroll target between
+Igor and Rufus and is consumed by Orc. Page Up/Page Down scroll that target by
+one viewport, Home reaches the oldest retained line, and End reaches the
+newest output. Up and Down remain input for the active agent's prompt history.
+Each pane retains at least 10,000 logical lines. Pointer movement selects only
+the scroll target; it never changes the active role or input destination.
+New output preserves a manually selected scroll position. Keyboard, control,
+Enter, and paste input sent to the active agent first scrolls that pane to the
+bottom. All scrolling keys are consumed by Orc, and all other input is ignored
+when no role is active.
+
+For `paused`, `blocked`, and `completed` tasks whose rendered roles are both
+`inactive`, and for `stopped` tasks with `stop_reason: child_failure`, exactly
+one `failed` role, and one `inactive` role, `Ctrl-R` opens an Orc-owned
+follow-up prompt without restarting the process. Enter requires a non-empty
+request; Escape cancels and an empty submission leaves state unchanged. A
+successful submission retires remaining children, preserves the task identity,
+target, backend, command/version, configured limits, and handoff history,
+clears terminal and role-session metadata, appends the request, starts a fresh
+deadline, sets `status: active`, `phase: implementer`, and `round: 1`, then
+launches Igor. Active or inconsistent records do not open the prompt.
 
 ## Housekeeping
 
