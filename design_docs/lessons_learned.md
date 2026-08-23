@@ -34,6 +34,29 @@ lessons from completed Orc tasks. It complements
 - Record manual UI acceptance against an exact commit, terminal environment,
   size matrix, scenario, observation, and result so review amendments cannot
   make the evidence ambiguous.
+- Automatic workflow tests must cover the complete handoff lifecycle: an
+  idle notification, retirement of the old PTY child, launch of the next role,
+  and the next round. A live child after a handoff is normal completion, not
+  evidence that the next role can be skipped.
+- Persisted failure metadata belongs to a specific workflow generation. A
+  validated resume must clear or supersede stale failure state before the
+  relaunch, while an unretired child that exits unexpectedly must still stop
+  the current workflow.
+- Backend session identities are role-specific. A reviewer must never inherit
+  an implementer's session, and backend exit status must be checked before a
+  handoff-shaped response is accepted.
+- Agentbox integration requires exact argv and real PTY coverage for both
+  marker states, both roles, begin/resume, and executable paths containing
+  spaces; command-construction unit tests alone are insufficient.
+
+## Verification and commit discipline
+
+- Commit-message formatting is a repository gate: keep every body line at or
+  below 60 columns and retain the shared `Implemented:`, `Reviewed:`, and
+  model-trailer contract through every amendment.
+- A completed task is not ready for housekeeping until its final review
+  records the exact verification snapshot, including integration coverage,
+  documentation checks, security/audit checks, and a clean worktree.
 
 ## Housekeeping
 
