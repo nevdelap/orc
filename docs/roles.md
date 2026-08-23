@@ -10,6 +10,19 @@ conversation roles are deliberately separate:
   checks the acceptance criteria and tests, records findings in
   `review_docs/<task-id>.md`, and approves or rejects the task.
 
+The final non-blank line of every agent turn is the strict
+`ORC_HANDOFF_V1: <JSON object>` contract with exactly the fields
+`launch_token`, `status`, `summary`, `files_changed`, `verification`,
+`blockers`, and `requested_action`. Igor may emit `HANDOFF` or
+`UNABLE_TO_PROCEED`; Rufus may also emit `COMPLETE`. Orc validates the launch
+token, role, generation, round, phase, and backend session before recording a
+handoff. A receiver gets only the preceding validated canonical handoff in a
+delimited context block, never raw backend payload data.
+
+The contract is bounded: the complete frame and delivered context are at most
+16 KiB, launch tokens are at most 256 bytes, scalar fields at most 4 KiB, and
+list items at most 512 bytes. Oversized handoffs are rejected as a whole.
+
 The implementation plan is the source of truth for task scope, dependencies,
 acceptance criteria, and state. A task must be fully specified before Igor
 starts. A blocked task is skipped until a human changes it back to `NEW`.

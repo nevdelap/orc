@@ -419,7 +419,7 @@ Acceptance criteria:
 
 ## TASK-013 - Harden workflow state and agent handoffs
 
-State: NEW
+State: COMPLETED
 
 Goal:
 

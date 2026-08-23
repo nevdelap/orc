@@ -817,9 +817,7 @@ def test_in_place_resume_restarts_inactive_terminal_task(
     target = tmp_path / "target"
     target.mkdir()
     handoffs = (
-        []
-        if status != "completed"
-        else [{"role": "implementer", "commit": "abc"}]
+        [] if status != "completed" else [{"role": "implementer", "commit": "abc"}]
     )
     record: dict[str, object] = {
         "status": status,
@@ -1033,9 +1031,7 @@ def test_textual_in_place_resume_prompt_submits_in_same_app(
             await pilot.pause()
             assert not app.resume_prompt_active
             assert launched == ["implementer"]
-            assert (
-                orc.load_state(state_file)["TASK-012"]["status"] == "active"
-            )
+            assert orc.load_state(state_file)["TASK-012"]["status"] == "active"
             app.exit()
 
     asyncio.run(exercise())
@@ -1062,6 +1058,7 @@ def test_textual_status_version_rail_is_complete_at_supported_sizes(
             }
         },
     )
+
     async def exercise() -> None:
         for size in ((120, 40), (80, 40), (80, 24)):
             app = orc.OrcApp(argparse.Namespace(state_file=state_file), "TASK-012")
@@ -1924,9 +1921,7 @@ def test_automatic_cli_bounds_and_removed_manual_syntax(tmp_path: Path) -> None:
     assert auto.max_rounds == 3
     assert auto.deadline_minutes == 7
     with pytest.raises(SystemExit):
-        orc.parse_args(
-            ["begin", str(target), "TASK-005", "implement", "--auto"]
-        )
+        orc.parse_args(["begin", str(target), "TASK-005", "implement", "--auto"])
     with pytest.raises(SystemExit):
         orc.parse_args(
             [
@@ -2007,9 +2002,7 @@ def test_backend_selector_precedence_and_required_error(
     monkeypatch.setenv("ORC_BACKEND", "invalid")
     assert orc.selected_backend(explicit) == "codex"
     with pytest.raises(SystemExit):
-        orc.parse_args(
-            ["begin", str(target), "TASK-005", "--codex", "--claude"]
-        )
+        orc.parse_args(["begin", str(target), "TASK-005", "--codex", "--claude"])
 
 
 def test_resume_parser_has_no_directory_or_backend_selector(tmp_path: Path) -> None:
@@ -2130,8 +2123,8 @@ def test_resume_delivers_exact_clarification_without_resetting_limits(
         [
             "--state-file",
             str(state_file),
-                "resume",
-                "TASK-005",
+            "resume",
+            "TASK-005",
             "Choose option B exactly",
         ]
     )
@@ -2412,19 +2405,19 @@ def test_resume_rejects_completion_as_terminal(
         "TASK-005": {
             "status": "paused",
             "phase": "complete",
-                "stop_reason": "completion",
-                "target_directory": str(target.resolve()),
-                "backend": "codex",
-                "user_requests": [],
+            "stop_reason": "completion",
+            "target_directory": str(target.resolve()),
+            "backend": "codex",
+            "user_requests": [],
         }
     }
     orc.save_state(state_file, state)
     args = orc.parse_args(
         [
             "--state-file",
-                str(state_file),
-                "resume",
-                "TASK-005",
+            str(state_file),
+            "resume",
+            "TASK-005",
             "continue",
         ]
     )
@@ -2738,9 +2731,7 @@ def test_status_bar_task_status_format_and_colors(
         ("failed", "#ff7b72"),
     ],
 )
-def test_status_bar_role_state_colors(
-    tmp_path: Path, state: str, color: str
-) -> None:
+def test_status_bar_role_state_colors(tmp_path: Path, state: str, color: str) -> None:
     app, _state_file, panes = app_stub(tmp_path, {"status": "active"})
     record = {"status": "active"}
     if state == "inactive":
@@ -2811,14 +2802,10 @@ def test_status_bar_composed_widgets_follow_size_priority(
             assert app.query_one("#status-hint", orc.Static).render().plain == (
                 f"{orc.STATUS_SEGMENT_SEPARATOR}{orc.FOCUS_STATUS}"
             )
-            assert (
-                "#7ee787"
-                in str(
-                    app.query_one("#status-message", orc.Static)
-                    ._Static__content
-                    .spans[-1]
-                    .style
-                )
+            assert "#7ee787" in str(
+                app.query_one("#status-message", orc.Static)
+                ._Static__content.spans[-1]
+                .style
             )
 
             await pilot.resize_terminal(80, 40)
@@ -2827,15 +2814,9 @@ def test_status_bar_composed_widgets_follow_size_priority(
             assert (
                 app.query_one("#status-message", orc.Static).styles.display == "block"
             )
-            assert (
-                app.query_one("#status-igor", orc.Static).styles.display == "block"
-            )
-            assert (
-                app.query_one("#status-rufus", orc.Static).styles.display == "block"
-            )
-            assert (
-                app.query_one("#status-backend", orc.Static).styles.display == "none"
-            )
+            assert app.query_one("#status-igor", orc.Static).styles.display == "block"
+            assert app.query_one("#status-rufus", orc.Static).styles.display == "block"
+            assert app.query_one("#status-backend", orc.Static).styles.display == "none"
             assert app.query_one("#status-hint", orc.Static).styles.display == "none"
 
             await pilot.resize_terminal(80, 24)
@@ -2844,12 +2825,8 @@ def test_status_bar_composed_widgets_follow_size_priority(
             assert (
                 app.query_one("#status-message", orc.Static).styles.display == "block"
             )
-            assert (
-                app.query_one("#status-igor", orc.Static).styles.display == "block"
-            )
-            assert (
-                app.query_one("#status-rufus", orc.Static).styles.display == "block"
-            )
+            assert app.query_one("#status-igor", orc.Static).styles.display == "block"
+            assert app.query_one("#status-rufus", orc.Static).styles.display == "block"
             assert app.query_one("#status-version", orc.Static).render().plain == (
                 f"{orc.STATUS_VERSION_SEPARATOR}{orc.ORC_VERSION}"
             )
@@ -3439,9 +3416,7 @@ def test_late_child_exit_preserves_terminal_metadata(
         "backend": backend,
     }
     app, state_file, panes = app_stub(tmp_path, record)
-    session = orc.ChildSession(
-        "reviewer", 7, 99, panes["reviewer"], backend=backend
-    )
+    session = orc.ChildSession("reviewer", 7, 99, panes["reviewer"], backend=backend)
     app.sessions = {"reviewer": session}
     monkeypatch.setattr(orc.os, "waitpid", lambda *_: (7, 256))
     monkeypatch.setattr(app.event_loop, "remove_reader", lambda *_: None)

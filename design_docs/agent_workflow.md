@@ -309,6 +309,54 @@ Enter, and paste input sent to the active agent first scrolls that pane to the
 bottom. All scrolling keys are consumed by Orc, and all other input is ignored
 when no role is active.
 
+## Durable state and handoff protocol
+
+New task records use schema version 2 and a monotonically increasing revision.
+State mutations hold an advisory lock associated with the state file, validate
+the complete current record, flush a temporary JSON document in the same
+directory, atomically replace the state file, and flush its containing
+directory. A malformed or unsupported record is never overwritten; an
+interrupted replacement leaves the previous valid record readable.
+
+The workflow transition function is the authority for handoffs, terminal
+events, child failures, polling, CLI resume, and in-place resume. Terminal
+events are idempotent. Resume decisions follow one matrix for both entry
+points: active is rejected as already active; completed, blocked, paused,
+deadline-stopped, maximum-rounds-stopped, and manual-pause-stopped records
+require their documented inactive-role predicates and a non-empty request;
+valid single-role child failures restart that failed role at the current round;
+all other inconsistent records are rejected without mutation. Accepted
+resumes preserve identity, configuration, limits, history, and audit data,
+clear terminal and launch/session metadata, append the exact request, and start
+a fresh deadline.
+
+Every role generation has a fresh opaque launch token. Its final non-blank line
+must be exactly `ORC_HANDOFF_V1: <JSON object>` with exactly seven fields:
+`launch_token`, `status`, `summary`, `files_changed`, `verification`,
+`blockers`, and `requested_action`. Only Rufus may emit `COMPLETE`;
+`UNABLE_TO_PROCEED` requires blockers and `COMPLETE` requires none. Duplicate
+keys, nested values, unknown fields, malformed frames, and role-inappropriate
+dispositions are rejected without scheduling. Frame, scalar, list, receipt,
+and diagnostic limits are the bounds defined by TASK-013; Orc rejects an
+oversized handoff and never truncates it into a usable event.
+
+Codex notifications use only root `last-assistant-message` (or
+`last_agent_message`) and root `thread-id` (or `thread_id`/`session_id`).
+Claude accepts only a root `type: result` event with root `session_id` and
+string `result`, with any preceding root `type: system` session ID matching;
+stream errors and unrelated event types are rejected. Accepted handoffs are
+correlated to role, phase, round, generation, token, and backend identity.
+Orc persists only the canonical handoff with Orc-authored UTC/local time,
+task, role, target commit, and session/thread identity. Rufus receives Igor's
+latest canonical handoff in a delimited non-instructional context block; Igor
+receives Rufus's preceding canonical handoff on the next round. Late,
+duplicate, and stale receipts are bounded no-ops.
+
+Backend and launch failures remain visible in the retained TUI. PTY readers
+close on EOF/error after one final drain, child groups receive SIGTERM within
+two seconds and SIGKILL within one additional second, and Git lookup and
+Claude capability probes each time out after five seconds.
+
 For `paused`, `blocked`, and `completed` tasks whose rendered roles are both
 `inactive`, and for `stopped` tasks with `stop_reason: child_failure`, exactly
 one `failed` role, and one `inactive` role, `Ctrl-R` opens an Orc-owned

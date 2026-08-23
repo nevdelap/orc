@@ -66,6 +66,21 @@ child before the next role launches. Orc keeps the final panes and status bar
 mounted in every terminal state; only `Ctrl-Q` exits, and quitting preserves
 the task record and diagnostics.
 
+New records use schema version 2 and a monotonically increasing revision.
+Every mutation is serialized with an advisory state-file lock and written as a
+flushed temporary JSON document followed by atomic replacement and a directory
+flush. A malformed or unsupported record is reported without being overwritten;
+an interrupted replacement leaves the previous document intact. Role launches
+carry an opaque generation token, so late, duplicate, and stale events are
+ignored rather than interpreted as a new workflow turn.
+
+Validated handoff frames and delivered context are capped at 16 KiB; launch
+tokens are capped at 256 bytes, other scalar fields at 4 KiB, and list items at
+512 bytes. Orc retains at most 256 accepted receipts and evicts only the
+oldest receipt whose generation can no longer report. Git lookup and Claude
+capability checks are bounded at five seconds and record the operation, role,
+backend, and limit when they time out.
+
 ## Status bar
 
 The left-to-right logical order is:
@@ -113,11 +128,47 @@ and handoff history remain persisted across this in-place resume.
 
 ## Handoffs and troubleshooting
 
-An idle handoff includes role, round, thread, target, UTC/local time, commit,
-and handoff fields. A blocker must use the exact status
-`UNABLE_TO_PROCEED` with a concise reason. Duplicate and stale events are
-ignored. Stop reasons are `completion`, `clarification`, `deadline`,
-`max_rounds`, `child_failure`, and the legacy `manual_pause`.
+An agent's final non-blank line must be exactly
+`ORC_HANDOFF_V1: <JSON object>`. The object has exactly these fields:
+`launch_token`, `status`, `summary`, `files_changed`, `verification`,
+`blockers`, and `requested_action`. Strings and list items are bounded;
+`status` is exactly `HANDOFF`, `COMPLETE`, or `UNABLE_TO_PROCEED`. Only Rufus
+may use `COMPLETE`; `UNABLE_TO_PROCEED` requires a non-empty blockers list and
+`COMPLETE` requires an empty one. Orc stores only the validated canonical
+handoff with its own timestamps, role, round, generation, session identity,
+target commit, and task metadata.
+
+Rufus receives Igor's latest validated handoff in a clearly delimited data
+block and must address that disposition. Igor receives Rufus's latest
+validated handoff at the start of the next round. These blocks are context,
+not instructions. Codex notifications use only root
+`last-assistant-message`/`last_agent_message` and
+`thread-id`/`thread_id`/`session_id`; Claude uses only a matching root
+`result` event and its `session_id`. Nested-only identities, free-form status
+lines, stream errors, stale generations, and duplicate receipts are rejected
+with bounded diagnostics and do not change scheduling.
+
+Stop reasons are `completion`, `clarification`, `deadline`, `max_rounds`,
+`child_failure`, and the legacy `manual_pause`. Launch, clean-exit, non-zero
+exit, malformed stream, PTY EOF/error, Git lookup, and Claude capability
+failures remain visible in the retained UI; child retirement uses bounded
+`SIGTERM`/`SIGKILL` cleanup.
+
+For local verification and CI, use the locked environment and these commands:
+
+```console
+uv sync --locked
+uv run pytest -q --cov=orc --cov-branch --cov-report=term-missing --cov-report=xml:coverage.xml --cov-fail-under=90
+uv run pytest -q -m integration tests
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy orc
+uv run python -c "from pathlib import Path; compile(Path('orc').read_text(), 'orc', 'exec')"
+uv run python -m compileall -q tests
+uv run mdformat --check README.md design_docs docs
+uv run pip-audit --strict
+actionlint .github/workflows/ci.yml
+```
 
 - **Backend selection error:** use `--codex` or `--claude`, or set
   `ORC_BACKEND` to one exact value. Executable variables configure paths only.
