@@ -287,7 +287,9 @@ Role states are `not started`, `active`, `waiting`, `inactive`, and `failed`. A
 role with a recorded normal handoff is `waiting` until the next workflow
 transition; a live child does not make that role `active`. Once completion is
 recorded, both roles are `inactive` and Orc keeps the final panes and status
-visible until the user quits with `Ctrl-Q`.
+visible until the user quits with `Ctrl-Q`. Orc likewise keeps the UI alive for
+`paused`, `blocked`, and `stopped` records, including clarification,
+`manual_pause`, `deadline`, `max_rounds`, and `child_failure` stop reasons.
 
 The begin prompt is optional: `begin DIRECTORY TASK-ID` uses only the built-in
 implementer prompt, while an omitted prompt is persisted as empty and is never
@@ -295,6 +297,10 @@ rendered as an empty user request. Resume remains strict and requires a
 non-empty request or clarification. After a normal handoff Orc retires the
 completed child before scheduling the next role. Retiring a completed child is
 ordinary workflow cleanup and must not be persisted as `child_failure`.
+Terminal transitions refresh the visible panes and status without scheduling a
+new role. `Ctrl-Q` is the only normal terminal-state exit path; its existing
+PTY, reader, timer, and child cleanup runs when the UI unmounts, and quitting
+does not delete or rewrite the persisted task record.
 
 ## Housekeeping
 

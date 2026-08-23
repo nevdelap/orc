@@ -158,7 +158,9 @@ segment itself remains exactly `<TASK-ID>: <status>`.
 Role states are `not started`, `active`, `waiting`, `inactive`, and `failed`. A
 role that has handed off is `waiting` until the next workflow transition, even
 if its child process is still alive. A completed task leaves both roles
-`inactive` and keeps the UI visible until `Ctrl-Q`.
+`inactive` and keeps the UI visible until `Ctrl-Q`. The same keep-alive behavior
+applies to `paused`, `blocked`, and `stopped` tasks, including clarification,
+manual-pause, deadline, maximum-round, and child-failure stops.
 
 When the agentbox marker is present and the selected launch actually includes
 the backend's no-permission flag, the bar also shows `agentbox: no-permissions`. Orc retires a normally handed-off child before launching the
@@ -175,7 +177,8 @@ task, round, thread, timestamp, commit, and phase, then launches no next role.
 The persisted `stop_reason` distinguishes `completion`, `clarification`,
 `deadline`, `max_rounds`, `child_failure`, and `manual_pause`. Duplicate idle
 events and stale notifications are ignored, so they cannot create an extra
-round or concurrent child.
+round or concurrent child. Reaching any terminal status refreshes the final
+panes and status bar but does not close the UI or launch another role.
 
 ## Interaction
 
@@ -183,14 +186,18 @@ Both role panes remain visible whenever the terminal supports the selected
 layout. The active pane has a highlighted border and its role is shown in the
 status line. Click either pane or press `Tab` to focus the next pane; focus
 selection updates the border and status without sending the focus command to
-the agent. `Ctrl-Q` exits the UI.
+the agent. `Ctrl-Q` is the explicit exit action: Orc stays alive for inspection
+after completion, a pause, a deadline, a round limit, or a child failure until
+the user presses it.
 
 Ordinary keys, digits, control keys, arrows, Enter, Shift-Tab, paste, and
 terminal resize signals are forwarded to the active Codex PTY. Shift-Tab uses
 the terminal's reported control sequence when available. Orc keeps startup,
 idle, and handoff messages in each pane, and displays the task name and Orc
 version in the status bar. Exiting the UI does not delete task state; resume
-the task later with the same target directory.
+the task later with the same target directory. Closing the UI with `Ctrl-Q`
+leaves the terminal task record and its final diagnostics available in the
+state file.
 
 ## Troubleshooting
 

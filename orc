@@ -115,6 +115,7 @@ VALID_STOP_REASONS = {
     "child_failure",
     "manual_pause",
 }
+TERMINAL_TASK_STATUSES = {"paused", "blocked", "stopped", "completed"}
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1177,6 +1178,9 @@ class OrcApp(App[None]):
             self.fatal_error(f"no state for task {self.task_id}")
             return
 
+        if record.get("status") in TERMINAL_TASK_STATUSES:
+            return
+
         target_value = record.get("target_directory")
         if not isinstance(target_value, str) or not target_value:
             self.fatal_error(
@@ -1184,13 +1188,10 @@ class OrcApp(App[None]):
             )
             return
         target_directory = Path(target_value)
-        if record.get("status") in {"blocked", "stopped", "completed"}:
-            return
         if deadline_expired(record):
             set_stop_reason(record, "deadline")
             save_state(self.args.state_file, state)
             self.refresh_status()
-            self.exit()
             return
 
         backend = backend_from_record(record)
@@ -1456,6 +1457,9 @@ class OrcApp(App[None]):
     ) -> bool:
         """Turn a Claude stream's final message into the shared idle event."""
 
+        if record.get("status") in TERMINAL_TASK_STATUSES:
+            return True
+
         exit_code = child_exit_code(status)
         if exit_code != 0:
             record["child_failure"] = {
@@ -1468,7 +1472,6 @@ class OrcApp(App[None]):
             set_stop_reason(record, "child_failure")
             save_state(self.args.state_file, state)
             self.refresh_status()
-            self.exit()
             return True
 
         payload = self.claude_handoff(session)
@@ -1484,7 +1487,6 @@ class OrcApp(App[None]):
             set_stop_reason(record, "child_failure")
             save_state(self.args.state_file, state)
             self.refresh_status()
-            self.exit()
             return True
 
         session_id = session.session_id
@@ -1529,7 +1531,6 @@ class OrcApp(App[None]):
             set_stop_reason(record, "child_failure")
             save_state(self.args.state_file, state)
             self.refresh_status()
-            self.exit()
         finally:
             if previous_task is None:
                 os.environ.pop("ORC_TASK_ID", None)
@@ -1722,20 +1723,18 @@ class OrcApp(App[None]):
 
         self.retire_completed_sessions(record)
 
-        if deadline_expired(record):
-            set_stop_reason(record, "deadline")
-            save_state(self.args.state_file, state)
-            self.refresh_status()
-            self.exit()
-            return
-
         status = record.get("status")
         if status == "completed":
             self.refresh_status()
             return
         if status in {"paused", "blocked", "stopped"}:
             self.refresh_status()
-            self.exit()
+            return
+
+        if deadline_expired(record):
+            set_stop_reason(record, "deadline")
+            save_state(self.args.state_file, state)
+            self.refresh_status()
             return
 
         if record.get("phase") in {"reviewer", "implementer"}:
@@ -1780,7 +1779,11 @@ class OrcApp(App[None]):
                     self.drain_session(session)
                     self.handle_claude_exit(session, state, record, _status)
                     continue
-                if isinstance(record, dict) and child_exit_code(_status) != 0:
+                if (
+                    isinstance(record, dict)
+                    and record.get("status") not in TERMINAL_TASK_STATUSES
+                    and child_exit_code(_status) != 0
+                ):
                     record["child_failure"] = {
                         "role": session.role,
                         "backend": "codex",
@@ -1793,7 +1796,6 @@ class OrcApp(App[None]):
                     set_stop_reason(record, "child_failure")
                     save_state(self.args.state_file, state)
                     self.refresh_status()
-                    self.exit()
                     continue
                 expected_handoff = (
                     isinstance(record, dict) and record.get("phase") != session.role
@@ -1826,10 +1828,8 @@ class OrcApp(App[None]):
                     set_stop_reason(record, "child_failure")
                     save_state(self.args.state_file, state)
                     self.refresh_status()
-                    self.exit()
                 elif session.role == self.active_role and not expected_handoff:
                     self.refresh_status()
-                    self.exit()
                 self.refresh_status()
 
     def on_key(self, event: Any) -> None:

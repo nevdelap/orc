@@ -107,7 +107,7 @@ Acceptance criteria:
 
 ## TASK-010 - Restore terminal-state UI lifetime
 
-State: NEW
+State: COMPLETED
 
 Goal:
 

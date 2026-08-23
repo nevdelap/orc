@@ -1166,7 +1166,7 @@ def test_orc_app_polling_unmount_and_mount(
     record["status"] = "paused"
     orc.save_state(state_file, {"TASK-003": record})
     app.poll_state()
-    assert exited
+    assert not exited
     record["status"] = "active"
     record["phase"] = "reviewer"
     orc.save_state(state_file, {"TASK-003": record})
@@ -1386,7 +1386,7 @@ def test_launch_resume_and_poll_edge_branches(
     assert app.sessions == {}
 
 
-def test_poll_children_exits_and_unmounts_resources(
+def test_poll_children_keeps_ui_alive_and_unmounts_resources(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     target = tmp_path / "target"
@@ -1414,7 +1414,7 @@ def test_poll_children_exits_and_unmounts_resources(
     monkeypatch.setattr(app, "exit", lambda *args: exits.append(args))
     monkeypatch.setattr(app, "update_status", lambda _message: None)
     app.poll_children()
-    assert session.exited and exits
+    assert session.exited and not exits
 
     app.sessions = {"done": argparse.Namespace(pid=1, master_fd=99, exited=True)}
     app.on_unmount()
@@ -2643,6 +2643,82 @@ def test_completed_task_keeps_ui_alive_with_both_roles_inactive(
     assert "Rufus: inactive" in rendered[-1]
 
 
+def test_terminal_task_stays_mounted_until_ctrl_q_and_preserves_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    record: dict[str, object] = {
+        "status": "completed",
+        "phase": "complete",
+        "target_directory": str(target),
+        "stop_reason": "completion",
+        "handoffs": [
+            {"role": "implementer"},
+            {"role": "reviewer"},
+        ],
+    }
+    state_file = tmp_path / "state.json"
+    orc.save_state(state_file, {"TASK-003": record})
+    app = orc.OrcApp(
+        argparse.Namespace(state_file=state_file, codex="codex"), "TASK-003"
+    )
+    monkeypatch.setattr(app, "launch_role", lambda _role: None)
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            assert app.is_running
+            app.poll_state()
+            await pilot.pause()
+            assert app.is_running
+            assert app.query_one("#status-message", orc.Static).render().plain == (
+                "TASK-003: completed"
+            )
+            app.exit()
+
+    asyncio.run(exercise())
+    assert orc.load_state(state_file)["TASK-003"] == record
+
+
+def test_paused_task_stays_mounted_without_mount_time_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    record: dict[str, object] = {
+        "status": "paused",
+        "phase": "reviewer",
+        "target_directory": str(target),
+        "stop_reason": "manual_pause",
+        "handoffs": [],
+        "user_requests": ["review the implementation"],
+    }
+    state_file = tmp_path / "state.json"
+    orc.save_state(state_file, {"TASK-003": record})
+    app = orc.OrcApp(
+        argparse.Namespace(state_file=state_file, codex="codex"), "TASK-003"
+    )
+    monkeypatch.setattr(
+        app,
+        "fork_codex",
+        lambda *_args: pytest.fail("paused task launched a child"),
+    )
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            assert app.is_running
+            assert app.sessions == {}
+            assert app.query_one("#status-message", orc.Static).render().plain == (
+                "TASK-003: paused"
+            )
+            app.exit()
+
+    asyncio.run(exercise())
+    assert orc.load_state(state_file)["TASK-003"] == record
+
+
 @pytest.mark.parametrize("status", ["paused", "blocked", "stopped"])
 def test_stop_status_keeps_compact_status_bar(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str
@@ -2671,6 +2747,175 @@ def test_stop_status_keeps_compact_status_bar(
     assert "Rufus:" in rendered[-1]
     assert orc.ORC_VERSION in rendered[-1]
     assert orc.FOCUS_STATUS in rendered[-1]
+
+
+@pytest.mark.parametrize(
+    ("status", "phase", "stop_reason"),
+    [
+        ("completed", "complete", "completion"),
+        ("blocked", "blocked", "clarification"),
+        ("paused", "reviewer", "manual_pause"),
+        ("stopped", "stopped", "deadline"),
+        ("stopped", "stopped", "max_rounds"),
+        ("stopped", "stopped", "child_failure"),
+    ],
+)
+def test_terminal_records_are_idempotent_and_keep_ui_alive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    phase: str,
+    stop_reason: str,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    record: dict[str, object] = {
+        "status": status,
+        "phase": phase,
+        "target_directory": str(target),
+        "automatic_rounds": True,
+        "deadline_at": "2000-01-01T00:00:00+00:00",
+        "stop_reason": stop_reason,
+        "handoffs": [],
+    }
+    app, state_file, _panes = app_stub(tmp_path, record)
+    exited: list[bool] = []
+    launches: list[str] = []
+    monkeypatch.setattr(app, "exit", lambda: exited.append(True))
+    monkeypatch.setattr(app, "launch_role", launches.append)
+    monkeypatch.setattr(app, "update_status", lambda _message: None)
+
+    app.poll_state()
+    first = orc.load_state(state_file)["TASK-003"]
+    app.poll_state()
+    second = orc.load_state(state_file)["TASK-003"]
+
+    assert second == first
+    assert not exited
+    assert launches == []
+
+
+def test_deadline_stops_workflow_once_without_exiting_or_launching(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    app, state_file, _panes = app_stub(
+        tmp_path,
+        {
+            "status": "active",
+            "phase": "implementer",
+            "target_directory": str(target),
+            "automatic_rounds": True,
+            "deadline_at": "2000-01-01T00:00:00+00:00",
+            "stop_reason": None,
+            "handoffs": [],
+        },
+    )
+    exited: list[bool] = []
+    launches: list[str] = []
+    monkeypatch.setattr(app, "exit", lambda: exited.append(True))
+    monkeypatch.setattr(app, "launch_role", launches.append)
+    monkeypatch.setattr(app, "update_status", lambda _message: None)
+
+    app.poll_state()
+    first = orc.load_state(state_file)["TASK-003"]
+    app.poll_state()
+    second = orc.load_state(state_file)["TASK-003"]
+
+    assert first["status"] == "stopped"
+    assert first["phase"] == "stopped"
+    assert first["stop_reason"] == "deadline"
+    assert second == first
+    assert not exited
+    assert launches == []
+
+
+@pytest.mark.parametrize("role", ["implementer", "reviewer"])
+def test_unexpected_clean_child_exit_stops_without_exiting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    role: str,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    app, state_file, panes = app_stub(
+        tmp_path,
+        {
+            "status": "active",
+            "phase": role,
+            "target_directory": str(target),
+            "handoffs": [],
+        },
+    )
+    session = orc.ChildSession(role, 7, 99, panes[role])
+    app.sessions = {role: session}
+    monkeypatch.setattr(orc.os, "waitpid", lambda *_: (7, 0))
+    monkeypatch.setattr(app.event_loop, "remove_reader", lambda *_: None)
+    monkeypatch.setattr(app, "exit", lambda: pytest.fail("terminal exit"))
+    monkeypatch.setattr(app, "update_status", lambda _message: None)
+
+    app.poll_children()
+    saved = orc.load_state(state_file)["TASK-003"]
+
+    assert saved["status"] == "stopped"
+    assert saved["phase"] == "stopped"
+    assert saved["stop_reason"] == "child_failure"
+    assert saved["child_failure"]["role"] == role
+    assert session.exited
+
+
+@pytest.mark.parametrize("backend", ["codex", "claude"])
+@pytest.mark.parametrize(
+    ("status", "phase", "stop_reason"),
+    [
+        ("paused", "reviewer", "manual_pause"),
+        ("blocked", "blocked", "clarification"),
+        ("stopped", "stopped", "deadline"),
+        ("completed", "complete", "completion"),
+    ],
+)
+def test_late_child_exit_preserves_terminal_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+    status: str,
+    phase: str,
+    stop_reason: str,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    record: dict[str, object] = {
+        "status": status,
+        "phase": phase,
+        "target_directory": str(target),
+        "stop_reason": stop_reason,
+        "child_failure": {
+            "role": "reviewer",
+            "backend": "prior",
+            "reason": "original diagnostic",
+        },
+        "handoffs": [],
+        "backend": backend,
+    }
+    app, state_file, panes = app_stub(tmp_path, record)
+    session = orc.ChildSession(
+        "reviewer", 7, 99, panes["reviewer"], backend=backend
+    )
+    app.sessions = {"reviewer": session}
+    monkeypatch.setattr(orc.os, "waitpid", lambda *_: (7, 256))
+    monkeypatch.setattr(app.event_loop, "remove_reader", lambda *_: None)
+    monkeypatch.setattr(app, "exit", lambda: pytest.fail("terminal exit"))
+    monkeypatch.setattr(app, "update_status", lambda _message: None)
+
+    app.poll_children()
+    first = orc.load_state(state_file)["TASK-003"]
+    app.poll_children()
+    second = orc.load_state(state_file)["TASK-003"]
+
+    assert first == record
+    assert second == first
+    assert session.exited
 
 
 def test_codex_nonzero_exit_after_handoff_is_child_failure(
@@ -2702,7 +2947,7 @@ def test_codex_nonzero_exit_after_handoff_is_child_failure(
     assert saved["stop_reason"] == "child_failure"
     assert saved["child_failure"]["backend"] == "codex"
     assert saved["child_failure"]["reason"] == "Codex exited with status 1"
-    assert exited
+    assert not exited
     assert rendered
     assert "TASK-003: stopped" in rendered[-1]
     assert "Igor: failed" in rendered[-1]
