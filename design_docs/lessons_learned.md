@@ -15,6 +15,14 @@ lessons from completed Orc tasks. It complements
   changes out of the task snapshot.
 - A clean worktree and an explicitly recorded plan state are completion
   requirements, not informal cleanup.
+- A planning specification must make every supported platform, mode, size
+  matrix, legacy-state case, interface value, payload field, and overflow
+  behavior explicit and testable; prose must not conflict with normative
+  tables or leave implementation decisions to inference.
+- Review metadata is part of the shared commit contract: pending findings must
+  name their review document and finding ID, commit body lines must meet the
+  length limit, and reviewer amendments must preserve the implementer's
+  section.
 
 ## Orc runtime and handoffs
 
@@ -57,11 +65,40 @@ lessons from completed Orc tasks. It complements
 - A completed task is not ready for housekeeping until its final review
   records the exact verification snapshot, including integration coverage,
   documentation checks, security/audit checks, and a clean worktree.
+- Run the exact declared test command in a clean environment. A passing suite
+  that depends on ambient variables, such as `ORC_BACKEND`, is not evidence
+  that the repository's gate passes.
+- Coverage thresholds must include their exact command, branch/source options,
+  report path, and failure behavior in both the task and CI workflow. A test
+  count alone is not coverage evidence.
+- CI-only tools must be represented by an executable workflow check and a
+  documented local fallback or limitation; an unavailable local tool must
+  not be reported as a passing local verification.
+
+## State and protocol design
+
+- Persisted state needs a versioned schema and complete record validation;
+  validating only the top-level JSON container permits malformed task records
+  to be rewritten as if they were valid.
+- Every state writer, including external idle hooks and backend exit paths,
+  must use the same locked mutation/revision operation. Direct atomic writes
+  can still bypass revisioning and lose the concurrency guarantees.
+- A protocol specification must define every field's type, requiredness,
+  empty-value rules, allowed enum values, size limits, and overflow behavior.
+  Saying that fields are structured or bounded is not independently testable.
+- Resume behavior needs a normative matrix covering status, stop reason, role
+  state, child liveness, selected role, round, preserved/reset fields, and
+  exact rejection behavior. A prose fallback that conflicts with a table is
+  an implementation bug waiting to happen.
+- Bounded retention must define what happens when every retained entry is
+  still live or reportable. Deterministic refusal and a truthful diagnostic
+  are preferable to silently evicting evidence or growing without limit.
 
 ## Housekeeping
 
 - Bootstrap work may appear in the worktree while the next task is being
   created; record that transition explicitly rather than misclassifying it as
   an unrelated product change.
-- Before retiring completed reviews, capture their durable lessons here and
-  retain the original commits in Git for history and auditability.
+- Before retiring completed reviews, capture their durable lessons here. Keep
+  only live task and unresolved-issue material in the documentation tree; the
+  original commits in Git provide history and auditability.

@@ -168,10 +168,10 @@ a gate.
 
 - A housekeeping commit has the subject `HOUSEKEEPING: <plain summary>` and
   contains only the maintenance described in the Housekeeping section below.
-- It may update lessons, remove completed tasks and their consumed review
-  documents, and record documentation removal suggestions. It must preserve
-  active and unresolved work and must not add product work, implement a task,
-  change source behavior, or bump the package version.
+- It may update lessons, remove retired task and review records, and record
+  documentation removal results. It must preserve active and unresolved work
+  and must not add product work, implement a task, change source behavior, or
+  bump the package version.
 - Housekeeping is performed between task commits and is not a substitute for a
   task, planning, or review amendment.
 
@@ -337,8 +337,9 @@ must be exactly `ORC_HANDOFF_V1: <JSON object>` with exactly seven fields:
 `UNABLE_TO_PROCEED` requires blockers and `COMPLETE` requires none. Duplicate
 keys, nested values, unknown fields, malformed frames, and role-inappropriate
 dispositions are rejected without scheduling. Frame, scalar, list, receipt,
-and diagnostic limits are the bounds defined by TASK-013; Orc rejects an
-oversized handoff and never truncates it into a usable event.
+and diagnostic limits are the bounds defined in the active workflow
+protocol; Orc rejects an oversized handoff and never truncates it into a
+usable event.
 
 Codex notifications use only root `last-assistant-message` (or
 `last_agent_message`) and root `thread-id` (or `thread_id`/`session_id`).
@@ -374,14 +375,19 @@ Housekeeping is the maintenance step between implementation tasks. It is not new
 product work and does not replace a task commit or review. During housekeeping:
 
 - Read every applicable completed-task review document in `review_docs/` and
-  include its durable implementation, testing, and process lessons when updating
-  `design_docs/lessons_learned.md`; do this before removing any review document.
+  include its durable implementation, testing, and process lessons when
+  updating `design_docs/lessons_learned.md`; do this before removing any
+  review document.
 - Remove `COMPLETED` task entries from the active implementation plan while
   retaining `NEW` and `BLOCKED` work. The completed task commit and its review
   history remain available in Git.
-- After their useful content has been captured, delete completed task review
-  documents from `review_docs/`. Keep a review or design document when an active
-  or future task still references it as source material.
+- After their useful content has been captured, delete every review document
+  that is no longer required by an active task, unresolved finding, or the
+  current housekeeping operation. This includes completed implementation
+  reviews, planning reviews for retired tasks, and prior housekeeping reviews.
+  Do not retain old documents merely for historical interest or auditability;
+  Git is the historical record. Keep a document only when a live task or
+  unresolved issue still requires it.
 - Review `design_docs/known_issues.md` and remove entries for issues that are
   verified closed. Move any durable lesson from a closed issue into
   `design_docs/lessons_learned.md` before removing the issue entry; leave open,
@@ -389,14 +395,14 @@ product work and does not replace a task commit or review. During housekeeping:
 - Audit every file in the documentation tree for obsolete or unreferenced
   artifacts and include an explicit `Removal suggestions` list in the
   housekeeping handoff. For each candidate, name the path and explain why it
-  appears obsolete; if there are none, say so explicitly. This includes stale
-  screenshots or other images in `design_docs/`. Do not silently delete an
-  uncertain artifact as part of housekeeping; record it in that list for the
-  operator.
-- Preserve the remaining plan and review history exactly; do not rewrite
-  findings into a new status or delete unresolved work. A documentation-only
-  housekeeping commit does not bump the package version or alter source
-  behavior.
+  is being removed; if there are none, say so explicitly. This includes stale
+  screenshots or other images in `design_docs/`. Remove obsolete artifacts in
+  the housekeeping commit after their useful content has been captured; do not
+  leave them in place merely because they are old. Preserve active task specs,
+  unresolved findings, and the current housekeeping record exactly; do not
+  rewrite findings into a new status or delete unresolved work. A
+  documentation-only housekeeping commit does not bump the package version or
+  alter source behavior.
 - Task numbers are stable identifiers. Once a task ID has been published in the
   plan, do not renumber it, reuse it for a different task, or rewrite it just
   because tasks were reordered or removed. If the plan changes, move or delete
