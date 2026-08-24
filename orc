@@ -427,6 +427,14 @@ def _validate_state_document(value: Any, path: Path) -> dict[str, Any]:
                 raise StateFormatError(
                     f"Orc state {path} task {task_id} has invalid deadline_at"
                 )
+            diagnostic = record.get("stop_diagnostic")
+            if diagnostic is not None and (
+                not isinstance(diagnostic, str)
+                or len(diagnostic.encode("utf-8")) > DIAGNOSTIC_LIMIT
+            ):
+                raise StateFormatError(
+                    f"Orc state {path} task {task_id} has invalid stop_diagnostic"
+                )
     return value
 
 
@@ -777,7 +785,11 @@ def deadline_expired(record: dict[str, Any], now: datetime | None = None) -> boo
 
 
 def set_stop_reason(
-    record: dict[str, Any], reason: str, *, completed: bool = False
+    record: dict[str, Any],
+    reason: str,
+    *,
+    completed: bool = False,
+    diagnostic: str | None = None,
 ) -> None:
     if reason not in VALID_STOP_REASONS:
         raise ValueError(f"unknown Orc stop reason: {reason}")
@@ -792,6 +804,35 @@ def set_stop_reason(
         else ("blocked" if reason == "clarification" else "stopped")
     )
     record["stop_reason"] = reason
+    if diagnostic is not None:
+        record["stop_diagnostic"] = _diagnostic(diagnostic)
+    elif reason != "orchestrator_exit":
+        record.pop("stop_diagnostic", None)
+
+
+def mark_cleanup_stopped(record: dict[str, Any], reason: str, diagnostic: str) -> bool:
+    """Record an orchestrator stop without disturbing terminal records."""
+
+    if record.get("status") in TERMINAL_TASK_STATUSES:
+        return False
+    if reason not in {"manual_pause", "orchestrator_exit"}:
+        raise ValueError(f"invalid cleanup stop reason: {reason}")
+    set_stop_reason(record, reason, diagnostic=diagnostic)
+    record["role_states"] = {"implementer": "inactive", "reviewer": "inactive"}
+    record.pop("live_child", None)
+    launches = record.get("role_launches")
+    if isinstance(launches, dict):
+        for launch in launches.values():
+            if isinstance(launch, dict):
+                launch["live_child"] = False
+                launch["can_report"] = False
+    history = record.get("launch_history")
+    if isinstance(history, list):
+        for launch in history:
+            if isinstance(launch, dict):
+                launch["live_child"] = False
+                launch["can_report"] = False
+    return True
 
 
 def latest_canonical_handoff(
@@ -1376,6 +1417,7 @@ def resume_task_record(
         "launch_backend",
         "launch_token",
         "live_child",
+        "stop_diagnostic",
     ):
         record.pop(key, None)
     record["role_launches"] = {}
@@ -2177,6 +2219,11 @@ class OrcApp(App[None]):
         self.layout_mode = ""
         self.last_status = "starting"
         self.event_loop: asyncio.AbstractEventLoop | None = None
+        self._cleanup_started = False
+        self._cleanup_request: tuple[str, str, str] | None = None
+        self._terminal_fd: int | None = None
+        self._terminal_attributes: list[Any] | None = None
+        self._previous_signal_handlers: dict[int, Any] = {}
 
     def get_default_screen(self) -> Screen:
         return OrcScreen(id="_default")
@@ -2248,6 +2295,9 @@ class OrcApp(App[None]):
             self.fatal_error("Orc's interactive PTY UI currently requires POSIX.")
             return
         self.event_loop = asyncio.get_running_loop()
+        self._capture_terminal_state()
+        if getattr(self, "_running", False):
+            self._install_signal_handlers()
         self.set_interval(0.1, self.poll_state)
         self.set_interval(0.1, self.poll_children)
         self.update_layout()
@@ -2260,6 +2310,59 @@ class OrcApp(App[None]):
 
     def fatal_error(self, message: str) -> None:
         self.last_status = message
+        self._cleanup_request = (
+            "orchestrator_exit",
+            "orchestrator_exit",
+            f"uncaught orchestrator error: {message}",
+        )
+        self.exit()
+
+    def _capture_terminal_state(self) -> None:
+        """Save the caller's terminal mode for restoration during cleanup."""
+
+        try:
+            fd = sys.stdin.fileno()
+            if not os.isatty(fd):
+                return
+            self._terminal_fd = fd
+            self._terminal_attributes = termios.tcgetattr(fd)
+        except (OSError, AttributeError, ValueError):
+            self._terminal_fd = None
+            self._terminal_attributes = None
+
+    def _install_signal_handlers(self) -> None:
+        for signum in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM):
+            try:
+                self._previous_signal_handlers[signum] = signal.getsignal(signum)
+                signal.signal(signum, self._handle_signal)
+            except (OSError, RuntimeError, ValueError):
+                continue
+
+    def _restore_signal_handlers(self) -> None:
+        handlers = dict(getattr(self, "_previous_signal_handlers", {}))
+        if hasattr(self, "_previous_signal_handlers"):
+            self._previous_signal_handlers.clear()
+        for signum, handler in handlers.items():
+            try:
+                signal.signal(signum, handler)
+            except (OSError, RuntimeError, ValueError):
+                continue
+
+    def _handle_signal(self, signum: int, _frame: Any) -> None:
+        """Make signals use the same cleanup path as every other exit."""
+
+        if getattr(self, "_cleanup_started", False):
+            return
+        try:
+            trigger = signal.Signals(signum).name
+        except ValueError:
+            trigger = f"signal {signum}"
+        self._cleanup_request = (
+            "orchestrator_exit",
+            "orchestrator_exit",
+            f"received {trigger}",
+        )
+        self.cleanup(trigger, stop_reason="orchestrator_exit")
         self.exit()
 
     def pane(self, role: str) -> SessionPane:
@@ -2687,6 +2790,151 @@ class OrcApp(App[None]):
         except OSError:
             pass
 
+    def _persist_cleanup_state(self, reason: str, diagnostic: str) -> None:
+        """Persist cleanup through the locked mutation path when possible."""
+
+        state_file = getattr(getattr(self, "args", None), "state_file", None)
+        task_id = getattr(self, "task_id", None)
+        if not isinstance(state_file, Path) or not isinstance(task_id, str):
+            return
+        if not state_file.exists():
+            return
+        try:
+            state = load_state(state_file)
+            record = state.get(task_id)
+            if not isinstance(record, dict):
+                return
+            if record.get("schema_version") == STATE_SCHEMA_VERSION:
+                mutate_task_state(
+                    state_file,
+                    task_id,
+                    lambda current: (
+                        mark_cleanup_stopped(current, reason, diagnostic)
+                        if current is not None
+                        else False
+                    ),
+                )
+                return
+
+            # Pre-baseline records are not a compatibility contract, but the
+            # cleanup path still uses the same lock and atomic replacement for
+            # the legacy records that older callers may hold in memory.
+            with state_lock(state_file):
+                current_state = _read_state(state_file)
+                current = current_state.get(task_id)
+                if isinstance(current, dict) and mark_cleanup_stopped(
+                    current, reason, diagnostic
+                ):
+                    _atomic_write_state(state_file, current_state)
+        except BaseException as error:
+            print(
+                f"orc: could not persist cleanup state: {_diagnostic(str(error))}",
+                file=sys.stderr,
+            )
+
+    @staticmethod
+    def _signal_child_group(session: Any, signum: int) -> None:
+        pid = getattr(session, "pid", None)
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return
+        try:
+            os.killpg(pid, signum)
+        except ProcessLookupError:
+            return
+        except OSError:
+            try:
+                os.kill(pid, signum)
+            except (OSError, ProcessLookupError):
+                pass
+
+    @staticmethod
+    def _reap_until(sessions: list[Any], deadline: float) -> None:
+        """Reap known children without waiting past the supplied deadline."""
+
+        while time.monotonic() < deadline:
+            pending = []
+            for session in sessions:
+                pid = getattr(session, "pid", None)
+                if (
+                    isinstance(pid, bool)
+                    or not isinstance(pid, int)
+                    or pid <= 0
+                    or getattr(session, "exited", False)
+                ):
+                    continue
+                pending.append(session)
+                try:
+                    child_pid, _status = os.waitpid(pid, os.WNOHANG)
+                except ChildProcessError:
+                    child_pid = pid
+                except OSError:
+                    child_pid = 0
+                if child_pid == pid:
+                    session.exited = True
+            if not pending or all(
+                getattr(session, "exited", False) for session in pending
+            ):
+                break
+            time.sleep(min(0.02, max(deadline - time.monotonic(), 0)))
+
+    def _restore_terminal(self) -> None:
+        fd = getattr(self, "_terminal_fd", None)
+        attributes = getattr(self, "_terminal_attributes", None)
+        if not isinstance(fd, int) or attributes is None:
+            return
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, attributes)
+        except (OSError, ValueError):
+            pass
+
+    def cleanup(
+        self,
+        trigger: str = "orchestrator exit",
+        *,
+        stop_reason: str = "orchestrator_exit",
+        diagnostic: str | None = None,
+    ) -> None:
+        """Stop children, persist the terminal outcome, and restore the TTY."""
+
+        if getattr(self, "_cleanup_started", False):
+            return
+        self._cleanup_started = True
+        request = getattr(self, "_cleanup_request", None)
+        if request is not None:
+            stop_reason, trigger, diagnostic = request
+        if diagnostic is None:
+            diagnostic = f"cleanup triggered by {trigger}"
+        diagnostic = _diagnostic(diagnostic)
+
+        self._persist_cleanup_state(stop_reason, diagnostic)
+        sessions_by_identity: dict[int, Any] = {}
+        for session in [
+            *list(getattr(self, "sessions", {}).values()),
+            *list(getattr(self, "retired_sessions", [])),
+        ]:
+            sessions_by_identity[id(session)] = session
+        sessions = list(sessions_by_identity.values())
+
+        for session in sessions:
+            try:
+                self.close_master_reader(session)
+            except BaseException:
+                pass
+        for session in sessions:
+            if not getattr(session, "exited", False):
+                self._signal_child_group(session, signal.SIGTERM)
+
+        self._reap_until(sessions, time.monotonic() + 2.0)
+        for session in sessions:
+            if not getattr(session, "exited", False):
+                self._signal_child_group(session, signal.SIGKILL)
+        self._reap_until(sessions, time.monotonic() + 1.0)
+
+        for session in sessions:
+            self.close_session_fd(session)
+        self._restore_signal_handlers()
+        self._restore_terminal()
+
     def submit_resume_request(self, request: str | None = None) -> bool:
         if request is None:
             request = getattr(self, "resume_prompt_value", "")
@@ -2769,6 +3017,7 @@ class OrcApp(App[None]):
             "blocked_thread",
             "blocked_at",
             "blocked_commit",
+            "stop_diagnostic",
         ):
             record.pop(key, None)
         record["stop_reason"] = None
@@ -3246,6 +3495,25 @@ class OrcApp(App[None]):
             if not getattr(session, "drained", False):
                 session.drained = True
                 self.drain_session(session)
+            current_session = self.sessions.get(session.role) is session
+            owned_session = current_session and not getattr(session, "retired", False)
+            if owned_session:
+                self.cleanup(
+                    "PTY read error",
+                    stop_reason="orchestrator_exit",
+                    diagnostic=(
+                        f"PTY read error for {session.role}: {_diagnostic(str(error))}"
+                    ),
+                )
+            elif any(item is session for item in getattr(self, "retired_sessions", [])):
+                # A queued callback can still report an error after normal
+                # retirement removed the reader. Close that retired master,
+                # but never stop the workflow that replaced it.
+                self.close_session_fd(session)
+            else:
+                # Lightweight callers may probe an unregistered session. It
+                # has no workflow or descriptor ownership to clean up here.
+                pass
             return
         if data:
             session.pane.feed(data)
@@ -3940,6 +4208,7 @@ class OrcApp(App[None]):
     def on_key(self, event: Any) -> None:
         key = event.key
         if key == "ctrl+q":
+            self._cleanup_request = ("manual_pause", "operator quit", "operator quit")
             self.exit()
             event.stop()
             return
@@ -4042,30 +4311,46 @@ class OrcApp(App[None]):
         event.stop()
 
     async def action_quit(self) -> None:
+        self._cleanup_request = ("manual_pause", "operator quit", "operator quit")
         self.exit()
 
     def on_unmount(self) -> None:
-        sessions = [
-            *self.sessions.values(),
-            *getattr(self, "retired_sessions", []),
-        ]
-        for session in sessions:
-            if not session.exited and not getattr(session, "retired", False):
-                if isinstance(session, ChildSession):
-                    self.retire_session(session)
-                else:
-                    try:
-                        os.killpg(session.pid, signal.SIGTERM)
-                    except (ProcessLookupError, OSError):
-                        pass
-            self.close_session_fd(session)
+        request = getattr(self, "_cleanup_request", None)
+        if request is None:
+            request = (
+                "orchestrator_exit",
+                "orchestrator exit",
+                "orchestrator exited",
+            )
+            self._cleanup_request = request
+        self.cleanup(request[1], stop_reason=request[0], diagnostic=request[2])
 
 
 def run_app(args: argparse.Namespace, task_id: str) -> None:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise SystemExit("begin/resume must be run from an interactive terminal")
     app = OrcApp(args, task_id)
-    app.run()
+    try:
+        app.run()
+    except BaseException as error:
+        cleanup = getattr(app, "cleanup", None)
+        if callable(cleanup):
+            cleanup(
+                f"uncaught {type(error).__name__}",
+                stop_reason="orchestrator_exit",
+                diagnostic=(
+                    f"uncaught {type(error).__name__}: {_diagnostic(str(error))}"
+                ),
+            )
+        raise
+    finally:
+        cleanup = getattr(app, "cleanup", None)
+        if callable(cleanup) and not getattr(app, "_cleanup_started", False):
+            cleanup(
+                "orchestrator exit",
+                stop_reason="orchestrator_exit",
+                diagnostic="orchestrator exited",
+            )
     print(f"{task_id} orchestration ended")
 
 
@@ -4118,6 +4403,7 @@ def begin(args: argparse.Namespace) -> None:
         "role_launches": {},
         "event_receipts": [],
         "rejected_events": [],
+        "stop_diagnostic": None,
     }
     with state_lock(args.state_file):
         state = _read_state(args.state_file)

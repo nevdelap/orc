@@ -271,7 +271,7 @@ Acceptance criteria:
 
 ## TASK-015 - Make process and signal cleanup reliable
 
-State: NEW
+State: COMPLETED
 
 Goal:
 

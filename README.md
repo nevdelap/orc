@@ -77,8 +77,11 @@ without state mutation.
 Igor and Rufus alternate automatically until completion, clarification,
 deadline, maximum rounds, or child failure. A normal handoff retires the old
 child before the next role launches. Orc keeps the final panes and status bar
-mounted in every terminal state; only `Ctrl-Q` exits, and quitting preserves
-the task record and diagnostics.
+mounted in every terminal state; only `Ctrl-Q` exits. Ctrl-Q records
+`stopped`/`manual_pause` with the diagnostic `operator quit`, while `SIGINT`,
+`SIGHUP`, `SIGTERM`, terminal disconnects, and uncaught exits record
+`stopped`/`orchestrator_exit` with a bounded trigger diagnostic. Already
+terminal records retain their status, stop reason, diagnostic, and history.
 
 New records use schema version 2 and a monotonically increasing revision.
 Every mutation is serialized with an advisory state-file lock and written as a
@@ -217,7 +220,15 @@ Stop reasons are `completion`, `clarification`, `deadline`, `max_rounds`,
 `child_failure`, `orchestrator_exit`, and the legacy `manual_pause`. Launch,
 clean-exit, non-zero exit, malformed stream, PTY EOF/error, Git lookup, and
 Claude capability failures remain visible in the retained UI; child retirement
-uses bounded `SIGTERM`/`SIGKILL` cleanup.
+uses bounded `SIGTERM`/`SIGKILL` cleanup. Every exit path uses one idempotent
+cleanup operation: it removes PTY readers, sends `SIGTERM` to every child
+process group, waits at most two seconds, escalates survivors with `SIGKILL`,
+reaps children, closes each PTY master once, restores terminal settings, and
+uses the locked state mutation path. A second signal cannot re-enter cleanup.
+If state persistence fails, Orc reports that failure on stderr after still
+cleaning up processes and the terminal. A stopped orchestrator-exit record
+with inactive roles can be resumed with `resume TASK-ID PROMPT` or in-place
+`Ctrl-R`; resume clears its stop diagnostic and starts Igor at round 1.
 
 For local verification and CI, use the locked environment and these commands:
 

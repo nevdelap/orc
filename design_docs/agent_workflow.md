@@ -292,9 +292,21 @@ rendered as an empty user request. After a normal handoff Orc retires the
 completed child before scheduling the next role. Retiring a completed child is
 ordinary workflow cleanup and must not be persisted as `child_failure`.
 Terminal transitions refresh the visible panes and status without scheduling a
-new role. `Ctrl-Q` is the only normal terminal-state exit path; its existing
-PTY, reader, timer, and child cleanup runs when the UI unmounts, and quitting
-does not delete or rewrite the persisted task record.
+new role. `Ctrl-Q` is the only normal terminal-state exit path. Ctrl-Q cleanup
+records `status: stopped`, `phase: stopped`, `stop_reason: manual_pause`, and
+`stop_diagnostic: "operator quit"` with inactive roles. SIGINT, SIGHUP, SIGTERM,
+terminal disconnect/error, and uncaught Python exits record stopped
+`orchestrator_exit` with a bounded diagnostic naming the trigger. Existing
+terminal status, reason, diagnostic, and history are retained.
+
+All exits use one idempotent best-effort cleanup operation. It removes event
+loop readers, sends SIGTERM to every Orc child process group, waits at most two
+seconds, sends SIGKILL to survivors, reaps children, closes each PTY master
+exactly once, restores installed signal handlers and terminal settings, and
+uses the locked atomic state mutation path. A second signal during cleanup is
+ignored. If state persistence fails, Orc reports the failure on stderr after
+still attempting child and terminal cleanup. SIGKILL is an unavoidable
+hard-stop limitation when the operating system cannot reap a survivor.
 
 The active workflow status and role labels are derived from persisted
 `status: active` and `phase`: Igor is active for `implementer`, Rufus for
@@ -440,6 +452,13 @@ Backend and launch failures remain visible in the retained TUI. PTY readers
 close on EOF/error after one final drain, child groups receive SIGTERM within
 two seconds and SIGKILL within one additional second, and Git lookup and
 backend capability probes each time out after five seconds.
+
+Cleanup-produced `orchestrator_exit` records are resumable when both roles are
+inactive and the record validates. CLI and in-place resume preserve identity,
+configuration, limits, requests, handoffs, audit/history, and prior context;
+clear terminal launch/session metadata and `stop_diagnostic`; start a fresh
+deadline and bounded cycle at Igor round 1; and reject active or malformed
+records without mutation.
 
 Before `begin` creates task state, and before CLI or in-place `resume` mutates
 state or launches a child, Orc preflights the selected executable without a
