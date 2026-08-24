@@ -130,6 +130,145 @@ Acceptance criteria:
 - Verification Profile B passes on Linux, with every command and result
   recorded in the handoff and review document.
 
+## TASK-022 - Restore operator input routing
+
+State: NEW
+
+Goal:
+
+- Restore operator-directed pane UX so one selected Igor or Rufus pane controls
+  input, scrolling, highlighting, and Ctrl-R resume targeting while automatic
+  workflow transitions and persisted phase truth remain authoritative.
+
+Dependencies:
+
+- TASK-013 must be `COMPLETED`.
+
+Scope:
+
+- Update the POSIX/Linux Textual input-routing and pane-selection behavior in
+  `orc`; workflow lifecycle decisions and persisted task state remain driven
+  by the existing workflow phase.
+- Add unit and real-PTY tests in `tests/` for both implementer and reviewer
+  sessions, keyboard input, paste input, pane clicks, Tab selection, state
+  polling, handoffs, child retirement, and in-place resume.
+- Update `README.md` and `design_docs/agent_workflow.md` with the unified
+  selected-pane UX, retained pane availability, role-specific Ctrl-R resume,
+  and the distinction between process-local selection and persisted workflow
+  state.
+- Keep one unified selected role process-local and never persist it or include
+  it in handoff context. The selected role is simultaneously the input target,
+  scroll target, Ctrl-R target, and highlighted pane; its highlight is the sole
+  visible selection indication. A pane is unavailable only before that role
+  has ever launched. After launch, it remains selectable for scrolling,
+  highlighting, and Ctrl-R after its child exits or is retired.
+- Before a manual selection, selection follows the active workflow role,
+  including each implementer-to-reviewer or reviewer-to-implementer handover.
+  Tab circularly cycles available launched roles in implementer-then-reviewer
+  order; an available-pane click selects that pane. Either action creates a
+  manual override.
+  The override lasts until the next successful role handover, when the next
+  child has launched and registered; selection then follows the newly active
+  role again. If the next child launch fails, retain the previous valid
+  selection and highlight. Pointer movement never creates a second selection.
+  Selection changes never alter task state, phase, role state, handoff history,
+  deadlines, launches, or audit data.
+- Route the explicitly listed pass-through text, control, navigation, Enter,
+  and paste bytes to the selected live child. If the selected child is not
+  live, route only that write transiently to the live workflow-active child,
+  then to the first other live child in implementer/reviewer order; retain the
+  selected role and its highlight. If no child is live, ignore pass-through
+  input. A live selected child is never replaced by a state-derived
+  destination. Before every input write, move the pane receiving that write to
+  its newest output so the operator can see the input context; fallback routing
+  moves the actual fallback destination pane, while the unified selection
+  remains unchanged.
+- Outside the Ctrl-R prompt, Orc owns `Ctrl-Q` (quit), `Ctrl-R` (open the
+  eligible resume prompt or consume as a no-op), `Escape` (consume as a
+  no-op), `Tab` (circularly select an available launched pane), Page Up, Page
+  Down, Home, and End (consume and scroll the selected pane), and all mouse
+  press, release, move, and click events (consume; an available-pane click
+  changes selection without sending bytes). `Shift-Tab` passes the exact bytes
+  `ESC [ Z`; `1` and `2` pass their literal bytes. Enter passes `\r`, Backspace
+  passes `\x7f`, Delete passes `ESC [3~`, and Up, Down, Right, and Left pass
+  `ESC [A`, `ESC [B`, `ESC [C`, and `ESC [D` respectively. Printable text
+  passes its UTF-8 bytes. Ctrl-A through Ctrl-Z pass their standard ASCII C0
+  bytes except Ctrl-Q and Ctrl-R, which are Orc-owned; Ctrl-\[ is Escape and is
+  consumed as the Escape no-op. Other unmapped, non-character key events are
+  consumed as no-ops. Paste outside the prompt passes its UTF-8 bytes.
+- While the Ctrl-R prompt is open, Ctrl-Q still quits; Ctrl-R and Tab are
+  consumed no-ops that cannot change the resume target; Escape cancels; Page
+  Up, Page Down, Home, and End remain Orc-owned scrolling; mouse events are
+  consumed without changing selection; and all other text, control,
+  navigation, Enter, and paste input belongs to the prompt editor. Enter
+  submits only a non-empty request, and no prompt input reaches either child.
+  With no live child, child-directed pass-through bytes are dropped, while all
+  Orc-owned selection, scrolling, quit, and prompt rules remain available.
+- Ctrl-R is available for every valid resumable terminal outcome: paused,
+  blocked/clarification, completed, and stopped for orchestrator exit, child
+  failure, deadline, maximum rounds, or manual pause, with each outcome's
+  inactive-role predicate satisfied. It targets the unified selected role; an
+  unlaunched role cannot be selected. A non-empty request appends to preserved
+  request, handoff, audit, and prior-context history, retires remaining
+  children, preserves identity/configuration/limits, clears terminal and
+  launch-session metadata, starts a fresh deadline and bounded cycle, sets
+  status active and phase to the selected role, marks only that role active,
+  and launches it. Round 1 denotes the new cycle and does not erase prior
+  round history. The selected role receives the request and then follows the
+  normal handoff lifecycle.
+- `orchestrator_exit` Ctrl-R coverage uses valid state fixtures in TASK-022;
+  TASK-015 remains responsible for producing those records during cleanup and
+  is not a TASK-022 dependency.
+- Do not reload persisted state as the prerequisite for every keystroke. State
+  polling may refresh workflow status and child availability, but it must not
+  overwrite the unified selection except at a role handover or cause input to
+  disappear during a phase transition.
+
+Acceptance criteria:
+
+- In a live TUI with both child PTYs, the operator can select Igor or Rufus by
+  Tab or pane click and verified bytes, including text, Enter, control keys,
+  arrow and other explicitly listed navigation bytes, Shift-Tab, `1`, `2`, and
+  paste, arrive only at the selected child. The one highlighted pane is
+  simultaneously the input, scroll, and Ctrl-R target, and pointer movement
+  does not change it.
+- Real Linux PTY/subprocess tests cover implementer and reviewer routing,
+  selection changes, pointer movement, state polling, role handovers, pane
+  retention after child exit/retirement, child exit between selection and
+  write, failed next-child launch, and the no-live-child case. They prove
+  fallback routing is transient, preserves selection, and reaches the correct
+  live child; a failed handover retains the previous valid highlight.
+- Tests prove clicks, Tab, pointer movement, and ordinary input do not mutate
+  the persisted task record, revision, handoff history, deadline, role
+  lifecycle, or audit data; resume-prompt input remains Orc-owned and is not
+  delivered to either child.
+- Tests prove input moves a manually scrolled receiving pane to the bottom,
+  including the transient fallback destination, without changing the unified
+  selected role or its highlight.
+- Tests cover the complete key/event matrix, including exact pass-through bytes
+  for text, control keys, Enter, Backspace, Delete, arrows, Shift-Tab, `1`,
+  `2`, and paste; Orc ownership for Ctrl-Q, Ctrl-R, Escape, Tab, scrolling,
+  mouse events, and prompt-open input; unknown key no-ops; and no-live-child
+  behavior.
+- Real-PTY tests cover Ctrl-R for every resumable terminal outcome, including
+  completion, max-round, deadline, manual-pause, orchestrator-exit,
+  clarification, and valid child-failure records. They cover selecting Igor or
+  Rufus, rejecting an unlaunched Rufus pane, preserved context/history and
+  configuration, fresh deadlines and round budgets, round-1 new-cycle truth,
+  role-specific launches, handoffs, prompt delivery to only the selected role,
+  and valid orchestrator-exit fixtures without a TASK-015 dependency.
+- Automatic implementer-to-reviewer handoffs, both Codex and Claude launch
+  paths, and normal selected-role handoffs retain their lifecycle behavior;
+  in-place resume launches exactly the selected role with the preserved
+  context and then uses the normal lifecycle.
+- README and workflow documentation state the exact selection, fallback,
+  retained-pane, handover, reserved-key, no-live-child, Ctrl-R, preserved-
+  history, and process-local-state contract consistently, including the fixed
+  implementer-then-reviewer fallback order.
+- Verification Profile B passes on Linux, with every command and result
+  recorded in the handoff and review document. Profile A also passes, with
+  the exact final task commit snapshot used for all evidence.
+
 ## TASK-015 - Make process and signal cleanup reliable
 
 State: NEW

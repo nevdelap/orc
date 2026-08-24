@@ -116,28 +116,75 @@ unavailable.
 
 ## Interaction
 
-The active-agent border follows the persisted mapping: only `active` with
+The active-agent status follows persisted workflow state: only `active` with
 phase `implementer` activates Igor, and only `active` with phase `reviewer`
-activates Rufus. Paused, blocked, stopped, and completed tasks have no active
-role. Mouse presses and releases are consumed and never change roles or reach
-an agent. In the retained UI, `Tab` cycles the scroll target between Igor and
-Rufus and is consumed by Orc; `Shift-Tab`, `1`, and `2` remain pass-through
-input. Page Up/Page Down move the selected pane by one viewport, while Home
-and End move it to the oldest and newest retained output. Up and Down remain
-agent prompt-history input. Moving the pointer over a pane changes only the
-scroll target, never the active-agent border or input destination. Each pane
-retains at least 10,000 logical lines, and new output does not move a manually
-scrolled pane. Ordinary keyboard, control, Enter, and paste input first return
-the active agent's pane to the bottom. `Ctrl-Q` is always the explicit exit
-action.
+activates Rufus. Separately, one process-local selected pane is the input,
+scroll, Ctrl-R, and highlight target. Its highlight is the sole visible
+selection indication; selection is never persisted or included in handoffs.
 
-When a task is paused, blocked, completed with both roles inactive, or stopped
-by a child failure with one failed role and one inactive role, `Ctrl-R` opens
-an Orc-owned follow-up prompt in the same process. Enter submits a non-empty
-request and starts Igor at round 1 with a fresh deadline; Escape cancels and an
-empty request leaves task state unchanged. Active or inconsistent workflows do
-not open the prompt. The task identity, target, backend, configured limits,
-and handoff history remain persisted across this in-place resume.
+A pane is unavailable only before its role has ever launched. After launch it
+remains available for scrolling, highlighting, and Ctrl-R even after its child
+exits or is retired. Before manual selection, the selected pane follows the
+active workflow role, including handovers. `Tab` circularly cycles available
+panes in implementer-then-reviewer order and a click on an available pane
+selects it. Either action creates a manual override until the next successful
+role handover, after the next child has launched and registered, when selection
+follows the newly active role again. If that launch fails, the previous valid
+selection and highlight remain. Pointer movement never changes selection.
+Mouse presses and releases are consumed and never reach an agent.
+Selection changes do not mutate task state, phase, role state, handoffs,
+deadlines, launches, or audit data.
+
+Outside the Ctrl-R prompt, Orc owns `Ctrl-Q` (quit), `Ctrl-R` (open the eligible
+resume prompt or consume as a no-op), `Escape` (consume as a no-op), `Tab`
+(circularly select an available launched pane), Page Up, Page Down, Home, and
+End (scroll the selected pane), and all mouse events. An available-pane click
+changes selection without sending bytes. `Shift-Tab` sends `ESC [ Z`; `1` and
+`2` send literal bytes. Enter sends `\r`, Backspace sends `\x7f`, Delete sends
+`ESC [3~`, and Up, Down, Right, and Left send `ESC [A`, `ESC [B`, `ESC [C`,
+and `ESC [D`. Printable text and paste send UTF-8 bytes. Ctrl-A through Ctrl-Z
+send standard ASCII C0 bytes except Ctrl-Q and Ctrl-R; Ctrl-\[ is the consumed
+Escape no-op. Other unmapped non-character keys are consumed as no-ops.
+
+While the Ctrl-R prompt is open, Ctrl-Q still quits; Ctrl-R and Tab are
+consumed no-ops that cannot change the resume target; Escape cancels; Page Up,
+Page Down, Home, and End remain Orc-owned scrolling; mouse events are consumed
+without changing selection; and all other text, control, navigation, Enter,
+and paste input belongs to the prompt editor. Enter submits only a non-empty
+request, and no prompt input reaches a child. Each pane retains at least
+10,000 logical lines, and new output does not move a manually scrolled pane.
+Before every input write, Orc moves the receiving pane to its newest output.
+Fallback input moves the actual fallback destination pane while preserving the
+selected pane and highlight. With no live child, child-directed bytes are
+dropped while Orc-owned selection, scrolling, quit, and prompt behavior
+remains available.
+
+`Ctrl-R` is always Orc-owned and is available for every valid resumable
+terminal outcome: paused, blocked/clarification, completed, and stopped for
+orchestrator exit, child failure, deadline, maximum rounds, or manual pause.
+The selected launched role receives the non-empty request; an unlaunched role
+cannot be selected. Escape cancels, and Enter or paste in the prompt remains
+Orc-owned; Escape outside the prompt is consumed as a no-op. A successful
+resume preserves identity, configuration, limits,
+requests, handoffs, audit/history, and prior context, starts a fresh deadline
+and bounded cycle, sets that role active at `round 1` of the new cycle, and
+launches it. Prompt text is never written to an agent PTY.
+
+If the selected child is not live, a normal write falls back transiently to
+the live workflow-active child, then the first other live child in
+implementer-then-reviewer order; the selected pane and highlight remain
+unchanged. With no live child, pass-through input is ignored while quit,
+prompt, and scrolling behavior remains active. Clicks on unavailable panes
+and Tab with no additional available pane are consumed.
+
+CLI `resume TASK-ID PROMPT` continues to use the persisted resume matrix and
+starts a fresh cycle at its documented role. In-place `Ctrl-R` uses the
+process-local selected launched pane as its target, as described above; active
+or inconsistent workflows do not open the prompt. Both paths preserve task
+identity, target, backend, configured limits, requests, handoffs, audit/history,
+and prior context while starting a fresh deadline and bounded cycle.
+TASK-022 tests valid `orchestrator_exit` state fixtures; TASK-015 later owns
+production of those records during cleanup.
 
 ## Handoffs and troubleshooting
 

@@ -296,20 +296,78 @@ new role. `Ctrl-Q` is the only normal terminal-state exit path; its existing
 PTY, reader, timer, and child cleanup runs when the UI unmounts, and quitting
 does not delete or rewrite the persisted task record.
 
-The active-agent border is derived only from persisted `status: active` and
-`phase`: Igor is active for `implementer`, Rufus for `reviewer`, and neither
-role is active for terminal statuses. Mouse press/release events are consumed.
-`Shift-Tab`, `1`, and `2` are forwarded to the workflow-active PTY as
-`ESC [ Z`, `1`, and `2`; `Tab` cycles the independent scroll target between
-Igor and Rufus and is consumed by Orc. Page Up/Page Down scroll that target by
-one viewport, Home reaches the oldest retained line, and End reaches the
-newest output. Up and Down remain input for the active agent's prompt history.
-Each pane retains at least 10,000 logical lines. Pointer movement selects only
-the scroll target; it never changes the active role or input destination.
-New output preserves a manually selected scroll position. Keyboard, control,
-Enter, and paste input sent to the active agent first scrolls that pane to the
-bottom. All scrolling keys are consumed by Orc, and all other input is ignored
-when no role is active.
+The active workflow border and role labels are derived from persisted
+`status: active` and `phase`: Igor is active for `implementer`, Rufus for
+`reviewer`, and neither role is active for terminal statuses. Separately, one
+unified selected role is process-local and is never persisted or included in
+handoff context. Its pane is simultaneously the input target, scroll target,
+Ctrl-R target, and highlighted pane; that highlight is the sole visible
+selection indication.
+
+A role pane is unavailable only before that role has ever launched. After its
+first launch, it remains available for scrolling, highlighting, and Ctrl-R
+even when its child exits or is retired. Before a manual selection, selection
+follows the active workflow role, including every successful role handover. Tab
+is consumed by Orc and circularly cycles available launched roles in the fixed
+implementer-then-reviewer order. A click on an available pane selects it.
+Either action creates a manual override that lasts until the next successful
+role handover, after the next child has launched and registered; selection then
+follows the newly active role again. If the next child launch fails, the
+previous valid selection and highlight are retained.
+Pointer movement never creates a second selection. Mouse press and release
+events are always consumed and never reach a child. Selection changes do not
+mutate task phase, role state, handoff history, deadlines, launches, or audit
+data.
+
+Outside the Ctrl-R prompt, Orc owns `Ctrl-Q` (quit), `Ctrl-R` (open the
+eligible resume prompt or consume as a no-op), `Escape` (consume as a no-op),
+`Tab` (circularly select an available launched pane), Page Up, Page Down, Home,
+and End (consume and scroll the selected pane), and all mouse press, release,
+move, and click events (consume; an available-pane click changes selection
+without sending bytes). `Shift-Tab` is forwarded to the selected live child as
+`ESC [ Z`; `1` and `2` are forwarded as literal bytes. Enter is `\r`,
+Backspace is `\x7f`, Delete is `ESC [3~`, and Up, Down, Right, and Left are
+`ESC [A`, `ESC [B`, `ESC [C`, and `ESC [D`. Printable text is forwarded as
+UTF-8 bytes. Ctrl-A through Ctrl-Z use their standard ASCII C0 bytes except
+Ctrl-Q and Ctrl-R, which are Orc-owned; Ctrl-\[ is Escape and is consumed as
+the Escape no-op. Other unmapped, non-character key events are consumed as
+no-ops. Paste outside the prompt is forwarded as UTF-8 bytes.
+
+While the Ctrl-R prompt is open, Ctrl-Q still quits; Ctrl-R and Tab are
+consumed no-ops that cannot change the resume target; Escape cancels; Page Up,
+Page Down, Home, and End remain Orc-owned scrolling; mouse events are consumed
+without changing selection; and all other text, control, navigation, Enter,
+and paste input belongs to the prompt editor. Enter submits only a non-empty
+request, and no prompt input reaches either child. Each pane retains at least
+10,000 logical lines, and new output preserves a manually scrolled position.
+Before every input write, Orc moves the receiving pane to its newest output so
+the operator can see the input context. If fallback routing sends input to
+another live child, Orc moves that fallback destination pane to the newest
+output while retaining the unified selected role and highlight.
+
+If the selected child is not live, route a normal write transiently to the live
+workflow-active child, then to the first other live child in
+implementer-then-reviewer order; retain the selected role and highlight. A
+live selected child is never replaced by a state-derived destination. With no
+live child, child-directed pass-through bytes are dropped while all Orc-owned
+selection, scrolling, quit, and prompt rules remain available.
+
+Ctrl-R is available for every valid resumable terminal outcome: paused,
+blocked/clarification, completed, and stopped for `orchestrator_exit`,
+`child_failure`, `deadline`, `max_rounds`, or `manual_pause`, subject to that
+record's inactive-role predicate. It targets the unified selected role, and
+an unlaunched role cannot be selected. Enter requires a non-empty request;
+Escape cancels and an empty submission leaves state unchanged. A successful
+submission retires remaining children, preserves task identity, target,
+backend, configured limits, requests, handoffs, audit/history, and prior
+context, clears terminal and launch/session metadata, appends the exact
+request, starts a fresh deadline and bounded cycle, sets `status: active`,
+sets `phase` to the selected role, marks only that role active, sets `round: 1`
+as the new cycle while retaining prior round history, and launches that role.
+The selected role then follows the normal handoff lifecycle. State polling may
+refresh workflow status and child availability, but it never overwrites the
+unified selection except at a role handover or loses input during a phase
+transition.
 
 ## Durable state and handoff protocol
 
@@ -322,18 +380,35 @@ interrupted replacement leaves the previous valid record readable.
 
 The workflow transition function is the authority for handoffs, terminal
 events, child failures, polling, CLI resume, and in-place resume. Terminal
-events are idempotent. Resume decisions follow one matrix for both entry
-points: active is rejected as already active; completed, blocked, paused,
-deadline-stopped, maximum-rounds-stopped, manual-pause-stopped, and
-orchestrator-exit-stopped records
-require their documented inactive-role predicates and a non-empty request;
-valid single-role child failures restart that failed role at the current round;
-all other inconsistent records are rejected without mutation. Accepted
-resumes preserve identity, configuration, limits, history, and audit data,
-clear terminal and launch/session metadata, append the exact request, and start
-a fresh deadline. Accepted orchestrator-exit resumes require both roles to be
-inactive, clear `stop_diagnostic`, and start Igor at round 1. Active roles or
-malformed records are rejected without mutation.
+events are idempotent. CLI resume decisions use one matrix: active is rejected
+as already active; completed, blocked, paused, deadline-stopped,
+maximum-rounds-stopped, manual-pause-stopped, and orchestrator-exit-stopped
+records require their documented inactive-role predicates and a non-empty
+request; valid single-role child failures restart that failed role at the
+current round; all other inconsistent records are rejected without mutation.
+Accepted CLI resumes preserve identity, configuration, limits, history, and
+audit data, clear terminal and launch/session metadata, append the exact
+request, start a fresh deadline, and use their documented role (Igor for a
+fresh cycle, or the failed role for a valid child failure). Accepted
+orchestrator-exit CLI resumes require both roles to be inactive, clear
+`stop_diagnostic`, and start Igor at round 1. Active roles or malformed
+records are rejected without mutation.
+
+In-place Ctrl-R uses the same record validation and terminal predicates but
+targets the unified process-local selected role. It is available for paused,
+blocked/clarification, completed, and stopped records whose reason is
+`orchestrator_exit`, `child_failure`, `deadline`, `max_rounds`, or
+`manual_pause`, provided the corresponding roles are inactive (or the valid
+single failed/inactive child-failure pair is present). A role that has never
+launched cannot be selected. Accepted Ctrl-R preserves identity,
+configuration, limits, requests, handoffs, audit data, and prior context;
+appends the exact request, clears terminal and launch/session metadata, starts
+a fresh deadline and bounded cycle, sets `status: active`, `phase` to the
+selected role, marks only that role active, sets `round: 1` as a new cycle,
+and launches the selected role. Active roles or malformed/inconsistent records
+are rejected without mutation. TASK-022 tests valid `orchestrator_exit`
+fixtures; TASK-015 remains responsible for producing those records during
+cleanup and is not a TASK-022 dependency.
 
 Every role generation has a fresh opaque launch token. Its final non-blank line
 must be exactly `ORC_HANDOFF_V1: <JSON object>` with exactly seven fields:
@@ -383,17 +458,18 @@ no configured command is invoked through a shell. Agentbox's backend-specific
 no-permissions option is appended only after a successful preflight and is
 present at most once in the final launch argv.
 
-For `paused`, `blocked`, and `completed` tasks whose rendered roles are both
-`inactive`, for `stopped` tasks with `stop_reason: orchestrator_exit` and both
-roles `inactive`, and for `stopped` tasks with `stop_reason: child_failure`,
-exactly one `failed` role, and one `inactive` role, `Ctrl-R` opens an Orc-owned
-follow-up prompt without restarting the process. Enter requires a non-empty
-request; Escape cancels and an empty submission leaves state unchanged. A
-successful submission retires remaining children, preserves the task identity,
-target, backend, command/version, configured limits, and handoff history,
-clears terminal and role-session metadata, appends the request, starts a fresh
-deadline, sets `status: active`, `phase: implementer`, and `round: 1`, then
-launches Igor. Active or inconsistent records do not open the prompt.
+For every valid resumable terminal record listed above, `Ctrl-R` opens an
+Orc-owned follow-up prompt without restarting the process. The unified selected
+role is the prompt target, and an unlaunched role cannot be selected. Enter
+requires a non-empty request; Escape cancels and an empty submission leaves
+state unchanged. A successful submission retires remaining children,
+preserves identity, target, backend, command/version, configured limits,
+requests, handoffs, audit data, and prior context, clears terminal and
+role-session metadata, appends the request, starts a fresh deadline and
+bounded cycle, sets `status: active`, sets `phase` to the selected role,
+marks only that role active, sets `round: 1` as the new cycle, and launches
+that role. Active or inconsistent records do not open the prompt, and prompt
+text is never written to an agent PTY.
 
 ## Housekeeping
 
