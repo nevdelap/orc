@@ -1022,6 +1022,248 @@ def test_live_textual_resize_focus_and_pty_redraw(
     asyncio.run(exercise())
 
 
+def _start_input_echo_session(app: object, role: str) -> orc.ChildSession:
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import os,tty; tty.setraw(0); os.write(1,b'READY\\n'); "
+            'exec("while True:\\n'
+            " data=os.read(0,1)\\n"
+            " if not data: break\\n"
+            " os.write(1,b'BYTE:'+data.hex().encode())\")"
+        ),
+    ]
+    pid, master_fd = app.fork_codex(command, os.environ.copy())
+    os.set_blocking(master_fd, False)
+    session = orc.ChildSession(role, pid, master_fd, app.pane(role))
+    app.sessions[role] = session
+    app.started_roles.add(role)
+    app.workflow_role = role
+    app.set_master_reader(session)
+    return session
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("role", ["implementer", "reviewer"])
+def test_textual_startup_focus_routes_first_key_to_selected_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, role: str
+) -> None:
+    state_file = tmp_path / "state.json"
+    target = tmp_path / "target"
+    target.mkdir()
+    orc.save_state(
+        state_file,
+        {
+            "TASK-023": {
+                "status": "active",
+                "phase": role,
+                "target_directory": str(target),
+            }
+        },
+    )
+    app = orc.OrcApp(
+        argparse.Namespace(state_file=state_file, codex="codex"), "TASK-023"
+    )
+    monkeypatch.setattr(app, "launch_role", lambda _role: None)
+    session: orc.ChildSession | None = None
+
+    async def exercise() -> None:
+        nonlocal session
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(0.1)
+            prompt = app.query_one("#resume-prompt", orc.Input)
+            assert app.screen.focused is None
+            assert not prompt.can_focus
+            session = _start_input_echo_session(app, role)
+            app._set_selected_role(role, manual=True)
+            app.update_layout()
+            await pilot.pause(0.2)
+
+            await pilot.press("x")
+            await pilot.pause(0.2)
+            output = app.pane(role).render_screen().plain
+            assert "BYTE:78" in output
+
+            await pilot.press("ctrl+a")
+            await pilot.pause(0.2)
+            output = app.pane(role).render_screen().plain
+            assert "BYTE:01" in output
+
+            app.exit()
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        if session is not None:
+            try:
+                os.killpg(session.pid, orc.signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(session.pid, 0)
+            except ChildProcessError:
+                pass
+
+
+@pytest.mark.integration
+def test_textual_resume_prompt_focus_isolates_and_restores_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_file = tmp_path / "state.json"
+    target = tmp_path / "target"
+    target.mkdir()
+    orc.save_state(
+        state_file,
+        {
+            "TASK-023": {
+                "status": "completed",
+                "phase": "complete",
+                "stop_reason": "completion",
+                "target_directory": str(target),
+                "backend": "codex",
+                "backend_command": "codex",
+                "backend_version": "test codex",
+                "max_rounds": 5,
+                "deadline_seconds": 120,
+                "round": 1,
+                "user_requests": [],
+                "handoffs": [],
+                "role_states": {"implementer": "inactive", "reviewer": "inactive"},
+            }
+        },
+    )
+    app = orc.OrcApp(
+        argparse.Namespace(state_file=state_file, codex="codex"), "TASK-023"
+    )
+    app.started_roles.add("implementer")
+    monkeypatch.setattr(app, "launch_role", lambda _role: None)
+    session: orc.ChildSession | None = None
+
+    async def exercise() -> None:
+        nonlocal session
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(0.1)
+            prompt = app.query_one("#resume-prompt", orc.Input)
+            assert app.screen.focused is None
+            assert not prompt.can_focus
+
+            await pilot.press("ctrl+r")
+            await pilot.pause()
+            assert app.resume_prompt_active
+            assert prompt.can_focus
+            assert app.screen.focused is prompt
+
+            session = _start_input_echo_session(app, "implementer")
+            app._set_selected_role("implementer", manual=True)
+            await pilot.pause(0.2)
+            await pilot.press("p")
+            await pilot.pause(0.2)
+            assert prompt.value == "p"
+            assert "BYTE:70" not in app.pane("implementer").render_screen().plain
+
+            await pilot.press("escape")
+            await pilot.pause()
+            assert not app.resume_prompt_active
+            assert not prompt.can_focus
+            assert app.screen.focused is None
+
+            await pilot.press("x")
+            await pilot.pause(0.2)
+            assert "BYTE:78" in app.pane("implementer").render_screen().plain
+            app.exit()
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        if session is not None:
+            try:
+                os.killpg(session.pid, orc.signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(session.pid, 0)
+            except ChildProcessError:
+                pass
+
+
+@pytest.mark.integration
+def test_textual_resume_submission_restores_app_routing_and_ineligible_ctrl_r(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_file = tmp_path / "state.json"
+    target = tmp_path / "target"
+    target.mkdir()
+    orc.save_state(
+        state_file,
+        {
+            "TASK-023": {
+                "status": "completed",
+                "phase": "complete",
+                "stop_reason": "completion",
+                "target_directory": str(target),
+                "backend": "codex",
+                "backend_command": "codex",
+                "backend_version": "test codex",
+                "max_rounds": 5,
+                "deadline_seconds": 120,
+                "round": 1,
+                "user_requests": [],
+                "handoffs": [],
+                "role_states": {"implementer": "inactive", "reviewer": "inactive"},
+            }
+        },
+    )
+    app = orc.OrcApp(
+        argparse.Namespace(state_file=state_file, codex="codex"), "TASK-023"
+    )
+    app.started_roles.add("implementer")
+    launched: list[str] = []
+    monkeypatch.setattr(app, "launch_role", launched.append)
+    session: orc.ChildSession | None = None
+
+    async def exercise() -> None:
+        nonlocal session
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(0.1)
+            prompt = app.query_one("#resume-prompt", orc.Input)
+            launched.clear()
+            await pilot.press("ctrl+r")
+            await pilot.press(*"continue")
+            await pilot.press("enter")
+            await pilot.pause(0.1)
+            assert not app.resume_prompt_active
+            assert not prompt.can_focus
+            assert app.screen.focused is None
+            assert launched
+            assert orc.load_state(state_file)["TASK-023"]["status"] == "active"
+
+            session = _start_input_echo_session(app, "implementer")
+            app._set_selected_role("implementer", manual=True)
+            await pilot.pause(0.2)
+            await pilot.press("ctrl+r")
+            await pilot.pause()
+            assert not app.resume_prompt_active
+            assert app.screen.focused is None
+            await pilot.press("x")
+            await pilot.pause(0.2)
+            assert "BYTE:78" in app.pane("implementer").render_screen().plain
+            app.exit()
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        if session is not None:
+            try:
+                os.killpg(session.pid, orc.signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(session.pid, 0)
+            except ChildProcessError:
+                pass
+
+
 def _pty_size(fd: int) -> tuple[int, int]:
     rows, columns, _, _ = struct.unpack(
         "HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, bytes(8))

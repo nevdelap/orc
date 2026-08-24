@@ -139,6 +139,14 @@ Mouse presses and releases are consumed and never reach an agent.
 Selection changes do not mutate task state, phase, role state, handoffs,
 deadlines, launches, or audit data.
 
+The hidden resume editor is not focusable at startup or during ordinary pane
+operation, including before the first child launch. App-level routing therefore
+receives the first operator keystroke and sends it through the selected-live
+child or the documented fallback. A valid Ctrl-R prompt makes the editor
+focusable and focused; Escape cancellation or completed submission disables
+it and restores app-level routing. An ineligible Ctrl-R remains an Orc-owned
+no-op and never focuses the editor.
+
 Outside the Ctrl-R prompt, Orc owns `Ctrl-Q` (quit), `Ctrl-R` (open the eligible
 resume prompt or consume as a no-op), `Escape` (consume as a no-op), `Tab`
 (circularly select an available launched pane), Page Up, Page Down, Home, and

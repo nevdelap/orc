@@ -332,6 +332,14 @@ events are always consumed and never reach a child. Selection changes do not
 mutate task phase, role state, handoff history, deadlines, launches, or audit
 data.
 
+The hidden `#resume-prompt` editor is not focusable at application startup or
+during ordinary pane operation, including before the first child launch.
+App-level routing consequently receives the first operator keystroke and
+applies the selected-live-child or fallback contract above. A valid Ctrl-R
+prompt makes the editor focusable and focused. Escape cancellation and
+completed submission disable the editor and restore app-level routing. An
+ineligible Ctrl-R remains an Orc-owned no-op and never focuses the editor.
+
 Outside the Ctrl-R prompt, Orc owns `Ctrl-Q` (quit), `Ctrl-R` (open the
 eligible resume prompt or consume as a no-op), `Escape` (consume as a no-op),
 `Tab` (circularly select an available launched pane), Page Up, Page Down, Home,

@@ -271,7 +271,7 @@ Acceptance criteria:
 
 ## TASK-023 - Restore app-level focus for operator input
 
-State: NEW
+State: COMPLETED
 
 Goal:
 

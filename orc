@@ -2277,10 +2277,14 @@ class OrcApp(App[None]):
             Static(ORC_VERSION, id="status-version", markup=False),
             id="status",
         )
-        yield Input(
+        resume_prompt = Input(
             placeholder="Follow-up request (Enter submits, Escape cancels)",
             id="resume-prompt",
         )
+        # The editor is present so it can be opened without rebuilding the
+        # layout, but it must never become Textual's implicit startup focus.
+        resume_prompt.can_focus = False
+        yield resume_prompt
 
     @staticmethod
     def initial_role(record: dict[str, Any]) -> str:
@@ -2294,6 +2298,9 @@ class OrcApp(App[None]):
         if os.name != "posix":
             self.fatal_error("Orc's interactive PTY UI currently requires POSIX.")
             return
+        # Keep app-level routing active until an eligible Ctrl-R prompt is
+        # explicitly opened.
+        self._set_resume_prompt_focus(False)
         self.event_loop = asyncio.get_running_loop()
         self._capture_terminal_state()
         if getattr(self, "_running", False):
@@ -2742,6 +2749,22 @@ class OrcApp(App[None]):
         except Exception:
             return None
 
+    def _set_resume_prompt_focus(self, active: bool) -> None:
+        """Toggle the resume editor's focus lifecycle with its visibility."""
+
+        prompt = self._resume_prompt_widget()
+        if prompt is None:
+            return
+        prompt.can_focus = active
+        if not getattr(self, "_running", False):
+            return
+        if active:
+            self.set_focus(prompt)
+        else:
+            # Unfocus after disabling the widget so Textual cannot select it
+            # again while normal app-level routing is being restored.
+            self.set_focus(None)
+
     def open_resume_prompt(self) -> bool:
         state = load_state(self.args.state_file)
         record = state.get(self.task_id)
@@ -2753,10 +2776,7 @@ class OrcApp(App[None]):
         if prompt is not None:
             prompt.value = ""
             prompt.styles.display = "block"
-            if getattr(self, "_running", False):
-                # Set focus through the app so the prompt receives the next
-                # key event even when it is opened from an app-level handler.
-                self.set_focus(prompt)
+        self._set_resume_prompt_focus(True)
         self.update_status("Resume request: enter a non-empty request")
         return True
 
@@ -2765,8 +2785,7 @@ class OrcApp(App[None]):
         prompt = self._resume_prompt_widget()
         if prompt is not None:
             prompt.styles.display = "none"
-        if getattr(self, "_running", False):
-            self.set_focus(None)
+        self._set_resume_prompt_focus(False)
 
     def _retire_all_sessions(self) -> None:
         sessions = list(self.sessions.values())
