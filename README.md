@@ -2,8 +2,9 @@
 
 Orc is a terminal orchestrator for Igor, the implementer, and Rufus, the
 reviewer. Every `begin` runs bounded automatic Igor/Rufus rounds in a split
-Textual terminal UI. The workflow-active role receives input and has the
-highlighted active-agent border.
+Textual terminal UI. Persisted workflow phase identifies the active role;
+one process-local selected pane owns input, scrolling, resume, and the sole
+selection highlight.
 
 ## Prerequisites
 
@@ -162,6 +163,8 @@ remains available.
 `Ctrl-R` is always Orc-owned and is available for every valid resumable
 terminal outcome: paused, blocked/clarification, completed, and stopped for
 orchestrator exit, child failure, deadline, maximum rounds, or manual pause.
+The orchestrator-exit case requires both persisted role states to be inactive;
+the other outcomes use their documented inactive-role predicates.
 The selected launched role receives the non-empty request; an unlaunched role
 cannot be selected. Escape cancels, and Enter or paste in the prompt remains
 Orc-owned; Escape outside the prompt is consumed as a no-op. A successful
@@ -180,7 +183,9 @@ and Tab with no additional available pane are consumed.
 CLI `resume TASK-ID PROMPT` continues to use the persisted resume matrix and
 starts a fresh cycle at its documented role. In-place `Ctrl-R` uses the
 process-local selected launched pane as its target, as described above; active
-or inconsistent workflows do not open the prompt. Both paths preserve task
+or inconsistent workflows do not open the prompt. Selection is not persisted,
+is not placed in handoff context, and cannot change workflow phase or audit
+data. Both paths preserve task
 identity, target, backend, configured limits, requests, handoffs, audit/history,
 and prior context while starting a fresh deadline and bounded cycle.
 TASK-022 tests valid `orchestrator_exit` state fixtures; TASK-015 later owns
@@ -209,10 +214,10 @@ lines, stream errors, stale generations, and duplicate receipts are rejected
 with bounded diagnostics and do not change scheduling.
 
 Stop reasons are `completion`, `clarification`, `deadline`, `max_rounds`,
-`child_failure`, and the legacy `manual_pause`. Launch, clean-exit, non-zero
-exit, malformed stream, PTY EOF/error, Git lookup, and Claude capability
-failures remain visible in the retained UI; child retirement uses bounded
-`SIGTERM`/`SIGKILL` cleanup.
+`child_failure`, `orchestrator_exit`, and the legacy `manual_pause`. Launch,
+clean-exit, non-zero exit, malformed stream, PTY EOF/error, Git lookup, and
+Claude capability failures remain visible in the retained UI; child retirement
+uses bounded `SIGTERM`/`SIGKILL` cleanup.
 
 For local verification and CI, use the locked environment and these commands:
 

@@ -124,6 +124,7 @@ VALID_STOP_REASONS = {
     "max_rounds",
     "child_failure",
     "manual_pause",
+    "orchestrator_exit",
 }
 TERMINAL_TASK_STATUSES = {"paused", "blocked", "stopped", "completed"}
 SCROLLBACK_LINES = 10_000
@@ -405,6 +406,7 @@ def _validate_state_document(value: Any, path: Path) -> dict[str, Any]:
                 "max_rounds",
                 "manual_pause",
                 "child_failure",
+                "orchestrator_exit",
             }
             if (
                 stop_reason not in valid_reasons
@@ -1225,15 +1227,25 @@ def transition_task(
 
 
 def resume_task_record(
-    record: dict[str, Any], request: str, *, now: datetime | None = None
+    record: dict[str, Any],
+    request: str,
+    *,
+    now: datetime | None = None,
+    selected_role: str | None = None,
 ) -> str:
     """Validate and apply the normative CLI/in-place resume matrix."""
 
     task_id = str(record.get("task_id", "unknown"))
+    requested_role = selected_role
     if not isinstance(request, str) or not request.strip():
         raise SystemExit("resume requires a non-empty clarification or request")
     status = record.get("status")
     reason = record.get("stop_reason")
+    if selected_role is not None and selected_role not in {
+        "implementer",
+        "reviewer",
+    }:
+        raise _resume_inconsistent({**record, "task_id": task_id})
     if status == "active":
         raise SystemExit(f"task {task_id} is already active")
     if status == "completed":
@@ -1249,7 +1261,12 @@ def resume_task_record(
         selected_role = "implementer"
         round_number = 1
     elif status == "stopped":
-        eligible = reason in {"deadline", "max_rounds", "manual_pause"}
+        eligible = reason in {
+            "deadline",
+            "max_rounds",
+            "manual_pause",
+            "orchestrator_exit",
+        }
         selected_role = "implementer"
         round_number = 1
         if reason == "child_failure":
@@ -1279,7 +1296,8 @@ def resume_task_record(
         selected_role = "implementer"
         round_number = 1
     if status in {"completed", "blocked", "paused"} or (
-        status == "stopped" and reason in {"deadline", "max_rounds", "manual_pause"}
+        status == "stopped"
+        and reason in {"deadline", "max_rounds", "manual_pause", "orchestrator_exit"}
     ):
         inactive = all(
             persisted_role_state(record, role) == "inactive"
@@ -1294,6 +1312,12 @@ def resume_task_record(
             eligible = False
     if not eligible:
         raise _resume_inconsistent({**record, "task_id": task_id})
+    if requested_role is not None:
+        selected_role = requested_role
+        # Ctrl-R starts a fresh bounded cycle even when the terminal outcome
+        # was a child failure. CLI resume keeps its documented failed-role
+        # current-round behavior because it does not provide a target role.
+        round_number = 1
     if (
         persisted_role_state(record, "implementer") == "active"
         or persisted_role_state(record, "reviewer") == "active"
@@ -2057,6 +2081,7 @@ class ChildSession:
     system_session_id: str | None = None
     reader_closed: bool = False
     drained: bool = False
+    write_failed: bool = False
 
     def __post_init__(self) -> None:
         if self.stream_events is None:
@@ -2140,8 +2165,13 @@ class OrcApp(App[None]):
         self.sessions: dict[str, ChildSession] = {}
         self.retired_sessions: list[ChildSession] = []
         self.started_roles: set[str] = set()
-        self.active_role: str | None = "implementer"
-        self.scroll_target = "implementer"
+        # Selection is deliberately process-local.  It is the one target for
+        # input, scrolling, resume, and the pane highlight; workflow phase is
+        # kept separately and remains authoritative in persisted state.
+        self.selected_role: str | None = "implementer"
+        self.active_role: str | None = "implementer"  # compatibility alias
+        self.manual_selection = False
+        self.workflow_role: str | None = None
         self.resume_prompt_active = False
         self.resume_prompt_value = ""
         self.layout_mode = ""
@@ -2211,9 +2241,7 @@ class OrcApp(App[None]):
         return phase if phase in {"implementer", "reviewer"} else "implementer"
 
     def active_workflow_role(self, record: dict[str, Any]) -> str | None:
-        role = workflow_active_role(record)
-        self.active_role = role
-        return role
+        return workflow_active_role(record)
 
     def on_mount(self) -> None:
         if os.name != "posix":
@@ -2469,17 +2497,72 @@ class OrcApp(App[None]):
             self.refresh_status()
 
     def scroll_pane(self) -> SessionPane:
-        """Return the pane currently selected for scroll navigation."""
+        """Return the one pane selected for scroll navigation."""
 
-        target = getattr(self, "scroll_target", "implementer")
+        target = self._selected_role()
         if target not in {"implementer", "reviewer"}:
             target = "implementer"
-            self.scroll_target = target
+            self._set_selected_role(target, manual=False)
         return self.pane(target)
 
-    def cycle_scroll_target(self) -> None:
-        current = getattr(self, "scroll_target", "implementer")
-        self.scroll_target = "reviewer" if current == "implementer" else "implementer"
+    def _selected_role(self) -> str | None:
+        selected = getattr(self, "selected_role", None)
+        if selected in {"implementer", "reviewer"}:
+            return str(selected)
+        # A small compatibility fallback keeps test doubles and older callers
+        # safe without creating a second persisted or process-local target.
+        active = getattr(self, "active_role", None)
+        if active in {"implementer", "reviewer"}:
+            return str(active)
+        if not hasattr(self, "selected_role") and not hasattr(self, "active_role"):
+            return "implementer"
+        return None
+
+    def _set_selected_role(self, role: str, *, manual: bool) -> None:
+        if role not in {"implementer", "reviewer"}:
+            return
+        self.selected_role = role
+        # Keep the historical attribute as a non-authoritative alias for
+        # callers that only inspect it; all routing uses selected_role.
+        self.active_role = role
+        if manual:
+            self.manual_selection = True
+
+    def _role_is_available(self, role: str) -> bool:
+        started_roles = getattr(self, "started_roles", None)
+        # Older lightweight callers that construct an OrcApp test double
+        # without the lifecycle set represent the initial Igor pane only.
+        # Real applications always initialize started_roles, so an empty set
+        # still correctly means that no role is available yet.
+        if started_roles is None:
+            return role == "implementer"
+        if role in started_roles:
+            return True
+        if role in getattr(self, "sessions", {}):
+            return True
+        return any(
+            getattr(session, "role", None) == role
+            for session in getattr(self, "retired_sessions", [])
+        )
+
+    def available_roles(self) -> list[str]:
+        return [
+            role
+            for role in ("implementer", "reviewer")
+            if self._role_is_available(role)
+        ]
+
+    def cycle_selected_role(self) -> None:
+        available = self.available_roles()
+        if not available:
+            return
+        current = self._selected_role()
+        if current not in available:
+            next_role = available[0]
+        else:
+            next_role = available[(available.index(current) + 1) % len(available)]
+        self._set_selected_role(next_role, manual=True)
+        self.update_layout()
 
     @staticmethod
     def _mouse_role(event: Any) -> str | None:
@@ -2491,12 +2574,18 @@ class OrcApp(App[None]):
             widget = getattr(widget, "parent", None)
         return None
 
-    def select_scroll_target(self, event: Any) -> None:
+    def select_pane(self, event: Any) -> None:
         role = self._mouse_role(event)
-        if role is not None:
-            self.scroll_target = role
+        if role is not None and self._role_is_available(role):
+            self._set_selected_role(role, manual=True)
+            self.update_layout()
 
     def can_resume_in_place(self, record: dict[str, Any]) -> bool:
+        selected_role = self._selected_role()
+        if selected_role not in {"implementer", "reviewer"}:
+            return False
+        if not self._role_is_available(selected_role):
+            return False
         if record.get("schema_version") == STATE_SCHEMA_VERSION:
             if any(
                 not session.exited and not getattr(session, "retired", False)
@@ -2509,16 +2598,35 @@ class OrcApp(App[None]):
                 )
                 backend_from_record(record)
                 candidate = copy.deepcopy(record)
-                resume_task_record(candidate, "in-place resume validation")
+                resume_task_record(
+                    candidate,
+                    "in-place resume validation",
+                    selected_role=selected_role,
+                )
             except (SystemExit, TypeError, ValueError):
                 return False
             return True
         status = record.get("status")
-        implementer_state = self.role_state(record, "implementer")
-        reviewer_state = self.role_state(record, "reviewer")
+        state_values = record.get("role_states")
+        if isinstance(state_values, dict):
+            implementer_state = persisted_role_state(record, "implementer")
+            reviewer_state = persisted_role_state(record, "reviewer")
+        else:
+            implementer_state = self.role_state(record, "implementer")
+            reviewer_state = self.role_state(record, "reviewer")
         if status in {"paused", "blocked", "completed"}:
             return implementer_state == reviewer_state == "inactive"
-        if status != "stopped" or record.get("stop_reason") != "child_failure":
+        if status != "stopped":
+            return False
+        reason = record.get("stop_reason")
+        if reason in {
+            "deadline",
+            "max_rounds",
+            "manual_pause",
+            "orchestrator_exit",
+        }:
+            return implementer_state == reviewer_state == "inactive"
+        if reason != "child_failure":
             return False
         return sorted((implementer_state, reviewer_state)) == [
             "failed",
@@ -2605,6 +2713,10 @@ class OrcApp(App[None]):
             return False
         if record.get("schema_version") == STATE_SCHEMA_VERSION:
             self._retire_all_sessions()
+            selected_role = self._selected_role()
+            if selected_role not in {"implementer", "reviewer"}:
+                self.update_status("Resume request rejected: no selected pane")
+                return False
 
             def apply(current: dict[str, Any] | None) -> str:
                 if current is None:
@@ -2612,22 +2724,23 @@ class OrcApp(App[None]):
                 current["task_id"] = self.task_id
                 if not current.get("backend_version"):
                     current["backend_version"] = backend_version
-                return resume_task_record(current, request)
+                return resume_task_record(current, request, selected_role=selected_role)
 
             try:
-                selected_role = mutate_task_state(
+                resumed_role = mutate_task_state(
                     self.args.state_file, self.task_id, apply
                 )
             except SystemExit as error:
                 self.update_status(str(error))
                 return False
             self.close_resume_prompt()
-            self.active_role = selected_role
+            self.workflow_role = None
+            self._set_selected_role(resumed_role, manual=False)
             if getattr(self, "_running", False):
                 self.update_layout()
             else:
                 self.refresh_status()
-            self.launch_role(selected_role)
+            self.launch_role(resumed_role)
             return True
         max_rounds = valid_round_limit(record.get("max_rounds"))
         deadline_seconds = valid_deadline_seconds(record.get("deadline_seconds"))
@@ -2636,6 +2749,10 @@ class OrcApp(App[None]):
             return False
 
         self._retire_all_sessions()
+        selected_role = self._selected_role()
+        if selected_role not in {"implementer", "reviewer"}:
+            self.update_status("Resume request rejected: no selected pane")
+            return False
         requests = record.get("user_requests", [])
         if not isinstance(requests, list):
             requests = []
@@ -2656,7 +2773,11 @@ class OrcApp(App[None]):
             record.pop(key, None)
         record["stop_reason"] = None
         record["status"] = "active"
-        record["phase"] = "implementer"
+        record["phase"] = selected_role
+        record["role_states"] = {
+            "implementer": "active" if selected_role == "implementer" else "inactive",
+            "reviewer": "active" if selected_role == "reviewer" else "inactive",
+        }
         record["round"] = 1
         if not record.get("backend_version"):
             record["backend_version"] = backend_version
@@ -2682,12 +2803,13 @@ class OrcApp(App[None]):
         ).isoformat(timespec="seconds")
         save_state(self.args.state_file, state)
         self.close_resume_prompt()
-        self.active_role = "implementer"
+        self.workflow_role = None
+        self._set_selected_role(selected_role, manual=False)
         if getattr(self, "_running", False):
             self.update_layout()
         else:
             self.refresh_status()
-        self.launch_role("implementer")
+        self.launch_role(selected_role)
         return True
 
     def record_child_failure(
@@ -2747,6 +2869,8 @@ class OrcApp(App[None]):
             and not existing.exited
             and not getattr(existing, "retired", False)
         ):
+            if getattr(self, "workflow_role", None) is None:
+                self.workflow_role = role
             return
         state = load_state(self.args.state_file)
         record = state.get(self.task_id)
@@ -3061,7 +3185,17 @@ class OrcApp(App[None]):
         session.round = current_round(record)
         self.sessions[role] = session
         self.started_roles.add(role)
-        self.active_role = role
+        previous_workflow_role = getattr(self, "workflow_role", None)
+        self.workflow_role = role
+        if previous_workflow_role != role:
+            # A successful child registration is the handover boundary.  A
+            # failed launch never reaches this point, so the prior selection
+            # and highlight remain intact in that case.
+            if previous_workflow_role is not None:
+                self.manual_selection = False
+                self._set_selected_role(role, manual=False)
+            elif not getattr(self, "manual_selection", False):
+                self._set_selected_role(role, manual=False)
         self.update_layout()
         self.set_master_reader(session)
         self.resize_session(session)
@@ -3429,26 +3563,59 @@ class OrcApp(App[None]):
         return True
 
     def write_active(self, data: bytes) -> None:
-        state = load_state(self.args.state_file)
-        record = state.get(self.task_id)
-        if not isinstance(record, dict):
-            return
-        role = workflow_active_role(record)
-        if role is None:
-            self.active_role = None
-            return
-        self.active_role = role
-        session = self.sessions.get(role)
-        if session is None or session.exited:
-            return
-        scroll_end = getattr(session.pane, "scroll_to_end", None)
-        if callable(scroll_end):
-            scroll_end()
-        try:
-            os.write(session.master_fd, data)
-        except OSError as error:
-            if error.errno not in (errno.EPIPE, errno.EBADF):
-                self.update_status(f"could not write to {session.role}: {error}")
+        """Write pass-through input to the selected live child.
+
+        Routing intentionally uses only process-local session/workflow
+        metadata.  Persisted state is polled on its own cadence and is never
+        reloaded as a prerequisite for a keystroke.
+        """
+
+        selected = self._selected_role()
+        workflow_role = getattr(self, "workflow_role", None)
+        candidates = [selected, workflow_role, "implementer", "reviewer"]
+        attempted: set[str] = set()
+        for role in candidates:
+            if role not in {"implementer", "reviewer"}:
+                continue
+            if role in attempted:
+                continue
+            attempted.add(role)
+            candidate = self.sessions.get(role)
+            if (
+                candidate is not None
+                and not getattr(candidate, "exited", False)
+                and not getattr(candidate, "retired", False)
+                and getattr(candidate, "master_fd", -1) >= 0
+            ):
+                scroll_end = getattr(candidate.pane, "scroll_to_end", None)
+                if callable(scroll_end):
+                    scroll_end()
+                remaining = data
+                while remaining:
+                    try:
+                        written = os.write(candidate.master_fd, remaining)
+                    except OSError as error:
+                        if error.errno in (errno.EIO, errno.EPIPE, errno.EBADF):
+                            # The child can disappear after the liveness check
+                            # and before this write.  Keep the selected role
+                            # unchanged and retry the remaining bytes using
+                            # the deterministic fallback order.
+                            candidate.write_failed = True
+                            self.close_master_reader(candidate)
+                            self.close_session_fd(candidate)
+                            break
+                        self.update_status(
+                            f"could not write to {candidate.role}: {error}"
+                        )
+                        return
+                    if written <= 0:
+                        candidate.write_failed = True
+                        self.close_master_reader(candidate)
+                        self.close_session_fd(candidate)
+                        break
+                    remaining = remaining[written:]
+                else:
+                    return
 
     def retire_session(self, session: ChildSession) -> None:
         """Stop a child after a normal handoff without treating it as a failure."""
@@ -3583,11 +3750,6 @@ class OrcApp(App[None]):
         width = self.size.width
         height = self.size.height - 1
         panes = self.query_one("#panes", Container)
-        state = load_state(self.args.state_file)
-        record = state.get(self.task_id)
-        active_role = (
-            self.active_workflow_role(record) if isinstance(record, dict) else None
-        )
 
         if width >= 120 and width >= height * 1.35:
             mode = "side-by-side"
@@ -3603,13 +3765,13 @@ class OrcApp(App[None]):
             pane = self.pane(role)
             pane.styles.width = "1fr"
             pane.styles.height = "1fr"
-            if role == active_role:
+            if role == self._selected_role():
                 pane.add_class("active-pane")
             else:
                 pane.remove_class("active-pane")
             pane.styles.display = (
                 "block"
-                if mode != "single" or role == (active_role or "implementer")
+                if mode != "single" or role == (self._selected_role() or "implementer")
                 else "none"
             )
 
@@ -3644,9 +3806,11 @@ class OrcApp(App[None]):
 
         status = record.get("status")
         if status == "completed":
+            self.workflow_role = None
             self.refresh_workflow_ui()
             return
         if status in {"paused", "blocked", "stopped"}:
+            self.workflow_role = None
             self.refresh_workflow_ui()
             return
 
@@ -3769,7 +3933,7 @@ class OrcApp(App[None]):
                     set_stop_reason(record, "child_failure")
                     save_state(self.args.state_file, state)
                     self.refresh_workflow_ui()
-                elif session.role == self.active_role and not expected_handoff:
+                elif session.role == self._selected_role() and not expected_handoff:
                     self.refresh_status()
                 self.refresh_status()
 
@@ -3780,16 +3944,27 @@ class OrcApp(App[None]):
             event.stop()
             return
         if getattr(self, "resume_prompt_active", False):
-            if key == "escape":
+            if key in {"ctrl+r", "tab"}:
+                event.stop()
+            elif key == "escape":
                 self.close_resume_prompt()
+                event.stop()
+            elif key in {"pageup", "pagedown", "home", "end"}:
+                scroll_actions = {
+                    "pageup": lambda: self.scroll_pane().scroll_page(-1),
+                    "pagedown": lambda: self.scroll_pane().scroll_page(1),
+                    "home": lambda: self.scroll_pane().scroll_to_home(),
+                    "end": lambda: self.scroll_pane().scroll_to_end(),
+                }
+                scroll_actions[key]()
                 event.stop()
             return
         if key == "ctrl+r":
-            if self.open_resume_prompt():
-                event.stop()
-                return
+            self.open_resume_prompt()
+            event.stop()
+            return
         if key == "tab":
-            self.cycle_scroll_target()
+            self.cycle_selected_role()
             event.stop()
             return
         scroll_actions = {
@@ -3811,9 +3986,13 @@ class OrcApp(App[None]):
             "down": b"\x1b[B",
             "right": b"\x1b[C",
             "left": b"\x1b[D",
-            "escape": b"\x1b",
             "shift+tab": b"\x1b[Z",
+            "1": b"1",
+            "2": b"2",
         }
+        if key in {"escape", "ctrl+["}:
+            event.stop()
+            return
         data = special_keys.get(key)
         if data is None and key.startswith("ctrl+") and len(key) == 6:
             data = bytes([ord(key[-1].upper()) - ord("@")])
@@ -3846,6 +4025,8 @@ class OrcApp(App[None]):
             event.stop()
 
     def on_click(self, event: Click) -> None:
+        if not getattr(self, "resume_prompt_active", False):
+            self.select_pane(event)
         event.stop()
 
     def on_mouse_down(self, event: MouseDown) -> None:
@@ -3858,7 +4039,6 @@ class OrcApp(App[None]):
         event.stop()
 
     def on_mouse_move(self, event: MouseMove) -> None:
-        self.select_scroll_target(event)
         event.stop()
 
     async def action_quit(self) -> None:

@@ -6,10 +6,12 @@ import fcntl
 import importlib.util
 import json
 import os
+import select
 import struct
 import subprocess
 import sys
 import termios
+import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -461,6 +463,387 @@ def test_fork_codex_runs_in_target_directory(tmp_path: Path) -> None:
     assert str(target) in output
 
 
+def _wait_for_pty_marker(fd: int, marker: bytes = b"DONE") -> bytes:
+    deadline = time.monotonic() + 3
+    output = b""
+    while marker not in output and time.monotonic() < deadline:
+        ready, _write, _error = select.select(
+            [fd], [], [], max(deadline - time.monotonic(), 0)
+        )
+        if not ready:
+            break
+        output += os.read(fd, 4096)
+    assert marker in output
+    return output
+
+
+def _wait_for_pty_eof(fd: int) -> None:
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        ready, _write, _error = select.select(
+            [fd], [], [], max(deadline - time.monotonic(), 0)
+        )
+        if not ready:
+            break
+        try:
+            data = os.read(fd, 4096)
+        except OSError as error:
+            if error.errno == orc.errno.EIO:
+                return
+            raise
+        if not data:
+            return
+    pytest.fail("PTY did not reach EOF")
+
+
+def _wait_for_file(path: Path) -> None:
+    deadline = time.monotonic() + 3
+    while not path.exists() and time.monotonic() < deadline:
+        select.select([], [], [], 0.01)
+    assert path.exists()
+
+
+def _pty_receiver_command() -> list[str]:
+    code = (
+        "import os,pathlib,sys,tty; tty.setraw(0); os.write(1,b'READY'); "
+        "data=os.read(0,4096); pathlib.Path(sys.argv[1]).write_bytes(data); "
+        "os.write(1,b'DONE')"
+    )
+    return [sys.executable, "-c", code]
+
+
+def _pty_exit_command(status: int = 7) -> list[str]:
+    code = f"import os; os.write(1,b'READY'); os._exit({status})"
+    return [sys.executable, "-c", code]
+
+
+@pytest.mark.integration
+def test_real_pty_selected_routing_and_exit_race_fallback(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    reviewer_capture = tmp_path / "reviewer-input"
+    implementer_capture = tmp_path / "implementer-input"
+    app = orc.OrcApp.__new__(orc.OrcApp)
+    app.selected_role = "reviewer"
+    app.active_role = "reviewer"
+    app.workflow_role = "implementer"
+    app.sessions = {}
+    app.started_roles = {"implementer", "reviewer"}
+    panes = {"implementer": FakePane(), "reviewer": FakePane()}
+    app.pane = lambda role: panes[role]
+    app.event_loop = None
+    children: list[tuple[int, int]] = []
+
+    try:
+        for role, capture in (
+            ("implementer", implementer_capture),
+            ("reviewer", reviewer_capture),
+        ):
+            command = [*_pty_receiver_command(), str(capture)]
+            pid, master_fd = app.fork_codex(command, os.environ.copy(), target)
+            os.set_blocking(master_fd, False)
+            children.append((pid, master_fd))
+            app.sessions[role] = orc.ChildSession(role, pid, master_fd, panes[role])
+
+        for role in ("implementer", "reviewer"):
+            _wait_for_pty_marker(app.sessions[role].master_fd, b"READY")
+        routing_bytes = b"text\r\x7f\x1b[3~\x1b[A\x1b[B\x1b[C\x1b[D\x1b[Z12\x03"
+        app.write_active(routing_bytes)
+        _wait_for_file(reviewer_capture)
+        _wait_for_pty_marker(app.sessions["reviewer"].master_fd)
+        os.waitpid(children[1][0], 0)
+        assert reviewer_capture.read_bytes() == routing_bytes
+
+        # The selected session has exited, but its local session flag has not
+        # been polled yet. Closing its stale PTY master models the race's
+        # failed write, and the remaining live child receives the same input
+        # through fallback.
+        os.close(children[1][1])
+        children[1] = (children[1][0], -1)
+        app.write_active(b"fallback-bytes")
+        _wait_for_file(implementer_capture)
+        os.waitpid(children[0][0], 0)
+        assert implementer_capture.read_bytes() == b"fallback-bytes"
+        assert app.selected_role == "reviewer"
+        assert panes["implementer"].scrolls == 1
+    finally:
+        for pid, master_fd in children:
+            try:
+                os.killpg(pid, orc.signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
+
+
+@pytest.mark.integration
+def test_real_pty_rejects_unlaunched_pane_and_drops_without_live_child(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    capture = tmp_path / "implementer-input"
+    app = orc.OrcApp.__new__(orc.OrcApp)
+    app.selected_role = "implementer"
+    app.active_role = "implementer"
+    app.workflow_role = "implementer"
+    app.sessions = {}
+    app.started_roles = {"implementer"}
+    panes = {"implementer": FakePane(), "reviewer": FakePane()}
+    app.pane = lambda role: panes[role]
+    app.event_loop = None
+    app.update_layout = lambda: None
+    pid, master_fd = app.fork_codex(
+        [*_pty_receiver_command(), str(capture)], os.environ.copy(), target
+    )
+    os.set_blocking(master_fd, False)
+    session = orc.ChildSession("implementer", pid, master_fd, panes["implementer"])
+    app.sessions["implementer"] = session
+
+    try:
+        _wait_for_pty_marker(master_fd, b"READY")
+        app.cycle_selected_role()
+        assert app.selected_role == "implementer"
+        app.write_active(b"first-input")
+        _wait_for_file(capture)
+        _wait_for_pty_marker(master_fd)
+        os.waitpid(pid, 0)
+        session.exited = True
+
+        app.write_active(b"ignored-with-no-live-child")
+        assert capture.read_bytes() == b"first-input"
+        assert app.selected_role == "implementer"
+    finally:
+        try:
+            os.killpg(pid, orc.signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+
+
+@pytest.mark.integration
+def test_real_pty_failed_next_child_launch_keeps_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    capture = tmp_path / "implementer-input"
+    record: dict[str, object] = {
+        "status": "active",
+        "phase": "reviewer",
+        "target_directory": str(target),
+        "prompt": "p",
+        "user_requests": [],
+    }
+    app, _state_file, panes = app_stub(tmp_path, record)
+    app.sessions = {}
+    app.started_roles = {"implementer"}
+    app.selected_role = "implementer"
+    app.active_role = "implementer"
+    app.workflow_role = "implementer"
+    pid, master_fd = app.fork_codex(
+        [*_pty_receiver_command(), str(capture)], os.environ.copy(), target
+    )
+    os.set_blocking(master_fd, False)
+    app.sessions["implementer"] = orc.ChildSession(
+        "implementer", pid, master_fd, panes["implementer"]
+    )
+    errors: list[str] = []
+    monkeypatch.setattr(
+        app,
+        "fork_codex",
+        lambda *_args: (_ for _ in ()).throw(OSError("next child unavailable")),
+    )
+    monkeypatch.setattr(app, "fatal_error", errors.append)
+    monkeypatch.setattr(app, "update_status", lambda _message: None)
+    monkeypatch.setattr(app, "refresh_status", lambda: None)
+
+    try:
+        _wait_for_pty_marker(master_fd, b"READY")
+        app.launch_role("reviewer")
+        assert any("could not launch reviewer" in error for error in errors)
+        assert app.selected_role == "implementer"
+        assert app.workflow_role == "implementer"
+        assert "reviewer" not in app.sessions
+        assert app.started_roles == {"implementer"}
+    finally:
+        try:
+            os.killpg(pid, orc.signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+
+
+@pytest.mark.integration
+def test_real_pty_write_failure_is_reaped_and_records_child_failure(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    record: dict[str, object] = {
+        "status": "active",
+        "phase": "reviewer",
+        "target_directory": str(target),
+        "prompt": "p",
+        "user_requests": [],
+    }
+    app, state_file, panes = app_stub(tmp_path, record)
+    app.sessions = {}
+    app.started_roles = {"reviewer"}
+    app.selected_role = "reviewer"
+    app.active_role = "reviewer"
+    app.workflow_role = "reviewer"
+    pid, master_fd = app.fork_codex(_pty_exit_command(), os.environ.copy(), target)
+    os.set_blocking(master_fd, False)
+    session = orc.ChildSession("reviewer", pid, master_fd, panes["reviewer"])
+    app.sessions["reviewer"] = session
+
+    def no_refresh() -> None:
+        pass
+
+    app.refresh_workflow_ui = no_refresh
+    app.refresh_status = no_refresh
+    app.update_status = lambda _message: None
+
+    try:
+        _wait_for_pty_marker(master_fd, b"READY")
+        _wait_for_pty_eof(master_fd)
+        os.close(master_fd)
+        master_fd = -1
+        app.write_active(b"lost-input")
+        assert session.write_failed
+        assert session.master_fd == -1
+        assert session.reader_closed
+
+        app.poll_children()
+        saved = orc.load_state(state_file)["TASK-003"]
+        assert saved["status"] == "stopped"
+        assert saved["stop_reason"] == "child_failure"
+        assert saved["child_failure"]["role"] == "reviewer"
+        with pytest.raises(ChildProcessError):
+            os.waitpid(pid, os.WNOHANG)
+    finally:
+        try:
+            os.killpg(pid, orc.signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "status,reason,phase",
+    [
+        ("paused", "manual_pause", "paused"),
+        ("blocked", "clarification", "blocked"),
+        ("completed", "completion", "complete"),
+        ("stopped", "deadline", "stopped"),
+        ("stopped", "max_rounds", "stopped"),
+        ("stopped", "manual_pause", "stopped"),
+        ("stopped", "orchestrator_exit", "stopped"),
+        ("stopped", "child_failure", "stopped"),
+    ],
+)
+def test_real_pty_ctrl_r_launches_selected_reviewer_for_terminal_outcomes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    reason: str,
+    phase: str,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    executable = tmp_path / "resume fake"
+    capture = tmp_path / "resume-role"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import os, pathlib\n"
+        "pathlib.Path(os.environ['ORC_CAPTURE']).write_text(os.environ['ORC_ROLE'])\n"
+    )
+    executable.chmod(0o755)
+    monkeypatch.setenv("ORC_CAPTURE", str(capture))
+    monkeypatch.setattr(orc, "preflight_backend", lambda *_args: "fake version")
+    record: dict[str, object] = {
+        "status": status,
+        "phase": phase,
+        "stop_reason": reason,
+        "target_directory": str(target),
+        "backend": "codex",
+        "backend_command": str(executable),
+        "backend_version": "old version",
+        "max_rounds": 5,
+        "deadline_seconds": 120,
+        "round": 3,
+        "user_requests": ["old request"],
+        "handoffs": [{"role": "implementer", "message": "history"}],
+        "role_states": {"implementer": "inactive", "reviewer": "inactive"},
+        "implementer_id": "old-igor",
+        "reviewer_id": "old-rufus",
+    }
+    if status == "blocked":
+        record["blocker_role"] = "implementer"
+        record["blocker_reason"] = "need clarification"
+    if reason == "child_failure":
+        record["child_failure"] = {"role": "reviewer", "exit_status": 1}
+        record["role_states"] = {
+            "implementer": "inactive",
+            "reviewer": "failed",
+        }
+    app, state_file, _panes = app_stub(tmp_path, record)
+    app.started_roles = {"implementer", "reviewer"}
+    app.selected_role = "reviewer"
+    app.active_role = "reviewer"
+    app.resume_prompt_active = True
+    app.close_resume_prompt = lambda: None
+    app.set_master_reader = lambda _session: None
+    app.resize_session = lambda _session: None
+    app.update_layout = lambda: None
+    app.refresh_status = lambda: None
+    app.update_status = lambda _message: None
+
+    assert app.submit_resume_request("resume as reviewer")
+    session = app.sessions["reviewer"]
+    _pid, child_status = os.waitpid(session.pid, 0)
+    assert os.WIFEXITED(child_status)
+    assert capture.read_text() == "reviewer"
+    saved = orc.load_state(state_file)["TASK-003"]
+    assert saved["status"] == "active"
+    assert saved["phase"] == "reviewer"
+    assert saved["round"] == 1
+    assert saved["handoffs"] == record["handoffs"]
+    assert "selected_role" not in saved
+    os.close(session.master_fd)
+
+
 def test_session_pane_preserves_ansi_and_resizes() -> None:
     pane = orc.SessionPane("implementer")
     pane.feed(b"\x1b[31mred\x1b[0m\n")
@@ -577,17 +960,17 @@ def test_live_textual_resize_focus_and_pty_redraw(
 
                 assert await pilot.click("#reviewer")
                 await pilot.pause()
-                assert app.active_role == "implementer"
+                assert app.selected_role == "reviewer"
                 await pilot.press("tab")
                 await pilot.pause()
-                assert app.active_role == "implementer"
+                assert app.selected_role == "implementer"
                 await pilot.click("#reviewer")
                 await pilot.pause()
-                assert app.active_role == "implementer"
+                assert app.selected_role == "reviewer"
                 assert "active" in app.last_status
                 assert "Ctrl-Q exits" in app.last_status
-                assert "active-pane" not in app.pane("reviewer").classes
-                assert "active-pane" in app.pane("implementer").classes
+                assert "active-pane" in app.pane("reviewer").classes
+                assert "active-pane" not in app.pane("implementer").classes
 
                 await pilot.resize_terminal(80, 40)
                 await pilot.pause(0.1)
@@ -669,8 +1052,9 @@ def test_orc_input_forwarding_and_scroll_navigation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app = orc.OrcApp.__new__(orc.OrcApp)
+    app.selected_role = "implementer"
     app.active_role = "implementer"
-    app.scroll_target = "implementer"
+    app.started_roles = {"implementer", "reviewer"}
     app.layout_mode = "side-by-side"
     writes: list[bytes] = []
     monkeypatch.setattr(app, "write_active", writes.append)
@@ -693,8 +1077,8 @@ def test_orc_input_forwarding_and_scroll_navigation(
 
     tab = Event("tab", "\t")
     app.on_key(tab)
-    assert app.active_role == "implementer"
-    assert app.scroll_target == "reviewer"
+    assert app.active_role == "reviewer"
+    assert app.selected_role == "reviewer"
     assert tab.stopped
     assert writes == [b"\r", b"c", b"\x03", b"\x1b[Z", b"1", b"2"]
 
@@ -716,7 +1100,9 @@ def test_orc_input_forwarding_and_scroll_navigation(
 
 def test_paste_click_and_find_task_role(monkeypatch: pytest.MonkeyPatch) -> None:
     app = orc.OrcApp.__new__(orc.OrcApp)
+    app.selected_role = "implementer"
     app.active_role = "implementer"
+    app.started_roles = {"implementer"}
     app.layout_mode = "side-by-side"
     app.sessions = {}
     writes: list[bytes] = []
@@ -753,6 +1139,209 @@ def test_paste_click_and_find_task_role(monkeypatch: pytest.MonkeyPatch) -> None
     assert orc.find_task_role({}, "missing") == (None, None)
 
 
+def test_selected_role_fallback_is_transient_and_moves_destination_to_bottom(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = orc.OrcApp.__new__(orc.OrcApp)
+    app.selected_role = "reviewer"
+    app.active_role = "reviewer"
+    app.workflow_role = "implementer"
+    app.started_roles = {"implementer", "reviewer"}
+    panes = {"implementer": FakePane(), "reviewer": FakePane()}
+    app.sessions = {
+        "implementer": argparse.Namespace(
+            role="implementer",
+            master_fd=11,
+            pane=panes["implementer"],
+            exited=False,
+            retired=False,
+        ),
+        "reviewer": argparse.Namespace(
+            role="reviewer",
+            master_fd=12,
+            pane=panes["reviewer"],
+            exited=True,
+            retired=False,
+        ),
+    }
+    writes: list[tuple[int, bytes]] = []
+    monkeypatch.setattr(
+        orc.os,
+        "write",
+        lambda fd, data: writes.append((fd, data)) or len(data),
+    )
+
+    app.write_active(b"fallback")
+
+    assert writes == [(11, b"fallback")]
+    assert panes["implementer"].scrolls == 1
+    assert app.selected_role == "reviewer"
+    assert app.active_role == "reviewer"
+
+
+def test_pty_write_race_retries_fallback_and_keeps_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = orc.OrcApp.__new__(orc.OrcApp)
+    app.selected_role = "reviewer"
+    app.active_role = "reviewer"
+    app.workflow_role = "implementer"
+    app.event_loop = None
+    app.sessions = {
+        "reviewer": argparse.Namespace(
+            role="reviewer",
+            master_fd=12,
+            pane=FakePane(),
+            exited=False,
+            retired=False,
+        ),
+        "implementer": argparse.Namespace(
+            role="implementer",
+            master_fd=11,
+            pane=FakePane(),
+            exited=False,
+            retired=False,
+        ),
+    }
+    writes: list[tuple[int, bytes]] = []
+
+    def write(fd: int, data: bytes) -> int:
+        writes.append((fd, data))
+        if fd == 12:
+            raise OSError(orc.errno.EIO, "child exited")
+        return len(data)
+
+    monkeypatch.setattr(orc.os, "write", write)
+    monkeypatch.setattr(orc.os, "close", lambda _fd: None)
+
+    app.write_active(b"X")
+
+    assert writes == [(12, b"X"), (11, b"X")]
+    assert app.sessions["reviewer"].write_failed
+    assert app.sessions["reviewer"].master_fd == -1
+    assert app.selected_role == "reviewer"
+    assert app.sessions["implementer"].pane.scrolls == 1
+
+
+def test_write_active_handles_partial_and_zero_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = orc.OrcApp.__new__(orc.OrcApp)
+    app.selected_role = "implementer"
+    app.active_role = "implementer"
+    app.workflow_role = "implementer"
+    app.event_loop = None
+    session = argparse.Namespace(
+        role="implementer",
+        master_fd=11,
+        pane=FakePane(),
+        exited=False,
+        retired=False,
+    )
+    app.sessions = {"implementer": session}
+    writes: list[bytes] = []
+    results = iter((1, 1, 1))
+    monkeypatch.setattr(
+        orc.os,
+        "write",
+        lambda _fd, data: writes.append(data) or next(results),
+    )
+    monkeypatch.setattr(orc.os, "close", lambda _fd: None)
+
+    app.write_active(b"abc")
+
+    assert writes == [b"abc", b"bc", b"c"]
+    session.exited = False
+    monkeypatch.setattr(orc.os, "write", lambda *_args: 0)
+    app.write_active(b"zero")
+    assert session.write_failed
+    assert session.master_fd == -1
+
+
+def test_prompt_owned_keys_never_reach_a_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = orc.OrcApp.__new__(orc.OrcApp)
+    app.resume_prompt_active = True
+    app.resume_prompt_value = ""
+    writes: list[bytes] = []
+    monkeypatch.setattr(app, "write_active", writes.append)
+    monkeypatch.setattr(app, "scroll_pane", lambda: FakePane())
+    monkeypatch.setattr(
+        app,
+        "close_resume_prompt",
+        lambda: setattr(app, "resume_prompt_active", False),
+    )
+
+    for key in ("ctrl+r", "tab", "escape", "pageup", "pagedown", "home", "end"):
+        event = Event(key)
+        app.on_key(event)
+        assert event.stopped
+
+    assert writes == []
+
+
+def test_ineligible_ctrl_r_is_consumed_without_child_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = orc.OrcApp.__new__(orc.OrcApp)
+    app.resume_prompt_active = False
+    writes: list[bytes] = []
+    monkeypatch.setattr(app, "open_resume_prompt", lambda: False)
+    monkeypatch.setattr(app, "write_active", writes.append)
+
+    event = Event("ctrl+r")
+    app.on_key(event)
+
+    assert event.stopped
+    assert writes == []
+
+
+def test_selection_helpers_keep_one_target_and_ignore_unavailable_panes() -> None:
+    app = orc.OrcApp.__new__(orc.OrcApp)
+    app.sessions = {}
+    app.started_roles = {"implementer"}
+    app.manual_selection = False
+    app.selected_role = None
+    app.active_role = None
+    panes = {"implementer": FakePane(), "reviewer": FakePane()}
+    app.pane = lambda role: panes[role]
+    app.update_layout = lambda: None
+
+    assert app._selected_role() is None
+    assert app.scroll_pane() is panes["implementer"]
+    assert app.selected_role == "implementer"
+    app._set_selected_role("not-a-role", manual=True)
+    assert app.selected_role == "implementer"
+
+    class Widget:
+        id = "reviewer"
+        parent = None
+
+    class ClickEvent:
+        widget = Widget()
+
+    app.select_pane(ClickEvent())
+    assert app.selected_role == "implementer"
+
+    app.started_roles.add("reviewer")
+    app.select_pane(ClickEvent())
+    assert app.selected_role == "reviewer"
+    assert app.manual_selection
+
+    app.started_roles.clear()
+    app.selected_role = "reviewer"
+    app.cycle_selected_role()
+    assert app.selected_role == "reviewer"
+
+    class Wrapper:
+        id = "wrapper"
+        parent = Widget()
+
+    app.select_pane(type("WrappedClick", (), {"widget": Wrapper()})())
+    assert app.selected_role == "reviewer"
+
+
 def test_pointer_selects_scroll_target_and_agent_input_returns_to_bottom(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -781,7 +1370,7 @@ def test_pointer_selects_scroll_target_and_agent_input_returns_to_bottom(
 
     move = MoveEvent()
     app.on_mouse_move(move)
-    assert app.scroll_target == "reviewer"
+    assert app.selected_role == "implementer"
     assert move.stopped
 
     app.sessions["implementer"] = argparse.Namespace(
@@ -851,6 +1440,7 @@ def test_in_place_resume_restarts_inactive_terminal_task(
         "failed_role": "reviewer",
     }
     app, state_file, _panes = app_stub(tmp_path, record)
+    app.started_roles.add("implementer")
     launched: list[str] = []
     monkeypatch.setattr(app, "launch_role", launched.append)
     before = orc.load_state(state_file)["TASK-003"]
@@ -897,6 +1487,7 @@ def test_in_place_resume_restarts_stopped_child_failure(
         "handoffs": [],
     }
     app, state_file, _panes = app_stub(tmp_path, record)
+    app.started_roles.add("implementer")
     launched: list[str] = []
     monkeypatch.setattr(app, "launch_role", launched.append)
     assert app.open_resume_prompt()
@@ -905,6 +1496,66 @@ def test_in_place_resume_restarts_stopped_child_failure(
     assert launched == ["implementer"]
     assert saved["status"] == "active"
     assert "child_failure" not in saved
+
+
+@pytest.mark.parametrize(
+    "status,reason,phase",
+    [
+        ("paused", "manual_pause", "paused"),
+        ("blocked", "clarification", "blocked"),
+        ("completed", "completion", "complete"),
+        ("stopped", "deadline", "stopped"),
+        ("stopped", "max_rounds", "stopped"),
+        ("stopped", "orchestrator_exit", "stopped"),
+    ],
+)
+def test_in_place_resume_targets_selected_reviewer_for_terminal_outcomes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    reason: str,
+    phase: str,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    record: dict[str, object] = {
+        "status": status,
+        "phase": phase,
+        "stop_reason": reason,
+        "target_directory": str(target),
+        "backend": "codex",
+        "backend_command": "codex",
+        "backend_version": "version",
+        "max_rounds": 5,
+        "deadline_seconds": 120,
+        "user_requests": ["old"],
+        "handoffs": [{"role": "implementer", "message": "old"}],
+        "implementer_id": "old-igor",
+        "reviewer_id": "old-rufus",
+        "role_states": {"implementer": "inactive", "reviewer": "inactive"},
+    }
+    if status == "blocked":
+        record["blocker_role"] = "implementer"
+        record["blocker_reason"] = "need clarification"
+    app, state_file, _panes = app_stub(tmp_path, record)
+    app.started_roles = {"implementer", "reviewer"}
+    app.selected_role = "reviewer"
+    app.active_role = "reviewer"
+    launched: list[str] = []
+    monkeypatch.setattr(app, "launch_role", launched.append)
+
+    assert app.open_resume_prompt()
+    assert app.submit_resume_request("continue as reviewer")
+
+    saved = orc.load_state(state_file)["TASK-003"]
+    assert launched == ["reviewer"]
+    assert saved["phase"] == "reviewer"
+    assert saved["role_states"] == {
+        "implementer": "inactive",
+        "reviewer": "active",
+    }
+    assert "selected_role" not in saved
+    assert saved["handoffs"] == record["handoffs"]
 
 
 def test_in_place_resume_empty_cancel_and_inconsistent_requests_are_noops(
@@ -923,6 +1574,7 @@ def test_in_place_resume_empty_cancel_and_inconsistent_requests_are_noops(
         "handoffs": [],
     }
     app, state_file, _panes = app_stub(tmp_path, record)
+    app.started_roles.add("implementer")
     monkeypatch.setattr(app, "launch_role", lambda _role: pytest.fail("launch"))
     before = orc.load_state(state_file)
     assert app.open_resume_prompt()
@@ -1027,6 +1679,7 @@ def test_textual_in_place_resume_prompt_submits_in_same_app(
     )
     args = argparse.Namespace(state_file=state_file, codex="codex")
     app = orc.OrcApp(args, "TASK-012")
+    app.started_roles.add("implementer")
     launched: list[str] = []
     monkeypatch.setattr(app, "launch_role", launched.append)
     monkeypatch.setattr(app, "poll_state", lambda: None)
@@ -1172,8 +1825,11 @@ def app_stub(
     app.args = args
     app.task_id = "TASK-003"
     app.sessions = {}
-    app.started_roles = set()
+    app.started_roles = {"implementer"}
+    app.selected_role = "implementer"
     app.active_role = "implementer"
+    app.manual_selection = False
+    app.workflow_role = "implementer"
     app.layout_mode = ""
     app.last_status = "starting"
     app.event_loop = FakeLoop()
@@ -1526,8 +2182,10 @@ def test_orc_app_io_resize_layout_and_status(
     session.exited = False
     error = OSError(5, "write")
     monkeypatch.setattr(orc.os, "write", lambda *_: (_ for _ in ()).throw(error))
+    monkeypatch.setattr(orc.os, "close", lambda _fd: None)
     app.write_active(b"x")
     assert statuses
+    session.exited = False
 
     monkeypatch.setattr(orc, "set_pty_size", lambda *_: None)
     app.resize_session(session)
@@ -3196,7 +3854,7 @@ def test_terminal_task_stays_mounted_until_ctrl_q_and_preserves_state(
 @pytest.mark.parametrize(
     "terminal_status", ["paused", "blocked", "stopped", "completed"]
 )
-def test_terminal_transition_clears_active_agent_border(
+def test_terminal_transition_retains_selected_agent_border(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     terminal_status: str,
@@ -3228,7 +3886,7 @@ def test_terminal_transition_clears_active_agent_border(
             orc.save_state(state_file, {"TASK-003": record})
             app.poll_state()
             await pilot.pause()
-            assert "active-pane" not in app.pane("implementer").classes
+            assert "active-pane" in app.pane("implementer").classes
             assert "active-pane" not in app.pane("reviewer").classes
             app.exit()
 

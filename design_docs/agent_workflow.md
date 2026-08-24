@@ -296,9 +296,10 @@ new role. `Ctrl-Q` is the only normal terminal-state exit path; its existing
 PTY, reader, timer, and child cleanup runs when the UI unmounts, and quitting
 does not delete or rewrite the persisted task record.
 
-The active workflow border and role labels are derived from persisted
+The active workflow status and role labels are derived from persisted
 `status: active` and `phase`: Igor is active for `implementer`, Rufus for
-`reviewer`, and neither role is active for terminal statuses. Separately, one
+`reviewer`, and neither role is active for terminal statuses. The pane border
+is owned only by the selected role, never by workflow phase. Separately, one
 unified selected role is process-local and is never persisted or included in
 handoff context. Its pane is simultaneously the input target, scroll target,
 Ctrl-R target, and highlighted pane; that highlight is the sole visible
@@ -355,7 +356,9 @@ selection, scrolling, quit, and prompt rules remain available.
 Ctrl-R is available for every valid resumable terminal outcome: paused,
 blocked/clarification, completed, and stopped for `orchestrator_exit`,
 `child_failure`, `deadline`, `max_rounds`, or `manual_pause`, subject to that
-record's inactive-role predicate. It targets the unified selected role, and
+record's inactive-role predicate. An `orchestrator_exit` record must have both
+roles inactive; a valid child-failure record has exactly one failed role and
+one inactive role. It targets the unified selected role, and
 an unlaunched role cannot be selected. Enter requires a non-empty request;
 Escape cancels and an empty submission leaves state unchanged. A successful
 submission retires remaining children, preserves task identity, target,

@@ -132,7 +132,7 @@ Acceptance criteria:
 
 ## TASK-022 - Restore operator input routing
 
-State: NEW
+State: COMPLETED
 
 Goal:
 

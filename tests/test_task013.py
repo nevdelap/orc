@@ -358,7 +358,10 @@ def test_cli_and_in_place_resume_share_strict_matrix(
     app.sessions = {}
     app.resume_prompt_active = False
     app.resume_prompt_value = ""
-    app.started_roles = set()
+    app.started_roles = {"implementer"}
+    app.selected_role = "implementer"
+    app.active_role = "implementer"
+    app.workflow_role = "implementer"
     app._resume_prompt_widget = lambda: None
     app.update_status = lambda _message: None
     app.launch_role = lambda _role: None
@@ -1159,6 +1162,8 @@ def test_in_place_resume_validates_target_and_backend(
     target.mkdir()
     app = orc.OrcApp.__new__(orc.OrcApp)
     app.sessions = {}
+    app.started_roles = {"implementer"}
+    app.selected_role = "implementer"
     paused = strict_record(target, status="paused", phase="paused")
     paused["stop_reason"] = "manual_pause"
     paused["role_states"] = {"implementer": "inactive", "reviewer": "inactive"}
@@ -1589,11 +1594,11 @@ def test_state_lock_and_ui_edge_paths(
         {"task": "t", "igor": "i", "rufus": "r", "backend": "b", "hint": "h"},
         200,
     )[0] == {"task", "igor", "rufus", "backend", "hint"}
-    app.scroll_target = "unknown"
+    app.selected_role = "unknown"
     app.pane = lambda role: role
     assert app.scroll_pane() == "implementer"
-    app.cycle_scroll_target()
-    assert app.scroll_target == "reviewer"
+    app.cycle_selected_role()
+    assert app.selected_role == "reviewer"
 
 
 def test_session_cleanup_io_and_size_edge_paths(
@@ -1630,7 +1635,10 @@ def test_session_cleanup_io_and_size_edge_paths(
     )
     app.read_session(session)
     app.sessions["implementer"] = session
+    monkeypatch.setattr(orc.os, "write", lambda *_args: 0)
+    monkeypatch.setattr(orc.os, "close", lambda _fd: None)
     app.write_active(b"x")
+    assert session.write_failed
 
     retired = orc.ChildSession("reviewer", 2, -1, Pane())
     app.sessions["reviewer"] = retired
