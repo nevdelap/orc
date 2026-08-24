@@ -21,6 +21,20 @@ sys.modules["orc_task013"] = orc
 spec.loader.exec_module(orc)
 
 
+@pytest.fixture(autouse=True)
+def default_codex_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep legacy unit tests independent of an installed Codex CLI."""
+
+    real_preflight = orc.preflight_backend
+
+    def preflight(backend: str, command: list[str]) -> str:
+        if backend == "codex" and command == ["codex"]:
+            return "test codex"
+        return real_preflight(backend, command)
+
+    monkeypatch.setattr(orc, "preflight_backend", preflight)
+
+
 def handoff(token: str, status: str = "HANDOFF", **extra: object) -> str:
     value: dict[str, object] = {
         "launch_token": token,

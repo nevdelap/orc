@@ -361,7 +361,27 @@ duplicate, and stale receipts are bounded no-ops.
 Backend and launch failures remain visible in the retained TUI. PTY readers
 close on EOF/error after one final drain, child groups receive SIGTERM within
 two seconds and SIGKILL within one additional second, and Git lookup and
-Claude capability probes each time out after five seconds.
+backend capability probes each time out after five seconds.
+
+Before `begin` creates task state, and before CLI or in-place `resume` mutates
+state or launches a child, Orc preflights the selected executable without a
+shell. It runs `[executable, "--version"]` and `[executable, "--help"]` with a
+five-second timeout and bounded combined stdout/stderr capture of 65,536
+bytes; output overflow terminates the probe. The first non-blank UTF-8-decoded
+version line is persisted, except that missing output or a line over 200
+UTF-8 bytes rejects the backend. Non-zero exits, timeouts, output overflow,
+and `OSError` failures use a bounded diagnostic identifying the backend,
+executable, and probe. Invalid UTF-8 is decoded with U+FFFD.
+
+Codex additionally runs `[executable, "resume", "--help"]` and requires the
+literal capabilities `resume`, either `-c` or `--config`, either `SESSION_ID`
+or `[SESSION_ID]`, and either `PROMPT` or `[PROMPT]`. Claude's `--help` must
+contain `--print`, `--output-format`, `stream-json`, `--input-format`, `text`,
+and `--resume`. A failed preflight leaves the task record and child process
+set unchanged. `CODEX_COMMAND` and `ORC_CLAUDE_COMMAND` remain argv values;
+no configured command is invoked through a shell. Agentbox's backend-specific
+no-permissions option is appended only after a successful preflight and is
+present at most once in the final launch argv.
 
 For `paused`, `blocked`, and `completed` tasks whose rendered roles are both
 `inactive`, for `stopped` tasks with `stop_reason: orchestrator_exit` and both

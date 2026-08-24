@@ -22,6 +22,7 @@ import json
 import os
 import re
 import secrets
+import selectors
 import signal
 import struct
 import subprocess
@@ -137,6 +138,14 @@ RECEIPT_LIMIT = 256
 REJECTED_DIAGNOSTIC_LIMIT = 64
 DIAGNOSTIC_LIMIT = 4 * 1024
 SUBPROCESS_TIMEOUT_SECONDS = 5
+PREFLIGHT_OUTPUT_LIMIT_BYTES = 65_536
+PREFLIGHT_VERSION_LIMIT_BYTES = 200
+CODEX_REQUIRED_RESUME_HELP = (
+    "resume",
+    ("-c", "--config"),
+    ("SESSION_ID", "[SESSION_ID]"),
+    ("PROMPT", "[PROMPT]"),
+)
 
 
 class StateFormatError(ValueError):
@@ -1400,11 +1409,8 @@ def notify_config(state_file: Path) -> str:
 def add_agentbox_codex_flag(command: list[str]) -> list[str]:
     """Add the agentbox Codex mode flag once when running inside agentbox."""
 
-    if (
-        sys.platform == "linux"
-        and AGENTBOX_IDENTITY.exists()
-        and CODEX_AGENTBOX_FLAG not in command
-    ):
+    if sys.platform == "linux" and AGENTBOX_IDENTITY.exists():
+        command[:] = [item for item in command if item != CODEX_AGENTBOX_FLAG]
         command.insert(max(len(command) - 1, 1), CODEX_AGENTBOX_FLAG)
     return command
 
@@ -1412,14 +1418,11 @@ def add_agentbox_codex_flag(command: list[str]) -> list[str]:
 def add_agentbox_claude_flag(command: list[str]) -> list[str]:
     """Add Claude's agentbox permission mode once when running in agentbox."""
 
-    if (
-        sys.platform == "linux"
-        and AGENTBOX_IDENTITY.exists()
-        and CLAUDE_AGENTBOX_FLAG not in command
-    ):
+    if sys.platform == "linux" and AGENTBOX_IDENTITY.exists():
         # The prompt is always the final argument. Keep the permission flag
         # among the CLI options so a prompt beginning with a dash is still
         # treated as input text by Claude Code.
+        command[:] = [item for item in command if item != CLAUDE_AGENTBOX_FLAG]
         command.insert(max(len(command) - 1, 1), CLAUDE_AGENTBOX_FLAG)
     return command
 
@@ -1448,45 +1451,241 @@ def claude_command() -> list[str]:
     )
 
 
+@dataclass(frozen=True)
+class PreflightProbe:
+    """The bounded result of one backend capability command."""
+
+    returncode: int | None
+    output: bytes
+    detail: str | None = None
+
+
+def _preflight_diagnostic(
+    backend: str, executable: str, probe: str, detail: str
+) -> str:
+    return _diagnostic(
+        f"backend {backend} executable {executable!r} failed {probe}: {detail}"
+    )
+
+
+def _terminate_preflight(process: subprocess.Popen[bytes]) -> None:
+    """Stop a probe and reap it without retaining any additional output."""
+
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            process.terminate()
+    except (OSError, ProcessLookupError):
+        pass
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except (OSError, ProcessLookupError):
+            pass
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _run_preflight_probe(argv: list[str], probe: str, backend: str) -> PreflightProbe:
+    """Run one probe with bounded combined output and a hard deadline."""
+
+    executable = argv[0] if argv else ""
+    try:
+        process = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+            start_new_session=(os.name == "posix"),
+        )
+    except (OSError, ValueError) as error:
+        return PreflightProbe(
+            None,
+            b"",
+            _preflight_diagnostic(backend, executable, probe, _diagnostic(str(error))),
+        )
+
+    assert process.stdout is not None
+    selector = selectors.DefaultSelector()
+    output = bytearray()
+    timed_out = False
+    exceeds_limit = False
+    eof = False
+    try:
+        os.set_blocking(process.stdout.fileno(), False)
+        selector.register(process.stdout, selectors.EVENT_READ)
+        deadline = time.monotonic() + SUBPROCESS_TIMEOUT_SECONDS
+        while not eof:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            events = selector.select(remaining)
+            if not events:
+                timed_out = True
+                break
+            try:
+                chunk = os.read(
+                    process.stdout.fileno(),
+                    PREFLIGHT_OUTPUT_LIMIT_BYTES - len(output) + 1,
+                )
+            except BlockingIOError:
+                continue
+            except OSError as error:
+                _terminate_preflight(process)
+                return PreflightProbe(
+                    None,
+                    bytes(output),
+                    _preflight_diagnostic(
+                        backend, executable, probe, _diagnostic(str(error))
+                    ),
+                )
+            if not chunk:
+                eof = True
+                selector.unregister(process.stdout)
+                break
+            if len(output) + len(chunk) > PREFLIGHT_OUTPUT_LIMIT_BYTES:
+                exceeds_limit = True
+                break
+            output.extend(chunk)
+        if timed_out or exceeds_limit:
+            _terminate_preflight(process)
+        else:
+            try:
+                process.wait(timeout=max(deadline - time.monotonic(), 0))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                _terminate_preflight(process)
+    finally:
+        try:
+            selector.unregister(process.stdout)
+        except (KeyError, ValueError):
+            pass
+        selector.close()
+        try:
+            process.stdout.close()
+        except OSError:
+            pass
+
+    if exceeds_limit:
+        detail = f"preflight output exceeds {PREFLIGHT_OUTPUT_LIMIT_BYTES} bytes"
+    elif timed_out:
+        detail = f"timed out after {SUBPROCESS_TIMEOUT_SECONDS} seconds"
+    elif process.returncode != 0:
+        detail = f"exit status {process.returncode}"
+    else:
+        detail = None
+    if detail is not None:
+        return PreflightProbe(
+            process.returncode,
+            bytes(output),
+            _preflight_diagnostic(backend, executable, probe, detail),
+        )
+    return PreflightProbe(process.returncode, bytes(output))
+
+
+def _preflight_version(backend: str, command: list[str], result: PreflightProbe) -> str:
+    if result.detail is not None:
+        raise SystemExit(result.detail)
+    text = result.output.decode("utf-8", errors="replace")
+    version_lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not version_lines:
+        raise SystemExit(
+            _diagnostic(
+                f"backend {backend} executable {command[0]!r} incompatible: "
+                "backend version is unknown"
+            )
+        )
+    version = version_lines[0]
+    if len(version.encode("utf-8")) > PREFLIGHT_VERSION_LIMIT_BYTES:
+        raise SystemExit(
+            _diagnostic(
+                f"backend {backend} executable {command[0]!r} incompatible: "
+                "backend version line exceeds 200 bytes"
+            )
+        )
+    return version
+
+
+def _required_help_tokens(text: str, required: tuple[Any, ...]) -> list[str]:
+    tokens = set(
+        re.findall(
+            r"--?[A-Za-z0-9][A-Za-z0-9_-]*|\[[A-Za-z0-9_]+\]|"
+            r"[A-Za-z0-9][A-Za-z0-9_-]*",
+            text,
+        )
+    )
+    missing: list[str] = []
+    for requirement in required:
+        if isinstance(requirement, tuple):
+            if not any(token in tokens for token in requirement):
+                missing.append(" or ".join(requirement))
+        elif requirement not in tokens:
+            missing.append(requirement)
+    return missing
+
+
+def preflight_backend(backend: str, command: list[str]) -> str:
+    """Verify one backend's executable and return its bounded version line."""
+
+    if backend not in {"codex", "claude"}:
+        raise SystemExit(f"unsupported backend {backend!r}")
+    if not command:
+        raise SystemExit(f"backend {backend} executable is missing")
+
+    version_result = _run_preflight_probe([*command, "--version"], "version", backend)
+    version = _preflight_version(backend, command, version_result)
+
+    help_result = _run_preflight_probe([*command, "--help"], "help", backend)
+    if help_result.detail is not None:
+        raise SystemExit(help_result.detail)
+    help_text = help_result.output.decode("utf-8", errors="replace")
+    if backend == "claude":
+        missing = _required_help_tokens(help_text, CLAUDE_REQUIRED_HELP)
+        if missing:
+            raise SystemExit(
+                _diagnostic(
+                    f"backend claude executable {command[0]!r} incompatible: "
+                    f"--help missing {', '.join(missing)}"
+                )
+            )
+    else:
+        resume_result = _run_preflight_probe(
+            [*command, "resume", "--help"], "resume help", backend
+        )
+        if resume_result.detail is not None:
+            raise SystemExit(resume_result.detail)
+        resume_text = resume_result.output.decode("utf-8", errors="replace")
+        missing = _required_help_tokens(resume_text, CODEX_REQUIRED_RESUME_HELP)
+        if missing:
+            raise SystemExit(
+                _diagnostic(
+                    f"backend codex executable {command[0]!r} incompatible: "
+                    f"resume --help missing {', '.join(missing)}"
+                )
+            )
+    return version
+
+
+def probe_codex(command: list[str]) -> str:
+    """Verify Codex's version, help, and resume-help contract."""
+
+    return preflight_backend("codex", command)
+
+
 def probe_claude(command: list[str]) -> str:
-    """Verify Claude Code's print/stream/resume capability contract."""
+    """Verify Claude's version and print/stream/resume contract."""
 
-    try:
-        result = subprocess.run(
-            [*command, "--help"],
-            capture_output=True,
-            check=False,
-            text=True,
-            timeout=SUBPROCESS_TIMEOUT_SECONDS,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise SystemExit(
-            f"cannot run Claude backend {command[0]!r} for capability check: {error}"
-        ) from error
-    help_text = f"{result.stdout}\n{result.stderr}"
-    missing = [flag for flag in CLAUDE_REQUIRED_HELP if flag not in help_text]
-    if result.returncode != 0 or missing:
-        detail = ", ".join(missing) if missing else f"exit status {result.returncode}"
-        raise SystemExit(
-            f"Claude backend {command[0]!r} is incompatible; "
-            f"--help must expose print stream/resume support (missing {detail})"
-        )
-
-    # Version is useful state, but it is intentionally best-effort: the
-    # capability contract is established by --help and some wrappers do not
-    # implement --version.
-    try:
-        version = subprocess.run(
-            [*command, "--version"],
-            capture_output=True,
-            check=False,
-            text=True,
-            timeout=SUBPROCESS_TIMEOUT_SECONDS,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return "unknown"
-    value = (version.stdout or version.stderr).strip().splitlines()
-    return value[0][:200] if value else "unknown"
+    return preflight_backend("claude", command)
 
 
 def backend_from_record(record: dict[str, Any]) -> str:
@@ -2344,7 +2543,9 @@ class OrcApp(App[None]):
             prompt.value = ""
             prompt.styles.display = "block"
             if getattr(self, "_running", False):
-                prompt.focus()
+                # Set focus through the app so the prompt receives the next
+                # key event even when it is opened from an app-level handler.
+                self.set_focus(prompt)
         self.update_status("Resume request: enter a non-empty request")
         return True
 
@@ -2390,21 +2591,27 @@ class OrcApp(App[None]):
         if not isinstance(record, dict) or not self.can_resume_in_place(record):
             self.close_resume_prompt()
             return False
+        try:
+            normalize_target_directory(Path(str(record.get("target_directory", ""))))
+        except (SystemExit, ValueError) as error:
+            self.update_status(f"Resume request rejected: {error}")
+            return False
+        try:
+            backend = backend_from_record(record)
+            configured_command = stored_backend_command(record, backend)
+            backend_version = preflight_backend(backend, configured_command)
+        except (SystemExit, ValueError) as error:
+            self.update_status(f"Resume request rejected: {error}")
+            return False
         if record.get("schema_version") == STATE_SCHEMA_VERSION:
-            try:
-                normalize_target_directory(
-                    Path(str(record.get("target_directory", "")))
-                )
-                backend_from_record(record)
-            except (SystemExit, ValueError) as error:
-                self.update_status(f"Resume request rejected: {error}")
-                return False
             self._retire_all_sessions()
 
             def apply(current: dict[str, Any] | None) -> str:
                 if current is None:
                     raise SystemExit(f"unknown task: {self.task_id}")
                 current["task_id"] = self.task_id
+                if not current.get("backend_version"):
+                    current["backend_version"] = backend_version
                 return resume_task_record(current, request)
 
             try:
@@ -2451,6 +2658,8 @@ class OrcApp(App[None]):
         record["status"] = "active"
         record["phase"] = "implementer"
         record["round"] = 1
+        if not record.get("backend_version"):
+            record["backend_version"] = backend_version
         record["automatic_rounds"] = True
         record["reviewer_reported_complete"] = False
         record["implementer_id"] = None
@@ -3683,14 +3892,8 @@ def run_app(args: argparse.Namespace, task_id: str) -> None:
 def begin(args: argparse.Namespace) -> None:
     target_directory = normalize_target_directory(args.directory)
     backend = selected_backend(args)
-    configured_command = (
-        claude_command()
-        if backend == "claude"
-        else backend_command_value(getattr(args, "codex", None) or codex_command())
-    )
-    backend_version = (
-        probe_claude(configured_command) if backend == "claude" else "unknown"
-    )
+    configured_command = claude_command() if backend == "claude" else codex_command()
+    backend_version = preflight_backend(backend, configured_command)
     stored_command: str | list[str] = (
         configured_command[0] if len(configured_command) == 1 else configured_command
     )
@@ -3776,8 +3979,7 @@ def resume(args: argparse.Namespace) -> None:
         raise SystemExit("resume requires a non-empty clarification or request")
     if record.get("schema_version") == STATE_SCHEMA_VERSION:
         configured_command = stored_backend_command(record, backend)
-        if backend == "claude":
-            probe_claude(configured_command)
+        backend_version = preflight_backend(backend, configured_command)
 
         # The callback re-reads the record while holding the task lock, so a
         # concurrent handoff cannot be overwritten by this resume.
@@ -3785,6 +3987,8 @@ def resume(args: argparse.Namespace) -> None:
             if current is None:
                 raise SystemExit(f"unknown task: {args.task_id}")
             current["task_id"] = args.task_id
+            if not current.get("backend_version"):
+                current["backend_version"] = backend_version
             return resume_task_record(current, args.prompt)
 
         mutate_task_state(args.state_file, args.task_id, apply)
@@ -3825,8 +4029,7 @@ def resume(args: argparse.Namespace) -> None:
         )
 
     configured_command = stored_backend_command(record, backend)
-    if backend == "claude":
-        probe_claude(configured_command)
+    backend_version = preflight_backend(backend, configured_command)
 
     child_failure = record.get("child_failure")
     reviewer_rollout_failed = (
@@ -3865,6 +4068,8 @@ def resume(args: argparse.Namespace) -> None:
     record["backend_command"] = (
         configured_command[0] if len(configured_command) == 1 else configured_command
     )
+    if not record.get("backend_version"):
+        record["backend_version"] = backend_version
     record["round"] = current_round(record)
     record["stop_reason"] = None
     record["clarification_received"] = (

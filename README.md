@@ -44,10 +44,23 @@ Use `--state-file PATH` before the command to select a state file.
 1–1440 and defaults to 60. Both limits are persisted and reused on resume.
 There is no manual one-round mode and no `--auto` option.
 
-For Claude, Orc probes the selected executable with `--help` before creating
-state. The help must expose `--print`, `--output-format stream-json`,
-`--input-format text`, and `--resume`. A clean Claude exit without a session
-ID and valid handoff is recorded as a child failure.
+Before creating or changing task state, Orc preflights the selected backend
+with argv-only subprocesses. It runs `[executable, "--version"]` and
+`[executable, "--help"]`; each command must exit successfully within five
+seconds. Combined output is UTF-8 decoded with replacement and captured up to
+65,536 bytes. A missing version line, a version line over 200 UTF-8 bytes, a
+timeout, non-zero exit, output overflow, or launch error rejects the backend
+with a bounded diagnostic. The first non-blank version line is persisted.
+
+Codex also must expose `resume`, `-c` or `--config`, `SESSION_ID` or
+`[SESSION_ID]`, and `PROMPT` or `[PROMPT]` in
+`[executable, "resume", "--help"]`. Claude's help must expose `--print`,
+`--output-format`, `stream-json`, `--input-format`, `text`, and `--resume`.
+The same preflight runs before CLI and in-place resume; failed probes leave
+state and child processes unchanged. Configured `CODEX_COMMAND` and
+`ORC_CLAUDE_COMMAND` values are passed as argv values and never through a
+shell. A clean Claude exit without a session ID and valid handoff is recorded
+as a child failure.
 
 ## State and lifecycle
 

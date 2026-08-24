@@ -25,6 +25,20 @@ sys.modules["orc"] = orc
 orc_spec.loader.exec_module(orc)
 
 
+@pytest.fixture(autouse=True)
+def default_codex_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep legacy unit tests independent of an installed Codex CLI."""
+
+    real_preflight = orc.preflight_backend
+
+    def preflight(backend: str, command: list[str]) -> str:
+        if backend == "codex" and command == ["codex"]:
+            return "test codex"
+        return real_preflight(backend, command)
+
+    monkeypatch.setattr(orc, "preflight_backend", preflight)
+
+
 class Event:
     def __init__(self, key: str = "", character: str | None = None) -> None:
         self.key = key
@@ -2038,6 +2052,7 @@ def test_legacy_resume_migrates_automatic_settings_after_validation(
     orc.save_state(state_file, {"TASK-005": record})
     configured_codex = tmp_path / "configured codex"
     monkeypatch.setenv("CODEX_COMMAND", str(configured_codex))
+    make_fake_codex(configured_codex)
     args = orc.parse_args(
         ["--state-file", str(state_file), "resume", "TASK-005", "continue"]
     )
@@ -2450,6 +2465,28 @@ def make_fake_claude(path: Path, *, compatible: bool = True) -> None:
         "flush=True)\n"
         "print(json.dumps({'type': 'result', 'session_id': 'claude-test', "
         "'result': 'Status: COMPLETE\\nSummary: done'}), flush=True)\n"
+    )
+    path.chmod(0o755)
+
+
+def make_fake_codex(path: Path, *, compatible: bool = True) -> None:
+    resume_help = (
+        "Usage: codex resume [--config VALUE] SESSION_ID PROMPT"
+        if compatible
+        else "Usage: codex resume"
+    )
+    path.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        f"resume_help = {resume_help!r}\n"
+        "if sys.argv[1:] == ['--version']:\n"
+        "    print('Codex test 1.2.3')\n"
+        "elif sys.argv[1:] == ['--help']:\n"
+        "    print('Usage: codex [OPTIONS]')\n"
+        "elif sys.argv[1:] == ['resume', '--help']:\n"
+        "    print(resume_help)\n"
+        "else:\n"
+        "    print('Codex launch')\n"
     )
     path.chmod(0o755)
 
@@ -3573,7 +3610,7 @@ def test_claude_nonzero_exit_is_child_failure_even_with_handoff(
 
 
 def test_claude_unavailable_command_has_clear_diagnostic() -> None:
-    with pytest.raises(SystemExit, match="cannot run Claude backend"):
+    with pytest.raises(SystemExit, match="backend claude executable"):
         orc.probe_claude(["missing-claude-command"])
 
 
