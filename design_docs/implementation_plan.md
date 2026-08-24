@@ -269,6 +269,83 @@ Acceptance criteria:
   recorded in the handoff and review document. Profile A also passes, with
   the exact final task commit snapshot used for all evidence.
 
+## TASK-023 - Restore app-level focus for operator input
+
+State: NEW
+
+Goal:
+
+- Ensure ordinary operator keystrokes reach TASK-022's selected live child in
+  the running Textual UI, while the Ctrl-R resume editor receives input only
+  during an explicitly opened resume prompt.
+
+Dependencies:
+
+- TASK-022 must be `COMPLETED`.
+
+Scope:
+
+- Update the POSIX/Linux Textual focus and event-routing behavior in `orc` so
+  the hidden `#resume-prompt` input cannot capture keyboard focus while it is
+  inactive or before the first child launch. Keep TASK-022's selected-role,
+  fallback, scrolling, reserved-key, paste, and no-live-child contracts
+  unchanged.
+- Define the focus lifecycle for the existing resume editor: inactive at
+  application startup and during normal pane operation; focused when a valid
+  Ctrl-R prompt is opened; and no longer focusable, with app-level routing
+  restored, after Escape cancellation or submission handling completes. An
+  ineligible Ctrl-R remains an Orc-owned no-op and must not focus the editor.
+- Preserve prompt ownership while it is open: prompt text, editing controls,
+  Enter submission, and paste remain prompt-owned; Ctrl-Q, Ctrl-R, Tab,
+  Escape, Page Up, Page Down, Home, End, and mouse events retain TASK-022's
+  Orc-owned behavior; no prompt input may reach a child PTY.
+- Add focused Textual integration coverage in `tests/test_orc.py` for startup
+  focus, ordinary printable and control-key delivery to a selected live PTY,
+  prompt focus and child isolation, Escape cancellation followed by restored
+  child routing, successful submission followed by restored child routing,
+  and ineligible Ctrl-R. Cover both implementer and reviewer selection where
+  the existing harness supports it, and verify that focus changes do not
+  mutate persisted workflow state.
+- Update `README.md` and `design_docs/agent_workflow.md` to state that the
+  inactive resume editor is not an input target and that app-level operator
+  routing is restored whenever the prompt is closed.
+
+Acceptance criteria:
+
+- In a live Linux Textual session before Ctrl-R is opened, the resume editor
+  is not focused or keyboard-focusable, and printable text, Enter, control
+  keys, navigation bytes, and paste follow TASK-022's selected-live-child or
+  fallback routing exactly. The first keystroke after startup is delivered;
+  it is not lost to the hidden editor.
+- Opening Ctrl-R for every eligible resumable outcome focuses the editor and
+  keeps all prompt text and paste in the editor. No prompt character,
+  control, navigation, Enter, or paste byte reaches either child PTY.
+- Escape closes an open prompt without submitting, makes the editor inactive,
+  and restores app-level routing to the unchanged selected role. The next
+  ordinary keystroke reaches the selected live child.
+- A valid non-empty submission closes or transitions out of the prompt,
+  leaves the editor inactive, and restores app-level routing after the
+  submission handler has completed. Resume state, selected-role behavior,
+  and preserved request/history semantics remain those specified by TASK-022.
+- A rejected non-empty submission that leaves the workflow resumable keeps the
+  editor open and focused so the operator can correct the request. If the
+  workflow becomes no longer resumable while the prompt is open, the editor
+  closes and app-level routing is restored without writing the rejected text
+  to a child.
+- Ctrl-R when no valid resume is available is consumed without focusing the
+  editor or writing to a child. Ctrl-R and Tab while the prompt is open remain
+  consumed no-ops, and mouse movement or clicks while it is open cannot create
+  a new focus or selection target.
+- Regression tests exercise real Textual event dispatch plus Linux PTY byte
+  capture for both the normal selected-child path and the transient fallback
+  path where applicable. They prove focus transitions do not alter persisted
+  task status, phase, revision, role lifecycle, deadline, handoff history, or
+  audit data except for the explicitly submitted resume request.
+- Existing TASK-022 unit, real-PTY, Codex, and Claude lifecycle behavior
+  remains passing. Verification Profile B passes on Linux, and Profile A
+  passes against the exact final task snapshot, with every command and result
+  recorded in the handoff and review document.
+
 ## TASK-015 - Make process and signal cleanup reliable
 
 State: COMPLETED
