@@ -5,6 +5,7 @@ import importlib.util
 import os
 import signal
 import sys
+import termios
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -429,6 +430,39 @@ def test_terminal_capture_and_signal_handlers_are_restored(
     assert set(handlers) == {orc.signal.SIGINT, orc.signal.SIGHUP, orc.signal.SIGTERM}
     app._restore_signal_handlers()
     assert app._previous_signal_handlers == {}
+
+
+def test_constructor_captures_terminal_before_textual_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured = [0]
+    original_attributes = [termios.BRKINT, termios.ICRNL, termios.OPOST]
+    textual_attributes = [termios.PARMRK, termios.INPCK, termios.ONLCR]
+
+    monkeypatch.setattr(sys.stdin, "fileno", lambda: 7)
+    monkeypatch.setattr(orc.os, "isatty", lambda _fd: True)
+
+    def tcgetattr(_fd: int) -> list[int]:
+        captured[0] += 1
+        return list(original_attributes)
+
+    monkeypatch.setattr(orc.termios, "tcgetattr", tcgetattr)
+    app = orc.OrcApp(
+        argparse.Namespace(state_file=tmp_path / "missing-state.json"), "TASK-015"
+    )
+
+    # Textual changes the TTY before on_mount. If capture still happens there,
+    # the changed attributes replace the caller's original snapshot.
+    monkeypatch.setattr(orc.termios, "tcgetattr", lambda _fd: textual_attributes)
+    monkeypatch.setattr(orc.asyncio, "get_running_loop", lambda: object())
+    monkeypatch.setattr(app, "set_interval", lambda *_args: None)
+    monkeypatch.setattr(app, "update_layout", lambda: None)
+    monkeypatch.setattr(app, "call_after_refresh", lambda *_args: None)
+    app.on_mount()
+
+    assert captured == [1]
+    assert app._terminal_fd == 7
+    assert app._terminal_attributes == original_attributes
 
 
 def test_cleanup_tolerates_reader_and_terminal_restore_errors(

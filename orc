@@ -2224,6 +2224,10 @@ class OrcApp(App[None]):
         self._terminal_fd: int | None = None
         self._terminal_attributes: list[Any] | None = None
         self._previous_signal_handlers: dict[int, Any] = {}
+        # Textual changes the caller's TTY before it dispatches on_mount. Save
+        # the real caller state while the app is being constructed so cleanup
+        # can restore line input and echo after Textual exits.
+        self._capture_terminal_state()
 
     def get_default_screen(self) -> Screen:
         return OrcScreen(id="_default")
@@ -2302,7 +2306,6 @@ class OrcApp(App[None]):
         # explicitly opened.
         self._set_resume_prompt_focus(False)
         self.event_loop = asyncio.get_running_loop()
-        self._capture_terminal_state()
         if getattr(self, "_running", False):
             self._install_signal_handlers()
         self.set_interval(0.1, self.poll_state)
