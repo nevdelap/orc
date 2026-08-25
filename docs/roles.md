@@ -20,8 +20,23 @@ handoff. A receiver gets only the preceding validated canonical handoff in a
 delimited context block, never raw backend payload data.
 
 The contract is bounded: the complete frame and delivered context are at most
-16 KiB, launch tokens are at most 256 bytes, scalar fields at most 4 KiB, and
-list items at most 512 bytes. Oversized handoffs are rejected as a whole.
+16 KiB, launch tokens are at most 256 UTF-8 bytes, scalar fields at most 4 KiB,
+list items at most 512 bytes, and each handoff list contains at most 32 items.
+The persisted handoff history retains at most 128 accepted entries, preserving
+the newest entry for each role when older entries are evicted. Oversized or
+duplicate-key handoffs are rejected as a whole and cannot alter workflow state
+or enter a prompt.
+
+Claude stream lines and events are limited to 64 KiB. Malformed or oversized
+events are discarded through the end of the event and produce one bounded
+rejected diagnostic. A child retains at most 256 stream events in memory;
+older events are dropped and `stream_dropped_count` saturates at 1,000,000.
+Explicit operator requests are retained in `user_requests` and
+`last_user_request`, with at most 32 entries and 4 KiB per UTF-8 request.
+Over-limit requests are rejected before state mutation or launch. Generated
+prompts are ephemeral, capped at 32 KiB, and reduce optional handoff context
+before launch; an explicit request is never silently truncated. Rejected
+diagnostics retain at most 64 entries and 4 KiB per diagnostic.
 
 The implementation plan is the source of truth for task scope, dependencies,
 acceptance criteria, and state. A task must be fully specified before Igor

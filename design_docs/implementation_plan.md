@@ -57,7 +57,7 @@ snapshot under review.
 
 ## TASK-016 - Bound agent-controlled data
 
-State: NEW
+State: COMPLETED
 
 Goal:
 

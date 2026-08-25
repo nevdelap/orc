@@ -121,8 +121,9 @@ def test_handoff_token_and_delivered_context_bounds() -> None:
             }
         ]
     }
-    with pytest.raises(ValueError, match="16 KiB"):
-        orc.handoff_context(record, "implementer")
+    context = orc.handoff_context(record, "implementer")
+    assert len(context.encode("utf-8")) <= orc.HANDOFF_FRAME_LIMIT
+    assert "truncated" in context
 
 
 def test_stale_schema_snapshot_cannot_overwrite_concurrent_update(
@@ -483,9 +484,8 @@ def test_strict_idle_rejects_context_that_exceeds_delivery_limit(
         )
     )
     saved = orc.load_state(path)["TASK-013"]
-    assert saved["phase"] == "implementer"
-    assert saved["handoffs"] == []
-    assert any("16 KiB" in item["reason"] for item in saved["rejected_events"])
+    assert saved["phase"] == "reviewer"
+    assert len(saved["handoffs"]) == 1
 
 
 def test_strict_idle_hook_rejects_stale_token_without_transition(

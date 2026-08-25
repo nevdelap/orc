@@ -456,6 +456,36 @@ latest canonical handoff in a delimited non-instructional context block; Igor
 receives Rufus's preceding canonical handoff on the next round. Late,
 duplicate, and stale receipts are bounded no-ops.
 
+### Agent-controlled data limits
+
+The complete UTF-8 `ORC_HANDOFF_V1: ` line and JSON object is limited to
+16 KiB. A launch token is limited to 256 bytes, scalar handoff fields to 4 KiB,
+list items to 512 bytes, and each handoff list to 32 items. Duplicate JSON
+keys, malformed objects, and any frame over the limit are rejected as a whole.
+Accepted persisted handoffs are retained in a rolling list of at most 128
+entries. The newest accepted handoff for each role is protected; when the list
+is full, the oldest other entry is evicted first. If no entry can be evicted,
+the handoff is rejected with a bounded diagnostic and the next role is not
+launched.
+
+Claude stream lines/events and Codex idle-hook payloads are bounded at 64 KiB.
+Oversized or malformed backend events are discarded through the end of the
+event, produce one bounded rejected diagnostic, and never enter agent context.
+Each child retains at most 256 Claude stream events in memory. Oldest events
+are discarded and the in-memory `stream_dropped_count` is a non-negative
+counter saturating at 1,000,000. Rejected diagnostics retain at most 64 entries
+and 4 KiB per diagnostic.
+
+Explicit operator requests are retained in `user_requests` and
+`last_user_request`, with at most 32 entries and 4 KiB per UTF-8 request. An
+over-limit request is rejected before state mutation or launch. Generated Orc
+prompts are ephemeral and capped at 32 KiB before launch. Optional context is
+reduced first; the exact explicit request is never silently truncated. Only
+trusted built-in instructions, the bounded explicit request, and canonical
+validated handoff context may enter an agent prompt. Raw notifications, stream
+events, backend help output, launch command transcripts, and other backend text
+are neither persisted nor injected.
+
 Backend and launch failures remain visible in the retained TUI. PTY readers
 close on EOF/error after one final drain, child groups receive SIGTERM within
 two seconds and SIGKILL within one additional second, and Git lookup and
