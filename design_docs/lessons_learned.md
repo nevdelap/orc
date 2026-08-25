@@ -100,6 +100,13 @@ lessons from completed Orc tasks. It complements
 - Persisted state needs a versioned schema and complete record validation;
   validating only the top-level JSON container permits malformed task records
   to be rewritten as if they were valid.
+- Schema evolution must be non-breaking at every intermediate commit and
+  between tasks. Introduce new fields and readers before changing writers,
+  keep deprecated representations readable while existing state is being
+  converted, and remove them only in a later change after the code no longer
+  needs them. A schema update must never make a partially implemented task or
+  the state left by the preceding task unloadable; explicit migrations must be
+  atomic, repeatable, validated, and preserve a recoverable backup.
 - Every state writer, including external idle hooks and backend exit paths,
   must use the same locked mutation/revision operation. Direct atomic writes
   can still bypass revisioning and lose the concurrency guarantees.
