@@ -75,6 +75,26 @@ lessons from completed Orc tasks. It complements
   documented local fallback or limitation; an unavailable local tool must
   not be reported as a passing local verification.
 
+## Recent completed-task lessons
+
+- Backend preflight must validate configured argv values, including embedded
+  NULs, and turn every launch error into a bounded backend/probe diagnostic.
+  Capability checks must compare literal tokens rather than substrings, and
+  agentbox permission flags must be normalized to exactly one occurrence.
+- A failed backend preflight must be exercised through begin and both resume
+  paths, proving state and child-process invariants rather than only testing
+  the probe helper in isolation.
+- Unified operator selection must survive PTY write races and transient
+  fallback routing. Polling still owns reader closure, child reaping, and
+  persisted child-failure state after a write failure.
+- Hidden prompt editors must be unfocusable before an eligible resume prompt
+  opens; closing the prompt must restore app-level routing. Focus tests need
+  actual Textual dispatch and PTY byte assertions to catch lost keystrokes.
+- PTY read errors, signals, terminal disconnects, and uncaught failures must
+  share one idempotent cleanup path. A late error from a normally retired
+  session must close only that session and never stop its replacement
+  workflow. Capture caller terminal state before UI startup.
+
 ## State and protocol design
 
 - Persisted state needs a versioned schema and complete record validation;
