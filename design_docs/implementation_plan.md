@@ -7,13 +7,19 @@ transitions, commit contract, handoff procedures, review-document format, and
 verification workflow are defined in `design_docs/agent_workflow.md`; role
 responsibilities are defined in `docs/roles.md`.
 
-Compatibility is forward-only. The private pre-release `v0.0.1` is not a
-compatibility baseline, so persisted data and behavior from before the first
-public release need not be migrated, projected, or preserved. Igor must reject
-unsupported pre-baseline state before mutation or launch. Every later task
-that changes a public schema or behavior must identify the established public
-baseline, preserve its declared compatibility contract, and specify any
-explicit migration or rejection behavior.
+Public compatibility is forward-only. The private pre-release `v0.0.1` is not
+a public compatibility baseline, but that exception does not permit an
+implementation task to strand state that exists in the shared workspace or
+that the preceding task produced. Every schema change must remain readable at
+each intermediate commit and between tasks: introduce new fields and readers
+first, keep deprecated representations readable while they are being
+converted, and remove them only in a later task after no writer emits them.
+Any explicit migration must be atomic, repeatable, validated, and preserve a
+recoverable backup. Every task that changes a schema must name this
+compatibility/deprecation plan and test the partially migrated and
+between-task states. Unsupported pre-baseline state may be rejected only when
+the established conversion path cannot strand in-use state; a schema update
+must never be the reason the current workflow becomes unloadable.
 
 ## Tasks
 
@@ -165,10 +171,12 @@ Scope:
   every earlier event has been evicted. Saturate `audit_dropped_count` at
   1,000,000 rather than overflowing. TASK-017 advances the state schema
   from version 2 to version 3. Because `v0.0.1` is private pre-release,
-  version-2 records are not part of the compatibility baseline: version-2
-  and all other unsupported records are rejected before mutation with the
-  bounded diagnostic `unsupported pre-baseline state schema`, and are never
-  migrated, repaired, or launched. New schema-3 records add these fields and
+  version-2 records are not part of the public compatibility baseline. The
+  completed TASK-017 runtime rejects unconverted version-2 records before
+  mutation with the bounded diagnostic `unsupported pre-baseline state schema`; this is a historical pre-release exception and must not be reused
+  for a future schema change. Future schema tasks must first add compatible
+  readers and an explicit validated conversion path before any old writer or
+  representation is removed. New schema-3 records add these fields and
   initialize `timing` with the current valid task start, a null
   `task_finished_at`, zero wall and role totals, zero unattributed time, and
   an empty generation list.
@@ -265,8 +273,9 @@ Acceptance criteria:
   JSON tuple string of at most 512 UTF-8 bytes. New schema-3 state starts
   with `audit_events: []`, `audit_next_sequence: 1`,
   `audit_dropped_count: 0`, `last_terminal_event_key: null`, and an explicit
-  schema revision. Pre-baseline schema-2 records are rejected before
-  mutation; migration is not required.
+  schema revision. The completed TASK-017 pre-baseline rejection remains a
+  historical compatibility boundary; future schema revisions must use the
+  non-breaking deprecation and migration policy at the top of this plan.
 - Verification Profile A passes on Linux, with every command and result
   recorded in the handoff and review document.
 
@@ -486,7 +495,12 @@ Acceptance criteria:
   `is_git_repository: "unknown"`, both roles, both backends, and
   accepted/rejected handoffs without false clean/commit claims.
 - Existing consumers of `last_commit` remain compatible while new status and
-  audit consumers receive the complete structured snapshot.
+  audit consumers receive the complete structured snapshot. Records produced
+  before TASK-018 and records during a partial rollout may omit
+  `git_evidence`; readers must project that absence to null and writers must
+  add the object without making the old record unreadable. Removal of any
+  deprecated short-hash-only path requires a later task after all writers and
+  readers have moved.
 - Verification Profile A passes on Linux, with every command and result
   recorded in the handoff and review document.
 
@@ -601,6 +615,12 @@ Scope:
   fails, retain the pending in-memory value, retry on the next tick, and do
   not claim a persisted update that did not succeed. The fixed two-role
   structure cannot grow without bound.
+- `activity` is an additive, optional compatibility field for this task.
+  Readers must treat it as absent/null for every record produced before
+  TASK-020, and writers must be able to add it without rewriting or rejecting
+  the rest of the record. Tests must load a pre-TASK-020 record, a partially
+  updated record, and a fully updated record. Any later removal of the
+  compatibility projection requires a separate deprecation task.
 - For the currently active role with a live child, display its normal role
   state plus an age in seconds. At 120 seconds without activity, display
   `stalled` with the elapsed age and warning color; reset to `active` on the

@@ -401,8 +401,12 @@ directory, atomically replace the state file, and flush its containing
 directory. A malformed or unsupported record is never overwritten; an
 interrupted replacement leaves the previous valid record readable. Schema 2
 and every other unsupported record are rejected before mutation with
-`unsupported pre-baseline state schema`; Orc does not migrate or repair
-private pre-release records.
+`unsupported pre-baseline state schema`; this is the historical private
+pre-release boundary established by TASK-017, not a model for future schema
+changes. Future schema changes must add compatible readers before changing
+writers, keep deprecated representations readable during conversion, and
+remove them only in a later task after an atomic, repeatable, validated
+migration has preserved a recoverable backup.
 
 Each schema-3 task has `audit_events`, `audit_next_sequence`,
 `audit_dropped_count`, `last_terminal_event_key`, and `timing`. The audit list
