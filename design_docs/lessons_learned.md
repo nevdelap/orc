@@ -94,6 +94,21 @@ lessons from completed Orc tasks. It complements
   share one idempotent cleanup path. A late error from a normally retired
   session must close only that session and never stop its replacement
   workflow. Capture caller terminal state before UI startup.
+- Re-entrant resume must retire every prior child session before launching the
+  selected role; real Textual dispatch and descriptor assertions are needed to
+  catch stale-session cleanup and replacement-launch races.
+- Reviewers must use `HANDOFF` for implementer-fixable blockers; reserve
+  `UNABLE_TO_PROCEED` for a genuine human clarification or decision. Orc
+  intentionally blocks and does not route the work back to Igor after an
+  `UNABLE_TO_PROCEED` handoff.
+- Complete state validation must reject missing schemas, invalid revisions,
+  impossible terminal keys, and incomplete terminal timing before mutation.
+  Tests must exercise the production validator rather than bypassing it for
+  legacy-shaped fixtures.
+- Bounded audit and timing data must use the locked revisioned mutation path:
+  sequences remain monotonic after eviction, terminal suppression survives
+  rolling-history eviction, and deadline cleanup closes open generations while
+  preserving aggregate totals.
 
 ## State and protocol design
 
