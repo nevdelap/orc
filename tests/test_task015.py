@@ -44,6 +44,18 @@ def strict_record(target: Path) -> dict[str, object]:
         "automatic_rounds": True,
         "deadline_at": "2099-01-01T00:00:00+00:00",
         "stop_reason": None,
+        "audit_events": [],
+        "audit_next_sequence": 1,
+        "audit_dropped_count": 0,
+        "last_terminal_event_key": None,
+        "timing": {
+            "task_started_at": "2025-01-01T00:00:00Z",
+            "task_finished_at": None,
+            "wall_seconds": 0,
+            "agent_wall_seconds": {"implementer": 0, "reviewer": 0},
+            "unattributed_wall_seconds": 0,
+            "generations": [],
+        },
     }
 
 
@@ -311,6 +323,10 @@ def test_cleanup_helpers_handle_terminal_records_and_signal_fallback(
     record["phase"] = "complete"
     record["stop_reason"] = "completion"
     record["role_states"] = {"implementer": "inactive", "reviewer": "inactive"}
+    record["timing"]["task_finished_at"] = "2025-01-01T00:00:00Z"
+    record["last_terminal_event_key"] = orc._audit_terminal_key(
+        "state_transition", None, None, "completed", "complete", "completion"
+    )
     orc.save_state(state_file, {"TASK-015": record})
     app = orc.OrcApp.__new__(orc.OrcApp)
     app.args = argparse.Namespace(state_file=state_file)

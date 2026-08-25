@@ -128,7 +128,7 @@ VALID_STOP_REASONS = {
 }
 TERMINAL_TASK_STATUSES = {"paused", "blocked", "stopped", "completed"}
 SCROLLBACK_LINES = 10_000
-STATE_SCHEMA_VERSION = 2
+STATE_SCHEMA_VERSION = 3
 HANDOFF_PREFIX = "ORC_HANDOFF_V1: "
 HANDOFF_FRAME_LIMIT = 16 * 1024
 HANDOFF_SCALAR_LIMIT = 4 * 1024
@@ -147,6 +147,11 @@ GENERATED_PROMPT_LIMIT = 32 * 1024
 STREAM_EVENT_LIMIT = 64 * 1024
 STREAM_EVENT_RETENTION = 256
 STREAM_DROPPED_LIMIT = 1_000_000
+AUDIT_EVENT_LIMIT = 256
+AUDIT_DROPPED_LIMIT = 1_000_000
+AUDIT_DETAIL_LIMIT = 4 * 1024
+AUDIT_TERMINAL_KEY_LIMIT = 512
+TIMING_GENERATION_LIMIT = 256
 CODEX_PAYLOAD_LIMIT = STREAM_EVENT_LIMIT
 SUBPROCESS_TIMEOUT_SECONDS = 5
 PREFLIGHT_OUTPUT_LIMIT_BYTES = 65_536
@@ -161,6 +166,286 @@ CODEX_REQUIRED_RESUME_HELP = (
 
 class StateFormatError(ValueError):
     """The persisted document is malformed or not supported by Orc."""
+
+
+AUDIT_EVENT_TYPES = {
+    "launch_started",
+    "launch_spawned",
+    "handoff_accepted",
+    "handoff_rejected",
+    "state_transition",
+    "child_exit",
+    "cleanup",
+}
+AUDIT_ROLES = {"implementer", "reviewer"}
+AUDIT_END_EVENTS = {"handoff_accepted", "child_exit", "cleanup"}
+AUDIT_EVENT_FIELDS = {
+    "sequence",
+    "time",
+    "event",
+    "role",
+    "round",
+    "generation",
+    "status_before",
+    "status_after",
+    "phase_before",
+    "phase_after",
+    "stop_reason",
+    "commit",
+    "detail",
+}
+TIMING_FIELDS = {
+    "task_started_at",
+    "task_finished_at",
+    "wall_seconds",
+    "agent_wall_seconds",
+    "unattributed_wall_seconds",
+    "generations",
+}
+TIMING_GENERATION_FIELDS = {
+    "role",
+    "round",
+    "generation",
+    "launched_at",
+    "spawned_at",
+    "ended_at",
+    "end_event",
+    "wall_seconds",
+}
+VALID_STATUSES = {"active", "paused", "blocked", "stopped", "completed"}
+VALID_PHASES = {"implementer", "reviewer", "paused", "blocked", "stopped", "complete"}
+
+
+def audit_timestamp(value: datetime | None = None) -> str:
+    """Return the canonical UTC timestamp used by audit and timing records."""
+
+    timestamp = (value or utc_now()).astimezone(UTC)
+    return timestamp.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _valid_audit_timestamp(value: Any) -> bool:
+    if not isinstance(value, str) or not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", value
+    ):
+        return False
+    return parse_timestamp(value) is not None
+
+
+def _non_negative_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _audit_terminal_key(
+    event: str,
+    role: str | None,
+    generation: int | None,
+    status_after: str | None,
+    phase_after: str | None,
+    stop_reason: str | None,
+) -> str:
+    return json.dumps(
+        [event, role, generation, status_after, phase_after, stop_reason],
+        separators=(",", ":"),
+    )
+
+
+def _validate_terminal_key(value: Any, record: dict[str, Any] | None = None) -> None:
+    if value is None:
+        return
+    if (
+        not isinstance(value, str)
+        or len(value.encode("utf-8")) > AUDIT_TERMINAL_KEY_LIMIT
+    ):
+        raise StateFormatError("invalid last_terminal_event_key")
+    try:
+        decoded = json.loads(value)
+    except ValueError as error:
+        raise StateFormatError("invalid last_terminal_event_key") from error
+    if not isinstance(decoded, list) or len(decoded) != 6:
+        raise StateFormatError("invalid last_terminal_event_key")
+    event, role, generation, status_after, phase_after, stop_reason = decoded
+    if event == "state_transition":
+        applicable = (
+            role is None
+            and generation is None
+            and phase_after
+            == {
+                "paused": "paused",
+                "blocked": "blocked",
+                "stopped": "stopped",
+                "completed": "complete",
+            }.get(status_after)
+            and stop_reason
+            in {
+                "paused": {"manual_pause"},
+                "blocked": {"clarification"},
+                "stopped": VALID_STOP_REASONS - {None, "completion", "clarification"},
+                "completed": {"completion"},
+            }.get(status_after, set())
+        )
+    elif event == "child_exit":
+        applicable = (
+            role in AUDIT_ROLES
+            and isinstance(generation, int)
+            and not isinstance(generation, bool)
+            and generation >= 1
+            and status_after == "stopped"
+            and phase_after == "stopped"
+            and stop_reason == "child_failure"
+        )
+    elif event == "cleanup":
+        applicable = (
+            role is None
+            and generation is None
+            and status_after == "stopped"
+            and phase_after == "stopped"
+            and stop_reason in {"manual_pause", "orchestrator_exit"}
+        )
+    else:
+        applicable = False
+    if not applicable:
+        raise StateFormatError("invalid last_terminal_event_key")
+    expected = _audit_terminal_key(*decoded)
+    if expected != value:
+        raise StateFormatError("invalid last_terminal_event_key")
+    if record is None:
+        return
+    if (
+        record.get("status") != status_after
+        or record.get("phase") != phase_after
+        or record.get("stop_reason") != stop_reason
+    ):
+        raise StateFormatError("terminal key does not match task state")
+
+
+def _validate_audit_event(value: Any) -> None:
+    if not isinstance(value, dict) or set(value) != AUDIT_EVENT_FIELDS:
+        raise StateFormatError("invalid audit event schema")
+    if (
+        not isinstance(value["sequence"], int)
+        or isinstance(value["sequence"], bool)
+        or value["sequence"] < 1
+    ):
+        raise StateFormatError("invalid audit event sequence")
+    if not _valid_audit_timestamp(value["time"]):
+        raise StateFormatError("invalid audit event time")
+    event = value["event"]
+    if event not in AUDIT_EVENT_TYPES:
+        raise StateFormatError("unknown audit event")
+    role = value["role"]
+    if role is not None and role not in AUDIT_ROLES:
+        raise StateFormatError("invalid audit event role")
+    round_number = value["round"]
+    if (
+        not isinstance(round_number, int)
+        or isinstance(round_number, bool)
+        or round_number < 1
+    ):
+        raise StateFormatError("invalid audit event round")
+    generation = value["generation"]
+    if generation is not None and (
+        not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 1
+    ):
+        raise StateFormatError("invalid audit event generation")
+    for field in ("status_before", "status_after"):
+        if value[field] is not None and value[field] not in VALID_STATUSES:
+            raise StateFormatError("invalid audit event status")
+    for field in ("phase_before", "phase_after"):
+        if value[field] is not None and value[field] not in VALID_PHASES:
+            raise StateFormatError("invalid audit event phase")
+    if (
+        value["stop_reason"] is not None
+        and value["stop_reason"] not in VALID_STOP_REASONS
+    ):
+        raise StateFormatError("invalid audit event stop reason")
+    if value["commit"] is not None:
+        raise StateFormatError("audit commit evidence is not available yet")
+    detail = value["detail"]
+    if not isinstance(detail, str) or len(detail.encode("utf-8")) > AUDIT_DETAIL_LIMIT:
+        raise StateFormatError("invalid audit event detail")
+    if event in {"launch_started", "launch_spawned"}:
+        if role not in AUDIT_ROLES or generation is None or detail:
+            raise StateFormatError("invalid launch audit event")
+    elif event in {"handoff_accepted", "handoff_rejected", "child_exit"}:
+        if role not in AUDIT_ROLES or generation is None or not detail:
+            raise StateFormatError("invalid role audit event")
+    elif event == "state_transition":
+        if (
+            value["status_before"] is None
+            or value["status_after"] is None
+            or value["phase_before"] is None
+            or value["phase_after"] is None
+        ):
+            raise StateFormatError("invalid state transition audit event")
+    elif event == "cleanup" and not detail:
+        raise StateFormatError("invalid cleanup audit event")
+
+
+def _validate_timing(value: Any) -> None:
+    if not isinstance(value, dict) or set(value) != TIMING_FIELDS:
+        raise StateFormatError("invalid timing schema")
+    if not _valid_audit_timestamp(value["task_started_at"]):
+        raise StateFormatError("invalid task_started_at")
+    if value["task_finished_at"] is not None and not _valid_audit_timestamp(
+        value["task_finished_at"]
+    ):
+        raise StateFormatError("invalid task_finished_at")
+    for field in ("wall_seconds", "unattributed_wall_seconds"):
+        if not _non_negative_int(value[field]):
+            raise StateFormatError("invalid timing total")
+    totals = value["agent_wall_seconds"]
+    if (
+        not isinstance(totals, dict)
+        or set(totals) != AUDIT_ROLES
+        or any(not _non_negative_int(totals[role]) for role in AUDIT_ROLES)
+    ):
+        raise StateFormatError("invalid agent timing totals")
+    generations = value["generations"]
+    if not isinstance(generations, list) or len(generations) > TIMING_GENERATION_LIMIT:
+        raise StateFormatError("invalid timing generations")
+    previous: datetime | None = None
+    for generation in generations:
+        if (
+            not isinstance(generation, dict)
+            or set(generation) != TIMING_GENERATION_FIELDS
+        ):
+            raise StateFormatError("invalid timing generation")
+        if generation["role"] not in AUDIT_ROLES:
+            raise StateFormatError("invalid timing generation role")
+        if (
+            not isinstance(generation["round"], int)
+            or isinstance(generation["round"], bool)
+            or generation["round"] < 1
+            or not isinstance(generation["generation"], int)
+            or isinstance(generation["generation"], bool)
+            or generation["generation"] < 1
+        ):
+            raise StateFormatError("invalid timing generation identity")
+        for field in ("launched_at", "spawned_at", "ended_at"):
+            timestamp = generation[field]
+            if timestamp is not None and not _valid_audit_timestamp(timestamp):
+                raise StateFormatError("invalid timing generation timestamp")
+        if not _valid_audit_timestamp(generation["launched_at"]):
+            raise StateFormatError("invalid timing generation start")
+        if generation["spawned_at"] is None and generation["ended_at"] is not None:
+            raise StateFormatError("invalid timing generation closure")
+        if generation["end_event"] not in (None, *AUDIT_END_EVENTS):
+            raise StateFormatError("invalid timing generation end event")
+        duration = generation["wall_seconds"]
+        if duration is not None and not _non_negative_int(duration):
+            raise StateFormatError("invalid timing generation duration")
+        if generation["ended_at"] is None:
+            if generation["end_event"] is not None or duration is not None:
+                raise StateFormatError("invalid open timing generation")
+        elif generation["end_event"] is None or duration is None:
+            raise StateFormatError("invalid closed timing generation")
+        spawned = parse_timestamp(generation["spawned_at"])
+        if spawned is not None and previous is not None and spawned < previous:
+            raise StateFormatError("timing generations are out of order")
+        if spawned is not None:
+            previous = spawned
 
 
 def _reject_duplicate_json_keys(
@@ -181,15 +466,10 @@ def _validate_state_document(value: Any, path: Path) -> dict[str, Any]:
         if not isinstance(task_id, str) or not isinstance(record, dict):
             raise StateFormatError(f"Orc state {path} contains an invalid task record")
         version = record.get("schema_version")
-        if version is not None and version != STATE_SCHEMA_VERSION:
-            raise StateFormatError(
-                f"Orc state {path} has unsupported schema version {version!r} "
-                f"for task {task_id}"
-            )
+        if version != STATE_SCHEMA_VERSION:
+            raise StateFormatError("unsupported pre-baseline state schema")
         revision = record.get("revision")
-        if revision is not None and (
-            isinstance(revision, bool) or not isinstance(revision, int) or revision < 0
-        ):
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
             raise StateFormatError(
                 f"Orc state {path} has invalid revision for task {task_id}"
             )
@@ -216,6 +496,11 @@ def _validate_state_document(value: Any, path: Path) -> dict[str, Any]:
                 "automatic_rounds",
                 "deadline_at",
                 "stop_reason",
+                "audit_events",
+                "audit_next_sequence",
+                "audit_dropped_count",
+                "last_terminal_event_key",
+                "timing",
             }
             missing = sorted(required - set(record))
             if missing:
@@ -531,6 +816,55 @@ def _validate_state_document(value: Any, path: Path) -> dict[str, Any]:
                 raise StateFormatError(
                     f"Orc state {path} task {task_id} has invalid deadline_at"
                 )
+            audit_events = record["audit_events"]
+            if (
+                not isinstance(audit_events, list)
+                or len(audit_events) > AUDIT_EVENT_LIMIT
+            ):
+                raise StateFormatError(
+                    f"Orc state {path} task {task_id} has invalid audit_events"
+                )
+            previous_sequence = 0
+            for audit_event in audit_events:
+                _validate_audit_event(audit_event)
+                sequence = audit_event["sequence"]
+                if sequence <= previous_sequence:
+                    raise StateFormatError(
+                        "audit sequences are not strictly increasing"
+                    )
+                previous_sequence = sequence
+            next_sequence = record["audit_next_sequence"]
+            if (
+                not isinstance(next_sequence, int)
+                or isinstance(next_sequence, bool)
+                or next_sequence < 1
+                or next_sequence <= previous_sequence
+            ):
+                raise StateFormatError("invalid audit_next_sequence")
+            dropped = record["audit_dropped_count"]
+            if (
+                not isinstance(dropped, int)
+                or isinstance(dropped, bool)
+                or not 0 <= dropped <= AUDIT_DROPPED_LIMIT
+            ):
+                raise StateFormatError("invalid audit_dropped_count")
+            _validate_terminal_key(record["last_terminal_event_key"], record)
+            _validate_timing(record["timing"])
+            if (
+                record["status"] == "active"
+                and record["timing"]["task_finished_at"] is not None
+            ):
+                raise StateFormatError("active task has a finished timing record")
+            if (
+                record["status"] in TERMINAL_TASK_STATUSES
+                and record["last_terminal_event_key"] is None
+            ):
+                raise StateFormatError("terminal task has no terminal key")
+            if (
+                record["status"] in TERMINAL_TASK_STATUSES
+                and record["timing"]["task_finished_at"] is None
+            ):
+                raise StateFormatError("terminal task has no finished timing record")
             diagnostic = record.get("stop_diagnostic")
             if diagnostic is not None and (
                 not isinstance(diagnostic, str)
@@ -628,6 +962,22 @@ def mutate_task_state(
         if current is None and not create:
             raise SystemExit(f"unknown task: {task_id}")
         before = copy.deepcopy(current) if isinstance(current, dict) else None
+        before_status = (
+            current.get("status")
+            if isinstance(current, dict) and current.get("status") in VALID_STATUSES
+            else None
+        )
+        before_phase = (
+            current.get("phase")
+            if isinstance(current, dict) and current.get("phase") in VALID_PHASES
+            else None
+        )
+        before_audit_count = (
+            len(current.get("audit_events", []))
+            if isinstance(current, dict)
+            and isinstance(current.get("audit_events"), list)
+            else 0
+        )
         result = mutator(current)
         updated = state.get(task_id)
         if isinstance(updated, dict):
@@ -635,6 +985,26 @@ def mutate_task_state(
                 updated, sort_keys=True, separators=(",", ":")
             ) == json.dumps(before, sort_keys=True, separators=(",", ":")):
                 return result
+            if _audit_enabled(updated):
+                audit_events = updated.get("audit_events")
+                status_after = updated.get("status")
+                phase_after = updated.get("phase")
+                if (
+                    isinstance(audit_events, list)
+                    and len(audit_events) == before_audit_count
+                    and (status_after != before_status or phase_after != before_phase)
+                ):
+                    append_audit_event(
+                        updated,
+                        "state_transition",
+                        round_number=current_round(updated),
+                        status_before=before_status,
+                        status_after=status_after,
+                        phase_before=before_phase,
+                        phase_after=phase_after,
+                        stop_reason=updated.get("stop_reason"),
+                        detail="",
+                    )
             updated["schema_version"] = STATE_SCHEMA_VERSION
             old_revision = current.get("revision", 0) if current else 0
             if isinstance(old_revision, bool) or not isinstance(old_revision, int):
@@ -807,6 +1177,254 @@ def parse_timestamp(value: Any) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
+def _duration_seconds(start: Any, end: Any) -> int:
+    started = parse_timestamp(start)
+    finished = parse_timestamp(end)
+    if started is None or finished is None or finished < started:
+        return 0
+    return max(0, int((finished - started).total_seconds()))
+
+
+def initialize_audit_state(record: dict[str, Any], started: datetime) -> None:
+    """Initialize the schema-3 audit and timing fields for a new task."""
+
+    timestamp = audit_timestamp(started)
+    record["audit_events"] = []
+    record["audit_next_sequence"] = 1
+    record["audit_dropped_count"] = 0
+    record["last_terminal_event_key"] = None
+    record["timing"] = {
+        "task_started_at": timestamp,
+        "task_finished_at": None,
+        "wall_seconds": 0,
+        "agent_wall_seconds": {"implementer": 0, "reviewer": 0},
+        "unattributed_wall_seconds": 0,
+        "generations": [],
+    }
+
+
+def _audit_enabled(record: dict[str, Any]) -> bool:
+    return record.get("schema_version") == STATE_SCHEMA_VERSION and all(
+        field in record
+        for field in (
+            "audit_events",
+            "audit_next_sequence",
+            "audit_dropped_count",
+            "last_terminal_event_key",
+            "timing",
+        )
+    )
+
+
+def _timing(record: dict[str, Any]) -> dict[str, Any] | None:
+    value = record.get("timing")
+    return value if isinstance(value, dict) else None
+
+
+def _update_task_timing(record: dict[str, Any], now: datetime) -> None:
+    timing = _timing(record)
+    if timing is None:
+        return
+    now_text = audit_timestamp(now)
+    finished = timing.get("task_finished_at")
+    endpoint = finished if isinstance(finished, str) else now_text
+    started = timing.get("task_started_at")
+    elapsed = _duration_seconds(started, endpoint)
+    endpoint_time = parse_timestamp(endpoint)
+    started_time = parse_timestamp(started)
+    if endpoint_time is not None and started_time is not None:
+        if endpoint_time < started_time:
+            record_rejected_event(record, "backward wall-clock adjustment")
+    timing["wall_seconds"] = elapsed
+    totals = timing.get("agent_wall_seconds")
+    if isinstance(totals, dict):
+        assigned = sum(value for value in totals.values() if _non_negative_int(value))
+        timing["unattributed_wall_seconds"] = max(0, elapsed - assigned)
+
+
+def _timing_generation_slot_available(record: dict[str, Any]) -> bool:
+    timing = _timing(record)
+    if timing is None:
+        return True
+    generations = timing.get("generations")
+    if not isinstance(generations, list) or len(generations) < TIMING_GENERATION_LIMIT:
+        return True
+    return any(
+        isinstance(item, dict) and item.get("ended_at") is not None
+        for item in generations
+    )
+
+
+def _close_generation(
+    record: dict[str, Any],
+    role: str,
+    generation: int,
+    end_event: str,
+    ended_at: datetime,
+) -> bool:
+    timing = _timing(record)
+    if timing is None:
+        return False
+    generations = timing.get("generations")
+    if not isinstance(generations, list):
+        return False
+    for item in reversed(generations):
+        if (
+            isinstance(item, dict)
+            and item.get("role") == role
+            and item.get("generation") == generation
+        ):
+            if item.get("ended_at") is not None:
+                return False
+            ended_text = audit_timestamp(ended_at)
+            item["ended_at"] = ended_text
+            item["end_event"] = end_event
+            spawned_time = parse_timestamp(item.get("spawned_at"))
+            ended_time = parse_timestamp(ended_text)
+            if (
+                spawned_time is not None
+                and ended_time is not None
+                and ended_time < spawned_time
+            ):
+                record_rejected_event(record, "backward wall-clock adjustment")
+            duration = _duration_seconds(item.get("spawned_at"), ended_text)
+            item["wall_seconds"] = duration
+            totals = timing.get("agent_wall_seconds")
+            if isinstance(totals, dict) and _non_negative_int(totals.get(role)):
+                totals[role] += duration
+            _update_task_timing(record, ended_at)
+            return True
+    return False
+
+
+def _close_open_generations(record: dict[str, Any], now: datetime) -> None:
+    timing = _timing(record)
+    generations = timing.get("generations") if timing else None
+    if not isinstance(generations, list):
+        return
+    for item in list(generations):
+        if not isinstance(item, dict) or item.get("ended_at") is not None:
+            continue
+        _close_generation(
+            record,
+            str(item.get("role")),
+            int(item.get("generation", 0)),
+            "cleanup",
+            now,
+        )
+
+
+def append_audit_event(
+    record: dict[str, Any],
+    event: str,
+    *,
+    role: str | None = None,
+    round_number: int | None = None,
+    generation: int | None = None,
+    status_before: str | None = None,
+    status_after: str | None = None,
+    phase_before: str | None = None,
+    phase_after: str | None = None,
+    stop_reason: str | None = None,
+    detail: str = "",
+    now: datetime | None = None,
+) -> bool:
+    """Append one validated audit event to a schema-3 task record."""
+
+    if not _audit_enabled(record):
+        return False
+    # Some unit-level workflow transitions predate launch metadata. They may
+    # still record the state transition, but a role event cannot be truthful
+    # without its generation identity.
+    if (
+        event in {"handoff_accepted", "handoff_rejected", "child_exit"}
+        and generation is None
+    ):
+        return False
+    timestamp = audit_timestamp(now)
+    events = record.get("audit_events")
+    next_sequence = record.get("audit_next_sequence")
+    if not isinstance(events, list) or not isinstance(next_sequence, int):
+        raise StateFormatError("invalid audit state")
+    if round_number is None:
+        round_number = current_round(record)
+    event_value = {
+        "sequence": next_sequence,
+        "time": timestamp,
+        "event": event,
+        "role": role,
+        "round": round_number,
+        "generation": generation,
+        "status_before": status_before,
+        "status_after": status_after,
+        "phase_before": phase_before,
+        "phase_after": phase_after,
+        "stop_reason": stop_reason,
+        "commit": None,
+        "detail": detail,
+    }
+    _validate_audit_event(event_value)
+    terminal = (
+        event in {"state_transition", "child_exit", "cleanup"}
+        and status_after in TERMINAL_TASK_STATUSES
+    )
+    if terminal:
+        key = _audit_terminal_key(
+            event,
+            role,
+            generation,
+            status_after,
+            phase_after,
+            stop_reason,
+        )
+        previous = record.get("last_terminal_event_key")
+        if previous is not None:
+            if previous == key:
+                return False
+            raise StateFormatError("different terminal audit event already recorded")
+        record["last_terminal_event_key"] = key
+        timing = _timing(record)
+        if timing is not None:
+            timing["task_finished_at"] = timestamp
+    record["audit_next_sequence"] = next_sequence + 1
+    if len(events) >= AUDIT_EVENT_LIMIT:
+        events.pop(0)
+        dropped = record.get("audit_dropped_count", 0)
+        record["audit_dropped_count"] = min(
+            AUDIT_DROPPED_LIMIT,
+            dropped + 1 if _non_negative_int(dropped) else 1,
+        )
+    events.append(event_value)
+    _update_task_timing(record, now or utc_now())
+    return True
+
+
+def _generation_for_role(record: dict[str, Any], role: str | None) -> int | None:
+    if role not in AUDIT_ROLES:
+        return None
+    launch = launch_record(record, role)
+    generation = launch.get("generation") if isinstance(launch, dict) else None
+    if (
+        isinstance(generation, int)
+        and not isinstance(generation, bool)
+        and generation >= 1
+    ):
+        return generation
+    generations = record.get("role_generations")
+    value = generations.get(role) if isinstance(generations, dict) else None
+    return value if isinstance(value, int) and value >= 1 else None
+
+
+def _audit_handoff_rejected(record: dict[str, Any], role: str, reason: str) -> None:
+    append_audit_event(
+        record,
+        "handoff_rejected",
+        role=role,
+        generation=_generation_for_role(record, role),
+        detail=_diagnostic(reason),
+    )
+
+
 def payload_field(value: Any, key: str) -> Any:
     if isinstance(value, dict):
         if key in value:
@@ -923,6 +1541,11 @@ def mark_cleanup_stopped(record: dict[str, Any], reason: str, diagnostic: str) -
         return False
     if reason not in {"manual_pause", "orchestrator_exit"}:
         raise ValueError(f"invalid cleanup stop reason: {reason}")
+    before_status = (
+        record.get("status") if record.get("status") in VALID_STATUSES else None
+    )
+    before_phase = record.get("phase") if record.get("phase") in VALID_PHASES else None
+    now = utc_now()
     set_stop_reason(record, reason, diagnostic=diagnostic)
     record["role_states"] = {"implementer": "inactive", "reviewer": "inactive"}
     record.pop("live_child", None)
@@ -938,6 +1561,19 @@ def mark_cleanup_stopped(record: dict[str, Any], reason: str, diagnostic: str) -
             if isinstance(launch, dict):
                 launch["live_child"] = False
                 launch["can_report"] = False
+    _close_open_generations(record, now)
+    append_audit_event(
+        record,
+        "cleanup",
+        round_number=current_round(record),
+        status_before=before_status,
+        status_after=record.get("status"),
+        phase_before=before_phase,
+        phase_after=record.get("phase"),
+        stop_reason=record.get("stop_reason"),
+        detail=_diagnostic(diagnostic),
+        now=now,
+    )
     return True
 
 
@@ -1492,6 +2128,16 @@ def _resume_inconsistent(record: dict[str, Any]) -> SystemExit:
     return SystemExit(f"task {task_id} has inconsistent state; resume was not applied")
 
 
+def _mark_launches_non_reportable(record: dict[str, Any]) -> None:
+    """Prevent terminal launches from producing later workflow events."""
+
+    launches = record.get("role_launches")
+    if isinstance(launches, dict):
+        for launch in launches.values():
+            if isinstance(launch, dict):
+                launch["can_report"] = False
+
+
 def transition_task(
     record: dict[str, Any],
     event: str,
@@ -1505,9 +2151,25 @@ def transition_task(
     status = record.get("status")
     if status in TERMINAL_TASK_STATUSES:
         return False
+    before_status = status if status in VALID_STATUSES else None
+    before_phase = record.get("phase") if record.get("phase") in VALID_PHASES else None
+    timestamp = now or utc_now()
     if event == "deadline":
         set_stop_reason(record, "deadline")
         record["role_states"] = {"implementer": "inactive", "reviewer": "inactive"}
+        _mark_launches_non_reportable(record)
+        _close_open_generations(record, timestamp)
+        append_audit_event(
+            record,
+            "state_transition",
+            round_number=current_round(record),
+            status_before=before_status,
+            status_after=record["status"],
+            phase_before=before_phase,
+            phase_after=record["phase"],
+            stop_reason=record["stop_reason"],
+            now=timestamp,
+        )
         return True
     if event == "child_failure":
         if role not in {"implementer", "reviewer"}:
@@ -1523,6 +2185,24 @@ def transition_task(
             "reviewer": "failed" if role == "reviewer" else "inactive",
         }
         set_stop_reason(record, "child_failure")
+        generation = _generation_for_role(record, role)
+        if generation is not None:
+            _close_generation(record, role, generation, "child_exit", timestamp)
+        if generation is not None:
+            append_audit_event(
+                record,
+                "child_exit",
+                role=role,
+                generation=generation,
+                round_number=current_round(record),
+                status_before=before_status,
+                status_after=record["status"],
+                phase_before=before_phase,
+                phase_after=record["phase"],
+                stop_reason=record["stop_reason"],
+                detail="child exited unsuccessfully",
+                now=timestamp,
+            )
         return True
     if event != "handoff" or handoff is None or role is None:
         raise ValueError(f"unknown workflow event: {event}")
@@ -1533,15 +2213,99 @@ def transition_task(
         record["blocker_reason"] = blockers[0] if blockers else "unspecified"
         record["role_states"] = {"implementer": "inactive", "reviewer": "inactive"}
         set_stop_reason(record, "clarification")
+        generation = _generation_for_role(record, role)
+        if generation is not None:
+            _close_generation(record, role, generation, "handoff_accepted", timestamp)
+        append_audit_event(
+            record,
+            "handoff_accepted",
+            role=role,
+            generation=generation,
+            round_number=current_round(record),
+            status_before=before_status,
+            status_after=record["status"],
+            phase_before=before_phase,
+            phase_after=record["phase"],
+            stop_reason=record["stop_reason"],
+            detail="UNABLE_TO_PROCEED handoff accepted",
+            now=timestamp,
+        )
+        append_audit_event(
+            record,
+            "state_transition",
+            round_number=current_round(record),
+            status_before=before_status,
+            status_after=record["status"],
+            phase_before=before_phase,
+            phase_after=record["phase"],
+            stop_reason=record["stop_reason"],
+            now=timestamp,
+        )
         return True
     if role == "implementer":
         record["status"] = "active"
         record["phase"] = "reviewer"
         record["role_states"] = {"implementer": "waiting", "reviewer": "active"}
+        generation = _generation_for_role(record, role)
+        if generation is not None:
+            _close_generation(record, role, generation, "handoff_accepted", timestamp)
+        append_audit_event(
+            record,
+            "handoff_accepted",
+            role=role,
+            generation=generation,
+            round_number=current_round(record),
+            status_before=before_status,
+            status_after=record["status"],
+            phase_before=before_phase,
+            phase_after=record["phase"],
+            stop_reason=record["stop_reason"],
+            detail="HANDOFF accepted",
+            now=timestamp,
+        )
+        append_audit_event(
+            record,
+            "state_transition",
+            round_number=current_round(record),
+            status_before=before_status,
+            status_after=record["status"],
+            phase_before=before_phase,
+            phase_after=record["phase"],
+            stop_reason=record["stop_reason"],
+            now=timestamp,
+        )
         return True
     if disposition == "COMPLETE":
         set_stop_reason(record, "completion", completed=True)
         record["role_states"] = {"implementer": "inactive", "reviewer": "inactive"}
+        generation = _generation_for_role(record, role)
+        if generation is not None:
+            _close_generation(record, role, generation, "handoff_accepted", timestamp)
+        append_audit_event(
+            record,
+            "handoff_accepted",
+            role=role,
+            generation=generation,
+            round_number=current_round(record),
+            status_before=before_status,
+            status_after=record["status"],
+            phase_before=before_phase,
+            phase_after=record["phase"],
+            stop_reason=record["stop_reason"],
+            detail="COMPLETE handoff accepted",
+            now=timestamp,
+        )
+        append_audit_event(
+            record,
+            "state_transition",
+            round_number=current_round(record),
+            status_before=before_status,
+            status_after=record["status"],
+            phase_before=before_phase,
+            phase_after=record["phase"],
+            stop_reason=record["stop_reason"],
+            now=timestamp,
+        )
         return True
     maximum = valid_round_limit(record.get("max_rounds")) or DEFAULT_MAX_ROUNDS
     if current_round(record) >= maximum:
@@ -1553,6 +2317,34 @@ def transition_task(
         record["phase"] = "implementer"
         record["stop_reason"] = None
         record["role_states"] = {"implementer": "active", "reviewer": "waiting"}
+    generation = _generation_for_role(record, role)
+    if generation is not None:
+        _close_generation(record, role, generation, "handoff_accepted", timestamp)
+    append_audit_event(
+        record,
+        "handoff_accepted",
+        role=role,
+        generation=generation,
+        round_number=current_round(record),
+        status_before=before_status,
+        status_after=record["status"],
+        phase_before=before_phase,
+        phase_after=record["phase"],
+        stop_reason=record["stop_reason"],
+        detail="HANDOFF accepted",
+        now=timestamp,
+    )
+    append_audit_event(
+        record,
+        "state_transition",
+        round_number=current_round(record),
+        status_before=before_status,
+        status_after=record["status"],
+        phase_before=before_phase,
+        phase_after=record["phase"],
+        stop_reason=record["stop_reason"],
+        now=timestamp,
+    )
     return True
 
 
@@ -1646,6 +2438,8 @@ def resume_task_record(
             eligible = False
     if not eligible:
         raise _resume_inconsistent({**record, "task_id": task_id})
+    before_status = status if status in VALID_STATUSES else None
+    before_phase = record.get("phase") if record.get("phase") in VALID_PHASES else None
     if requested_role is not None:
         selected_role = requested_role
         # Ctrl-R starts a fresh bounded cycle even when the terminal outcome
@@ -1654,7 +2448,7 @@ def resume_task_record(
         round_number = 1
     launches = record.get("role_launches")
     if isinstance(launches, dict) and any(
-        isinstance(value, dict) and value.get("can_report", True)
+        isinstance(value, dict) and value.get("can_report") is True
         for value in launches.values()
     ):
         raise _resume_inconsistent({**record, "task_id": task_id})
@@ -1714,6 +2508,23 @@ def resume_task_record(
     record["claude_session_id"] = None
     record["claude_final_response"] = None
     record["reviewer_reported_complete"] = False
+    if _audit_enabled(record):
+        record["last_terminal_event_key"] = None
+        timing = _timing(record)
+        if timing is not None:
+            timing["task_finished_at"] = None
+        append_audit_event(
+            record,
+            "state_transition",
+            round_number=round_number,
+            status_before=before_status,
+            status_after="active",
+            phase_before=before_phase,
+            phase_after=selected_role,
+            stop_reason=None,
+            detail="resume accepted",
+            now=started,
+        )
     return selected_role
 
 
@@ -3302,109 +4113,33 @@ class OrcApp(App[None]):
         except (SystemExit, ValueError) as error:
             self.update_status(f"Resume request rejected: {error}")
             return False
-        if record.get("schema_version") == STATE_SCHEMA_VERSION:
-            self._retire_all_sessions()
-            selected_role = self._selected_role()
-            if selected_role not in {"implementer", "reviewer"}:
-                self.update_status("Resume request rejected: no selected pane")
-                return False
-
-            def apply(current: dict[str, Any] | None) -> str:
-                if current is None:
-                    raise SystemExit(f"unknown task: {self.task_id}")
-                current["task_id"] = self.task_id
-                if not current.get("backend_version"):
-                    current["backend_version"] = backend_version
-                return resume_task_record(current, request, selected_role=selected_role)
-
-            try:
-                resumed_role = mutate_task_state(
-                    self.args.state_file, self.task_id, apply
-                )
-            except SystemExit as error:
-                self.update_status(str(error))
-                return False
-            self.close_resume_prompt()
-            self.workflow_role = None
-            self._set_selected_role(resumed_role, manual=False)
-            if getattr(self, "_running", False):
-                self.update_layout()
-            else:
-                self.refresh_status()
-            self._launch_after_resume(resumed_role)
-            return True
-        max_rounds = valid_round_limit(record.get("max_rounds"))
-        deadline_seconds = valid_deadline_seconds(record.get("deadline_seconds"))
-        if max_rounds is None or deadline_seconds is None:
-            self.update_status("Resume request rejected: invalid task limits")
-            return False
-
         self._retire_all_sessions()
         selected_role = self._selected_role()
         if selected_role not in {"implementer", "reviewer"}:
             self.update_status("Resume request rejected: no selected pane")
             return False
-        requests = record.get("user_requests", [])
-        if not isinstance(requests, list):
-            requests = []
+
+        def apply(current: dict[str, Any] | None) -> str:
+            if current is None:
+                raise SystemExit(f"unknown task: {self.task_id}")
+            current["task_id"] = self.task_id
+            if not current.get("backend_version"):
+                current["backend_version"] = backend_version
+            return resume_task_record(current, request, selected_role=selected_role)
+
         try:
-            append_user_request(record, request)
+            resumed_role = mutate_task_state(self.args.state_file, self.task_id, apply)
         except SystemExit as error:
             self.update_status(str(error))
             return False
-        for key in (
-            "stop_reason",
-            "child_failure",
-            "failed_role",
-            "blocker_role",
-            "blocker_reason",
-            "blocked_task",
-            "blocked_round",
-            "blocked_thread",
-            "blocked_at",
-            "blocked_commit",
-            "stop_diagnostic",
-        ):
-            record.pop(key, None)
-        record["stop_reason"] = None
-        record["status"] = "active"
-        record["phase"] = selected_role
-        record["role_states"] = {
-            "implementer": "active" if selected_role == "implementer" else "inactive",
-            "reviewer": "active" if selected_role == "reviewer" else "inactive",
-        }
-        record["round"] = 1
-        if not record.get("backend_version"):
-            record["backend_version"] = backend_version
-        record["automatic_rounds"] = True
-        record["reviewer_reported_complete"] = False
-        record["implementer_id"] = None
-        record["reviewer_id"] = None
-        record["role_generations"] = {"implementer": 0, "reviewer": 0}
-        record["launch_history"] = []
-        record.pop("live_child", None)
-        for key in (
-            "claude_session_id",
-            "claude_final_response",
-            "claude_sessions",
-            "launch_command",
-            "launch_backend",
-        ):
-            record.pop(key, None)
-        started = utc_now()
-        record["cycle_started_at"] = started.isoformat(timespec="seconds")
-        record["deadline_at"] = (
-            started + timedelta(seconds=deadline_seconds)
-        ).isoformat(timespec="seconds")
-        save_state(self.args.state_file, state)
         self.close_resume_prompt()
         self.workflow_role = None
-        self._set_selected_role(selected_role, manual=False)
+        self._set_selected_role(resumed_role, manual=False)
         if getattr(self, "_running", False):
             self.update_layout()
         else:
             self.refresh_status()
-        self._launch_after_resume(selected_role)
+        self._launch_after_resume(resumed_role)
         return True
 
     def record_child_failure(
@@ -3465,6 +4200,51 @@ class OrcApp(App[None]):
         self.update_status(f"{role.title()} child failure: {_diagnostic(reason)}")
         self.refresh_workflow_ui()
 
+    def record_child_exit(
+        self,
+        session: Any,
+        detail: str,
+        *,
+        terminal: bool = False,
+    ) -> None:
+        """Record a child exit without duplicating generation timing."""
+
+        generation = getattr(session, "generation", None)
+        if not isinstance(generation, int) or generation < 1:
+            return
+
+        def apply(current: dict[str, Any] | None) -> None:
+            if current is None or not _audit_enabled(current):
+                return
+            status = (
+                current.get("status")
+                if current.get("status") in VALID_STATUSES
+                else None
+            )
+            phase = (
+                current.get("phase") if current.get("phase") in VALID_PHASES else None
+            )
+            status_after = status if terminal else None
+            phase_after = phase if terminal else None
+            append_audit_event(
+                current,
+                "child_exit",
+                role=getattr(session, "role", None),
+                generation=generation,
+                round_number=getattr(session, "round", None) or current_round(current),
+                status_before=status,
+                status_after=status_after,
+                phase_before=phase,
+                phase_after=phase_after,
+                stop_reason=current.get("stop_reason") if terminal else None,
+                detail=_diagnostic(detail),
+            )
+
+        try:
+            mutate_task_state(self.args.state_file, self.task_id, apply)
+        except (SystemExit, StateFormatError):
+            return
+
     def launch_role(self, role: str) -> None:
         existing = self.sessions.get(role)
         if (
@@ -3487,38 +4267,26 @@ class OrcApp(App[None]):
 
         target_value = record.get("target_directory")
         if not isinstance(target_value, str) or not target_value:
-            if record.get("schema_version") == STATE_SCHEMA_VERSION:
-                self.record_child_failure(role, "no target directory in Orc state")
-            else:
-                self.fatal_error(
-                    f"task {self.task_id} has no target directory in Orc state"
-                )
+            self.record_child_failure(role, "no target directory in Orc state")
             return
         target_directory = Path(target_value)
         if deadline_expired(record):
-            if record.get("schema_version") == STATE_SCHEMA_VERSION:
-                mutate_task_state(
-                    self.args.state_file,
-                    self.task_id,
-                    lambda current: (
-                        transition_task(current, "deadline")
-                        if current is not None
-                        else None
-                    ),
-                )
-            else:
-                transition_task(record, "deadline")
-                save_state(self.args.state_file, state)
+            mutate_task_state(
+                self.args.state_file,
+                self.task_id,
+                lambda current: (
+                    transition_task(current, "deadline")
+                    if current is not None
+                    else None
+                ),
+            )
             self.refresh_workflow_ui()
             return
 
         try:
             backend = backend_from_record(record)
         except SystemExit as error:
-            if record.get("schema_version") == STATE_SCHEMA_VERSION:
-                self.record_child_failure(role, str(error))
-            else:
-                self.fatal_error(str(error))
+            self.record_child_failure(role, str(error))
             return
 
         if record.get(
@@ -3533,13 +4301,7 @@ class OrcApp(App[None]):
 
         requests = record.get("user_requests", [])
         if not isinstance(requests, list):
-            if record.get("schema_version") == STATE_SCHEMA_VERSION:
-                self.record_child_failure(role, "invalid user requests")
-            else:
-                self.fatal_error(
-                    f"cannot launch {role}: invalid user requests for task "
-                    f"{self.task_id}"
-                )
+            self.record_child_failure(role, "invalid user requests")
             return
         has_request = isinstance(requests, list) and bool(requests)
         thread_id = record.get(f"{role}_id")
@@ -3551,13 +4313,7 @@ class OrcApp(App[None]):
             and not has_request
             and not record.get("automatic_rounds")
         ):
-            if record.get("schema_version") == STATE_SCHEMA_VERSION:
-                self.record_child_failure(role, "no user request recorded for resume")
-            else:
-                self.fatal_error(
-                    f"cannot resume {role}: no user request recorded for task "
-                    f"{self.task_id}"
-                )
+            self.record_child_failure(role, "no user request recorded for resume")
             return
         auto_continuation = bool(record.get("automatic_rounds")) and bool(
             isinstance(thread_id, str) and thread_id
@@ -3580,6 +4336,8 @@ class OrcApp(App[None]):
                 current_generations = current.get("role_generations", {})
                 if not isinstance(current_generations, dict):
                     current_generations = {}
+                if not _timing_generation_slot_available(current):
+                    raise SystemExit("timing generation retention full")
                 generation = int(current_generations.get(role, 0)) + 1
                 current_generations = dict(current_generations)
                 current_generations[role] = generation
@@ -3593,6 +4351,7 @@ class OrcApp(App[None]):
                 current_thread_id = current.get(f"{role}_id")
                 if backend == "claude":
                     current_thread_id = claude_session_for_role(current, role)
+                launch_started = utc_now()
                 launch_data = {
                     "role": role,
                     "phase": role,
@@ -3605,8 +4364,21 @@ class OrcApp(App[None]):
                         if isinstance(current_thread_id, str)
                         else None
                     ),
-                    "launched_at": iso_now(),
+                    "launched_at": audit_timestamp(launch_started),
                 }
+                append_audit_event(
+                    current,
+                    "launch_started",
+                    role=role,
+                    generation=generation,
+                    round_number=current_round(current),
+                    status_before=current.get("status"),
+                    status_after=current.get("status"),
+                    phase_before=current.get("phase"),
+                    phase_after=current.get("phase"),
+                    stop_reason=current.get("stop_reason"),
+                    now=launch_started,
+                )
                 launch_map[role] = launch_data
                 history = current.setdefault("launch_history", [])
                 if not isinstance(history, list):
@@ -3634,27 +4406,6 @@ class OrcApp(App[None]):
             auto_continuation = bool(record.get("automatic_rounds")) and bool(
                 isinstance(thread_id, str) and thread_id
             )
-        else:
-            generations = record.get("role_generations", {})
-            if not isinstance(generations, dict):
-                generations = {}
-            generation = int(generations.get(role, 0)) + 1
-            generations[role] = generation
-            record["role_generations"] = generations
-            launch_token = secrets.token_urlsafe(32)
-            history = record.setdefault("launch_history", [])
-            if isinstance(history, list):
-                history.append(
-                    {
-                        "role": role,
-                        "generation": generation,
-                        "phase": role,
-                        "launch_token": launch_token,
-                    }
-                )
-                del history[:-LAUNCH_HISTORY_LIMIT]
-            save_state(self.args.state_file, state)
-
         if role == "implementer":
             prompt = (
                 IMPLEMENTER_ROUND_PROMPT
@@ -3717,9 +4468,6 @@ class OrcApp(App[None]):
                 self.record_child_failure(role, "task disappeared during launch")
                 return
             record = loaded_record
-        else:
-            save_state(self.args.state_file, state)
-
         environment = os.environ.copy()
         # The child is connected to Orc's ANSI-capable terminal emulator, not
         # directly to the caller's stdout.  Do not let a wrapper/container
@@ -3731,18 +4479,16 @@ class OrcApp(App[None]):
         environment["ORC_ROLE"] = role
         environment["ORC_ROUND"] = str(record.get("round", 0))
         environment["ORC_ROLE_GENERATION"] = str(generation)
+        environment["ORC_LAUNCH_TOKEN"] = launch_token
         environment["ORC_TARGET_DIRECTORY"] = str(target_directory)
         environment["ORC_BACKEND"] = backend
         environment["ORC_STATE_FILE"] = str(self.args.state_file)
         try:
             pid, master_fd = self.fork_codex(command, environment, target_directory)
         except OSError as error:
-            if record.get("schema_version") == STATE_SCHEMA_VERSION:
-                self.record_child_failure(
-                    role, f"could not launch child: {error}", backend=backend
-                )
-            else:
-                self.fatal_error(f"could not launch {role}: {error}")
+            self.record_child_failure(
+                role, f"could not launch child: {error}", backend=backend
+            )
             return
 
         if record.get("schema_version") == STATE_SCHEMA_VERSION:
@@ -3767,6 +4513,54 @@ class OrcApp(App[None]):
                             item["live_child"] = True
                             break
                 current["live_child"] = {"role": role, "pid": pid}
+                timing = _timing(current)
+                if timing is not None:
+                    generations = timing.get("generations")
+                    if not isinstance(generations, list):
+                        raise SystemExit("invalid timing generations")
+                    if len(generations) >= TIMING_GENERATION_LIMIT:
+                        evict_at = next(
+                            (
+                                index
+                                for index, item in enumerate(generations)
+                                if isinstance(item, dict)
+                                and item.get("ended_at") is not None
+                            ),
+                            None,
+                        )
+                        if evict_at is None:
+                            raise SystemExit("timing generation retention full")
+                        generations.pop(evict_at)
+                    spawned = utc_now()
+                    generations.append(
+                        {
+                            "role": role,
+                            "round": current_round(current),
+                            "generation": generation,
+                            "launched_at": (
+                                launch_data.get("launched_at")
+                                if isinstance(launch_data, dict)
+                                else audit_timestamp(spawned)
+                            ),
+                            "spawned_at": audit_timestamp(spawned),
+                            "ended_at": None,
+                            "end_event": None,
+                            "wall_seconds": None,
+                        }
+                    )
+                    append_audit_event(
+                        current,
+                        "launch_spawned",
+                        role=role,
+                        generation=generation,
+                        round_number=current_round(current),
+                        status_before=current.get("status"),
+                        status_after=current.get("status"),
+                        phase_before=current.get("phase"),
+                        phase_after=current.get("phase"),
+                        stop_reason=current.get("stop_reason"),
+                        now=spawned,
+                    )
 
             try:
                 mutate_task_state(self.args.state_file, self.task_id, persist_child)
@@ -4119,47 +4913,22 @@ class OrcApp(App[None]):
 
         exit_code = child_exit_code(status)
         if exit_code != 0:
-            if record.get("schema_version") == STATE_SCHEMA_VERSION:
-                self.record_child_failure(
-                    session.role,
-                    f"Claude exited with status {exit_code}",
-                    backend="claude",
-                    diagnostics=getattr(session, "stream_rejected_diagnostics", None),
-                )
-                return True
-            record["child_failure"] = {
-                "role": session.role,
-                "backend": "claude",
-                "exit_status": status,
-                "reason": f"Claude exited with status {exit_code}",
-                "time": iso_now(),
-            }
-            set_stop_reason(record, "child_failure")
-            save_state(self.args.state_file, state)
-            self.refresh_workflow_ui()
+            self.record_child_failure(
+                session.role,
+                f"Claude exited with status {exit_code}",
+                backend="claude",
+                diagnostics=getattr(session, "stream_rejected_diagnostics", None),
+            )
             return True
 
         payload = self.claude_handoff(session)
         if payload is None:
-            if record.get("schema_version") == STATE_SCHEMA_VERSION:
-                self.record_child_failure(
-                    session.role,
-                    session.stream_error or "clean Claude exit without a valid handoff",
-                    backend="claude",
-                    diagnostics=getattr(session, "stream_rejected_diagnostics", None),
-                )
-                return True
-            record["child_failure"] = {
-                "role": session.role,
-                "backend": "claude",
-                "exit_status": status,
-                "reason": session.stream_error
-                or "clean Claude exit without a valid handoff",
-                "time": iso_now(),
-            }
-            set_stop_reason(record, "child_failure")
-            save_state(self.args.state_file, state)
-            self.refresh_workflow_ui()
+            self.record_child_failure(
+                session.role,
+                session.stream_error or "clean Claude exit without a valid handoff",
+                backend="claude",
+                diagnostics=getattr(session, "stream_rejected_diagnostics", None),
+            )
             return True
 
         session_id = session.session_id
@@ -4177,6 +4946,21 @@ class OrcApp(App[None]):
                         current["claude_sessions"] = sessions
                     sessions[session.role] = session_id
                     current[f"{session.role}_id"] = session_id
+                    launch = launch_record(current, session.role)
+                    launch_generation = None
+                    if isinstance(launch, dict):
+                        launch["session_id"] = session_id
+                        launch_generation = launch.get("generation")
+                    history = current.get("launch_history", [])
+                    if isinstance(history, list):
+                        for item in reversed(history):
+                            if (
+                                isinstance(item, dict)
+                                and item.get("role") == session.role
+                                and item.get("generation") == launch_generation
+                            ):
+                                item["session_id"] = session_id
+                                break
 
                 mutate_task_state(
                     self.args.state_file, self.task_id, persist_claude_session
@@ -4189,17 +4973,6 @@ class OrcApp(App[None]):
                     )
                     return True
                 record = loaded_record
-            else:
-                record["claude_session_id"] = session_id
-                record["claude_final_response"] = None
-                sessions = record.setdefault("claude_sessions", {})
-                if not isinstance(sessions, dict):
-                    sessions = {}
-                    record["claude_sessions"] = sessions
-                sessions[session.role] = session_id
-                record[f"{session.role}_id"] = session_id
-                save_state(self.args.state_file, state)
-
         previous_task = os.environ.get("ORC_TASK_ID")
         previous_role = os.environ.get("ORC_ROLE")
         previous_round = os.environ.get("ORC_ROUND")
@@ -4243,18 +5016,7 @@ class OrcApp(App[None]):
                 )
             )
         except SystemExit as error:
-            if record.get("schema_version") == STATE_SCHEMA_VERSION:
-                self.record_child_failure(session.role, str(error), backend="claude")
-            else:
-                record["child_failure"] = {
-                    "role": session.role,
-                    "backend": "claude",
-                    "exit_status": status,
-                    "reason": str(error),
-                    "time": iso_now(),
-                }
-                set_stop_reason(record, "child_failure")
-                save_state(self.args.state_file, state)
+            self.record_child_failure(session.role, str(error), backend="claude")
             self.refresh_workflow_ui()
         finally:
             if previous_task is None:
@@ -4573,6 +5335,10 @@ class OrcApp(App[None]):
                 state = load_state(self.args.state_file)
                 record = state.get(self.task_id)
                 if getattr(session, "retired", False):
+                    self.record_child_exit(
+                        session,
+                        "retired child exited after handoff",
+                    )
                     self.close_session_fd(session)
                     if session in getattr(self, "retired_sessions", []):
                         self.retired_sessions.remove(session)
@@ -4584,35 +5350,46 @@ class OrcApp(App[None]):
                 ):
                     self.drain_session(session)
                     self.handle_claude_exit(session, state, record, _status)
+                    refreshed = load_state(self.args.state_file).get(self.task_id)
+                    if (
+                        isinstance(refreshed, dict)
+                        and refreshed.get("schema_version") == STATE_SCHEMA_VERSION
+                        and (
+                            refreshed.get("status") in TERMINAL_TASK_STATUSES
+                            or (
+                                refreshed.get("status") == "active"
+                                and refreshed.get("phase") != session.role
+                            )
+                        )
+                    ):
+                        self.record_child_exit(
+                            session,
+                            "Claude child exited after handoff",
+                        )
                     continue
                 if (
                     isinstance(record, dict)
                     and record.get("status") not in TERMINAL_TASK_STATUSES
                     and child_exit_code(_status) != 0
                 ):
-                    if record.get("schema_version") == STATE_SCHEMA_VERSION:
-                        self.record_child_failure(
-                            session.role,
-                            f"Codex exited with status {child_exit_code(_status)}",
-                            backend="codex",
-                        )
-                        continue
-                    record["child_failure"] = {
-                        "role": session.role,
-                        "backend": "codex",
-                        "exit_status": _status,
-                        "reason": (
-                            f"Codex exited with status {child_exit_code(_status)}"
-                        ),
-                        "time": iso_now(),
-                    }
-                    set_stop_reason(record, "child_failure")
-                    save_state(self.args.state_file, state)
-                    self.refresh_workflow_ui()
+                    self.record_child_failure(
+                        session.role,
+                        f"Codex exited with status {child_exit_code(_status)}",
+                        backend="codex",
+                    )
                     continue
                 expected_handoff = (
                     isinstance(record, dict) and record.get("phase") != session.role
                 )
+                if (
+                    isinstance(record, dict)
+                    and record.get("schema_version") == STATE_SCHEMA_VERSION
+                    and expected_handoff
+                ):
+                    self.record_child_exit(
+                        session,
+                        "Codex child exited after handoff",
+                    )
                 if (
                     session.role == "implementer"
                     and isinstance(record, dict)
@@ -4633,21 +5410,11 @@ class OrcApp(App[None]):
                     and record.get("status") == "active"
                     and record.get("phase") == session.role
                 ):
-                    if record.get("schema_version") == STATE_SCHEMA_VERSION:
-                        self.record_child_failure(
-                            session.role,
-                            "clean child exit without a valid handoff",
-                            backend=getattr(session, "backend", "codex"),
-                        )
-                        continue
-                    record["child_failure"] = {
-                        "role": session.role,
-                        "exit_status": _status,
-                        "time": iso_now(),
-                    }
-                    set_stop_reason(record, "child_failure")
-                    save_state(self.args.state_file, state)
-                    self.refresh_workflow_ui()
+                    self.record_child_failure(
+                        session.role,
+                        "clean child exit without a valid handoff",
+                        backend=getattr(session, "backend", "codex"),
+                    )
                 elif session.role == self._selected_role() and not expected_handoff:
                     self.refresh_status()
                 self.refresh_status()
@@ -4859,6 +5626,7 @@ def begin(args: argparse.Namespace) -> None:
         "rejected_events": [],
         "stop_diagnostic": None,
     }
+    initialize_audit_state(record, started)
     with state_lock(args.state_file):
         state = _read_state(args.state_file)
         if args.task_id in state:
@@ -4918,90 +5686,6 @@ def resume(args: argparse.Namespace) -> None:
         mutate_task_state(args.state_file, args.task_id, apply)
         run_app(args, args.task_id)
         return
-    if record.get("status") == "active":
-        raise SystemExit(f"task {args.task_id} is already active")
-    if record.get("status") == "completed":
-        raise SystemExit(f"task {args.task_id} is already complete")
-    if record.get("phase") == "complete" or record.get("stop_reason") == "completion":
-        raise SystemExit(f"task {args.task_id} is already complete")
-    requests = record.get("user_requests")
-    if requests is None:
-        requests = record.get("user_feedback", [])
-    if not isinstance(requests, list):
-        raise SystemExit(f"Orc state for {args.task_id} has invalid user_requests")
-    if "user_requests" not in record:
-        record["user_requests"] = list(requests)
-    automatic = bool(record.get("automatic_rounds"))
-    if automatic:
-        max_rounds = valid_round_limit(record.get("max_rounds"))
-        deadline_seconds = valid_deadline_seconds(record.get("deadline_seconds"))
-        if max_rounds is None or deadline_seconds is None:
-            raise SystemExit(
-                f"task {args.task_id} has invalid automatic limits; "
-                "expected 1-5 rounds and 1-1440 minutes"
-            )
-        deadline_at = parse_timestamp(record.get("deadline_at"))
-        if deadline_at is None:
-            raise SystemExit(
-                f"task {args.task_id} has no valid persisted automatic deadline"
-            )
-        if deadline_at <= utc_now():
-            raise SystemExit(f"task {args.task_id} deadline has expired")
-    else:
-        max_rounds = valid_round_limit(record.get("max_rounds")) or DEFAULT_MAX_ROUNDS
-        deadline_seconds = (
-            valid_deadline_seconds(record.get("deadline_seconds"))
-            or DEFAULT_DEADLINE_SECONDS
-        )
-
-    configured_command = stored_backend_command(record, backend)
-    backend_version = preflight_backend(backend, configured_command)
-
-    child_failure = record.get("child_failure")
-    reviewer_rollout_failed = (
-        record.get("stop_reason") == "child_failure"
-        and isinstance(child_failure, dict)
-        and child_failure.get("role") == "reviewer"
-    )
-
-    # All validation is complete before changing the loaded record.
-    append_user_request(record, args.prompt)
-    record.pop("child_failure", None)
-    previous_status = record.get("status")
-    record["status"] = "active"
-    if reviewer_rollout_failed:
-        # A missing Codex rollout cannot be resumed.  Preserve Igor's commit
-        # and review round, but force a new Rufus session on the next launch.
-        record["reviewer_id"] = None
-        record["reviewer_reported_complete"] = False
-        record["phase"] = "reviewer"
-    else:
-        record["phase"] = "implementer"
-    if not automatic:
-        started = utc_now()
-        record["automatic_rounds"] = True
-        record["max_rounds"] = max_rounds
-        record["deadline_seconds"] = deadline_seconds
-        record["cycle_started_at"] = started.isoformat(timespec="seconds")
-        record["deadline_at"] = (
-            started + timedelta(seconds=deadline_seconds)
-        ).isoformat(timespec="seconds")
-    record["target_directory"] = str(target_directory)
-    record["backend"] = backend
-    record["backend_command"] = (
-        configured_command[0] if len(configured_command) == 1 else configured_command
-    )
-    if not record.get("backend_version"):
-        record["backend_version"] = backend_version
-    record["round"] = current_round(record)
-    record["stop_reason"] = None
-    record["clarification_received"] = (
-        args.prompt
-        if previous_status == "blocked"
-        else record.get("clarification_received")
-    )
-    _atomic_write_state(args.state_file, state)
-    run_app(args, args.task_id)
 
 
 def parse_claude_result_event(
@@ -5053,16 +5737,19 @@ def _strict_idle_hook(
 ) -> bool:
     """Process a new-schema event through the serialized state path."""
 
+    def reject(reason: str) -> bool:
+        record_rejected_event(record, reason)
+        _audit_handoff_rejected(record, role, reason)
+        return False
+
     try:
         message, session_id = parse_codex_idle_payload(payload)
     except ValueError as error:
-        record_rejected_event(record, str(error))
-        return False
+        return reject(str(error))
 
     launch = launch_record(record, role)
     if launch is None:
-        record_rejected_event(record, "event has no persisted launch generation")
-        return False
+        return reject("event has no persisted launch generation")
     try:
         canonical = parse_handoff_message(
             message,
@@ -5070,8 +5757,7 @@ def _strict_idle_hook(
             launch_token=launch.get("launch_token"),
         )
     except ValueError as error:
-        record_rejected_event(record, str(error))
-        return False
+        return reject(str(error))
     if record.get("status") in TERMINAL_TASK_STATUSES:
         return True
     expected_session = launch.get("session_id")
@@ -5080,16 +5766,16 @@ def _strict_idle_hook(
         and expected_session
         and session_id != expected_session
     ):
-        record_rejected_event(record, "handoff session identity does not match launch")
+        return reject("handoff session identity does not match launch")
+    if deadline_expired(record):
+        transition_task(record, "deadline")
         return False
     try:
         handoff_context({"handoffs": [{"role": role, "canonical": canonical}]}, role)
     except ValueError as error:
-        record_rejected_event(record, str(error))
-        return False
+        return reject(str(error))
     if not handoff_slot_available(copy.deepcopy(record), role):
-        record_rejected_event(record, "handoff_capacity: no eligible handoff slot")
-        return False
+        return reject("handoff_capacity: no eligible handoff slot")
     receipt = canonical_receipt(
         {
             "task": task_id,
@@ -5108,8 +5794,7 @@ def _strict_idle_hook(
     ):
         return True
     if record.get("phase") != role or launch.get("phase") != record.get("phase"):
-        record_rejected_event(record, "stale handoff phase")
-        return False
+        return reject("stale handoff phase")
     if len(receipts) >= RECEIPT_LIMIT:
         evicted = False
         for index, item in enumerate(receipts):
@@ -5131,13 +5816,13 @@ def _strict_idle_hook(
                 "reason": "receipt_capacity: no eligible receipt slot",
                 "time": iso_now(),
             }
-            set_stop_reason(record, "child_failure")
+            transition_task(record, "child_failure", role=role)
             record_rejected_event(record, "receipt_capacity")
+            _audit_handoff_rejected(record, role, "receipt_capacity")
             return False
     target_value = record.get("target_directory")
     if not isinstance(target_value, str) or not target_value:
-        record_rejected_event(record, "handoff has no valid target directory")
-        return False
+        return reject("handoff has no valid target directory")
     target_directory = normalize_target_directory(Path(target_value))
     git_diagnostics: list[str] = []
     commit = current_commit(target_directory, git_diagnostics)
@@ -5151,8 +5836,9 @@ def _strict_idle_hook(
             "reason": reason,
             "time": iso_now(),
         }
-        set_stop_reason(record, "child_failure")
+        transition_task(record, "child_failure", role=role)
         record_rejected_event(record, reason)
+        _audit_handoff_rejected(record, role, reason)
         return False
     handoff = {
         "schema_version": 1,
@@ -5169,12 +5855,13 @@ def _strict_idle_hook(
     }
     handoff.update(canonical)
     if not append_handoff(record, handoff):
-        record_rejected_event(record, "handoff_capacity: no eligible handoff slot")
-        return False
+        return reject("handoff_capacity: no eligible handoff slot")
     record["last_handoff"] = handoff
     record["last_role"] = role
     record["last_commit"] = handoff["commit"]
     record["last_idle_role"] = role
+    if role == "reviewer":
+        record["reviewer_reported_complete"] = canonical["status"] == "COMPLETE"
     record[f"{role}_id"] = session_id
     if role == "reviewer":
         record["last_reviewer_event"] = canonical
@@ -5208,14 +5895,17 @@ def idle_hook(args: argparse.Namespace) -> None:
         role = os.environ.get("ORC_ROLE")
         if task_id and role in {"implementer", "reviewer"}:
             try:
+
+                def apply(current: dict[str, Any] | None) -> None:
+                    if current is None:
+                        return
+                    record_rejected_event(current, reason)
+                    _audit_handoff_rejected(current, role, reason)
+
                 mutate_task_state(
                     args.state_file,
                     task_id,
-                    lambda current: (
-                        record_rejected_event(current, reason)
-                        if current is not None
-                        else None
-                    ),
+                    apply,
                 )
             except (SystemExit, StateFormatError):
                 pass
@@ -5284,147 +5974,6 @@ def idle_hook(args: argparse.Namespace) -> None:
 
         mutate_task_state(args.state_file, task_id, apply)
         return
-
-    status = handoff_status(payload)
-    reason = handoff_reason(payload)
-    if status == UNABLE_TO_PROCEED and not reason:
-        raise SystemExit("UNABLE_TO_PROCEED handoff requires a concise reason")
-
-    event_key = handoff_event_key(task_id, role, payload)
-    processed = record.get("processed_idle_events", [])
-    if not isinstance(processed, list):
-        processed = []
-    if event_key in processed:
-        return
-    if record.get("status") in {"blocked", "stopped", "completed"}:
-        return
-    current_phase = record.get("phase")
-    if current_phase in {"implementer", "reviewer"} and current_phase != role:
-        return
-    if record.get("status") == "paused" and role == "reviewer":
-        return
-
-    expected_session = record.get(f"{role}_id")
-    if (
-        isinstance(expected_session, str)
-        and expected_session
-        and session_id
-        and session_id != expected_session
-    ):
-        return
-    expected_round = int(record.get("round", 0))
-    generations = record.get("role_generations", {})
-    generation_tracking = isinstance(generations, dict) and role in generations
-    for key, expected in (("round", expected_round), ("generation", None)):
-        value = payload_field(payload, key)
-        if value is None and generation_tracking and key == "round":
-            value = os.environ.get("ORC_ROUND")
-        if value is None and generation_tracking and key == "generation":
-            value = os.environ.get("ORC_ROLE_GENERATION")
-        if value is None:
-            continue
-        try:
-            actual = int(value)
-        except (TypeError, ValueError):
-            return
-        if key == "generation":
-            expected = generations.get(role)
-        if expected is not None and actual != int(expected):
-            return
-    if deadline_expired(record):
-        set_stop_reason(record, "deadline")
-        _atomic_write_state(args.state_file, state)
-        return
-
-    target_value = record.get("target_directory")
-    if not isinstance(target_value, str) or not target_value:
-        raise SystemExit(
-            f"idle hook found no valid target directory for task {task_id}"
-        )
-    target_directory = normalize_target_directory(Path(target_value))
-    if session_id:
-        record[f"{role}_id"] = session_id
-    handoff_thread_id = session_id
-    if handoff_thread_id is None:
-        saved_thread_id = record.get(f"{role}_id")
-        if isinstance(saved_thread_id, str) and saved_thread_id:
-            handoff_thread_id = saved_thread_id
-    record["last_idle_role"] = role
-    record["last_idle_event"] = payload
-
-    handoff = {
-        "time": iso_now(),
-        "local_time": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "task_id": task_id,
-        "role": role,
-        "round": record.get("round", 0),
-        "thread_id": handoff_thread_id,
-        "target_directory": str(target_directory),
-        "commit": current_commit(target_directory),
-        "message": assistant_message_from_payload(payload),
-        "status": status,
-    }
-    generation = payload_field(payload, "generation")
-    if generation is None:
-        generation = os.environ.get("ORC_ROLE_GENERATION")
-    if generation is not None:
-        try:
-            handoff["generation"] = int(generation)
-        except (TypeError, ValueError):
-            pass
-    handoff.update(handoff_details(payload))
-    if status == UNABLE_TO_PROCEED:
-        handoff["reason"] = reason
-    handoffs = record.setdefault("handoffs", [])
-    if not isinstance(handoffs, list):
-        handoffs = []
-        record["handoffs"] = handoffs
-    handoffs.append(handoff)
-    record["last_handoff"] = handoff
-    record["last_role"] = role
-    record["last_commit"] = handoff["commit"]
-    processed.append(event_key)
-    record["processed_idle_events"] = processed[-PROCESSED_EVENT_LIMIT:]
-
-    if status == UNABLE_TO_PROCEED:
-        record["blocker_role"] = role
-        record["blocker_reason"] = reason
-        record["blocked_task"] = task_id
-        record["blocked_round"] = record.get("round", 0)
-        record["blocked_thread"] = handoff_thread_id
-        record["blocked_at"] = handoff["time"]
-        record["blocked_commit"] = handoff["commit"]
-        record["last_reviewer_event"] = (
-            payload if role == "reviewer" else record.get("last_reviewer_event")
-        )
-        set_stop_reason(record, "clarification")
-        save_state(args.state_file, state)
-        return
-
-    if role == "implementer":
-        if int(record.get("round", 0)) == 0:
-            record["round"] = 1
-        record["phase"] = "reviewer"
-        save_state(args.state_file, state)
-        return
-
-    record["last_reviewer_event"] = payload
-    message = assistant_message_from_payload(payload) or ""
-    record["reviewer_reported_complete"] = status == "COMPLETE" or bool(
-        re.search(r"(?im)^\s*TASK COMPLETE\s*$", message)
-    )
-    if record["reviewer_reported_complete"]:
-        set_stop_reason(record, "completion", completed=True)
-    else:
-        maximum = valid_round_limit(record.get("max_rounds")) or DEFAULT_MAX_ROUNDS
-        if current_round(record) >= maximum:
-            set_stop_reason(record, "max_rounds")
-        else:
-            record["round"] = current_round(record) + 1
-            record["phase"] = "implementer"
-            record["status"] = "active"
-            record["stop_reason"] = None
-    _atomic_write_state(args.state_file, state)
 
 
 def find_task_role(

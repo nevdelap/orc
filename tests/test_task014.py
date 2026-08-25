@@ -103,6 +103,25 @@ def strict_record(target: Path, backend: str, command: Path) -> dict[str, object
         "automatic_rounds": True,
         "deadline_at": "2099-01-01T00:00:00+00:00",
         "stop_reason": "manual_pause",
+        "audit_events": [],
+        "audit_next_sequence": 1,
+        "audit_dropped_count": 0,
+        "last_terminal_event_key": orc._audit_terminal_key(
+            "state_transition",
+            None,
+            None,
+            "paused",
+            "paused",
+            "manual_pause",
+        ),
+        "timing": {
+            "task_started_at": "2025-01-01T00:00:00Z",
+            "task_finished_at": "2025-01-01T00:00:00Z",
+            "wall_seconds": 0,
+            "agent_wall_seconds": {"implementer": 0, "reviewer": 0},
+            "unattributed_wall_seconds": 0,
+            "generations": [],
+        },
     }
 
 

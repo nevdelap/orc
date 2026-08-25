@@ -38,6 +38,17 @@ prompts are ephemeral, capped at 32 KiB, and reduce optional handoff context
 before launch; an explicit request is never silently truncated. Rejected
 diagnostics retain at most 64 entries and 4 KiB per diagnostic.
 
+Schema-3 task records also retain a chronological `audit_events` list capped
+at 256 entries, monotonic `audit_next_sequence`, saturating
+`audit_dropped_count`, `last_terminal_event_key`, and bounded task/generation
+timing totals. Audit events are appended under the state lock in the same
+revisioned atomic write as the state decision. They record only safe role,
+round, generation, status/phase, stop-reason, timestamp, and bounded
+diagnostic data; prompts, launch tokens, backend arguments, raw payloads, and
+transcripts are redacted and never persisted in the audit trail. Open timing
+generations are never evicted; a full set of open generations rejects a launch
+with `timing generation retention full` before child spawn.
+
 The implementation plan is the source of truth for task scope, dependencies,
 acceptance criteria, and state. A task must be fully specified before Igor
 starts. A blocked task is skipped until a human changes it back to `NEW`.

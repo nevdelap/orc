@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import fcntl
 import importlib.util
+import io
 import json
 import os
 import select
@@ -14,6 +15,7 @@ import termios
 import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -39,6 +41,149 @@ def default_codex_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
         return real_preflight(backend, command)
 
     monkeypatch.setattr(orc, "preflight_backend", preflight)
+
+
+def save_schema3_fixture(path: Path, state: dict[str, Any]) -> None:
+    """Write an explicit schema-3 fixture for older unit-test scenarios."""
+
+    for task_id, record in state.items():
+        if not isinstance(record, dict):
+            continue
+        status = record.setdefault("status", "active")
+        if status not in {"active", *orc.TERMINAL_TASK_STATUSES}:
+            status = "active"
+            record["status"] = status
+        phase = {
+            "paused": "paused",
+            "blocked": "blocked",
+            "stopped": "stopped",
+            "completed": "complete",
+        }.get(status, record.get("phase"))
+        if status == "active" and phase not in {"implementer", "reviewer"}:
+            phase = "implementer"
+        record["phase"] = phase
+        failure = record.get("child_failure")
+        failed_role = (
+            failure.get("role")
+            if isinstance(failure, dict)
+            and failure.get("role") in {"implementer", "reviewer"}
+            else None
+        )
+        record.update(
+            {
+                "schema_version": orc.STATE_SCHEMA_VERSION,
+                "revision": record.get("revision", 1),
+                "task_id": task_id,
+                "round": record.get("round", 1),
+                "target_directory": record.get("target_directory", str(path.parent)),
+                "backend": record.get("backend", "codex"),
+                "backend_command": record.get("backend_command", "codex"),
+                "user_requests": record.get("user_requests", []),
+                "handoffs": record.get("handoffs", []),
+                "event_receipts": record.get("event_receipts", []),
+                "rejected_events": record.get("rejected_events", []),
+                "max_rounds": record.get("max_rounds", 5),
+                "deadline_seconds": record.get("deadline_seconds", 3600),
+                "automatic_rounds": record.get("automatic_rounds", True),
+                "deadline_at": record.get("deadline_at", "2099-01-01T00:00:00+00:00"),
+            }
+        )
+        record["role_states"] = {
+            role: (
+                "failed"
+                if failed_role == role
+                else (
+                    "active"
+                    if status == "active" and phase == role
+                    else "waiting"
+                    if status == "active"
+                    else "inactive"
+                )
+            )
+            for role in ("implementer", "reviewer")
+        }
+        generations = record.get("role_generations")
+        if not isinstance(generations, dict):
+            generations = {}
+        record["role_generations"] = {
+            role: (
+                generations.get(role, 0)
+                if isinstance(generations.get(role, 0), int)
+                and not isinstance(generations.get(role, 0), bool)
+                and generations.get(role, 0) >= 0
+                else 0
+            )
+            for role in ("implementer", "reviewer")
+        }
+        record.setdefault("role_launches", {})
+        if status == "active":
+            record["stop_reason"] = None
+        else:
+            record["stop_reason"] = record.get("stop_reason") or {
+                "paused": "manual_pause",
+                "blocked": "clarification",
+                "completed": "completion",
+            }.get(status, "orchestrator_exit")
+        record.setdefault("audit_events", [])
+        record.setdefault("audit_next_sequence", 1)
+        record.setdefault("audit_dropped_count", 0)
+        record.setdefault("last_terminal_event_key", None)
+        record.setdefault(
+            "timing",
+            {
+                "task_started_at": "2025-01-01T00:00:00Z",
+                "task_finished_at": None,
+                "wall_seconds": 0,
+                "agent_wall_seconds": {"implementer": 0, "reviewer": 0},
+                "unattributed_wall_seconds": 0,
+                "generations": [],
+            },
+        )
+        if status in orc.TERMINAL_TASK_STATUSES:
+            terminal_key = orc._audit_terminal_key(
+                "state_transition", None, None, status, phase, record["stop_reason"]
+            )
+            record["last_terminal_event_key"] = terminal_key
+            record["audit_events"] = [
+                {
+                    "sequence": 1,
+                    "time": "2025-01-01T00:00:00Z",
+                    "event": "state_transition",
+                    "role": None,
+                    "round": record["round"],
+                    "generation": None,
+                    "status_before": "active",
+                    "status_after": status,
+                    "phase_before": "implementer",
+                    "phase_after": phase,
+                    "stop_reason": record["stop_reason"],
+                    "commit": None,
+                    "detail": "test fixture terminal transition",
+                }
+            ]
+            record["audit_next_sequence"] = 2
+            record["timing"]["task_finished_at"] = "2025-01-01T00:00:00Z"
+        else:
+            record["last_terminal_event_key"] = None
+            record["timing"]["task_finished_at"] = None
+            thread_id = record.get(f"{phase}_id")
+            if isinstance(thread_id, str) and thread_id:
+                generation = max(1, record["role_generations"][phase])
+                record["role_generations"][phase] = generation
+                record["role_launches"].setdefault(
+                    phase,
+                    {
+                        "role": phase,
+                        "phase": phase,
+                        "round": record["round"],
+                        "generation": generation,
+                        "launch_token": f"test-{phase}-token",
+                        "backend": record["backend"],
+                        "session_id": thread_id,
+                        "can_report": True,
+                    },
+                )
+    orc.save_state(path, state)
 
 
 class Event:
@@ -85,6 +230,58 @@ def make_git_target(path: Path) -> str:
         capture_output=True,
         text=True,
     ).stdout.strip()
+
+
+def test_terminal_key_validation_enforces_applicability_and_evidence(
+    tmp_path: Path,
+) -> None:
+    key = orc._audit_terminal_key(
+        "state_transition", None, None, "stopped", "stopped", "deadline"
+    )
+    orc._validate_terminal_key(key)
+    with pytest.raises(orc.StateFormatError):
+        orc._validate_terminal_key(
+            '["unknown",null,null,"stopped","stopped","deadline"]'
+        )
+    with pytest.raises(orc.StateFormatError):
+        orc._validate_terminal_key(key + " ")
+
+    record = {
+        "status": "active",
+        "phase": "implementer",
+        "stop_reason": None,
+        "audit_events": [],
+    }
+    with pytest.raises(orc.StateFormatError, match="does not match"):
+        orc._validate_terminal_key(key, record)
+    record["status"] = "stopped"
+    record["phase"] = "stopped"
+    record["stop_reason"] = "deadline"
+    record["audit_events"] = None
+    orc._validate_terminal_key(key, record)
+
+
+def test_schema3_rejects_invalid_revision_before_required_fields() -> None:
+    with pytest.raises(orc.StateFormatError, match="invalid revision"):
+        orc._validate_state_document(
+            {"TASK-003": {"schema_version": orc.STATE_SCHEMA_VERSION, "revision": -1}},
+            Path("state.json"),
+        )
+
+
+def test_schema3_rejects_malformed_audit_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    make_git_target(target)
+    state_file = tmp_path / "state.json"
+    monkeypatch.setattr(orc, "run_app", lambda *_: None)
+    orc.begin(cli_args(state_file, target))
+    value = orc.load_state(state_file)["TASK-003"]
+    value["audit_events"] = "not-a-list"
+    with pytest.raises(orc.StateFormatError, match="invalid audit_events"):
+        orc._validate_state_document({"TASK-003": value}, state_file)
 
 
 def test_direct_script_help_invocation() -> None:
@@ -153,9 +350,10 @@ def test_begin_rejects_duplicate_without_overwriting_state(
 ) -> None:
     target = tmp_path / "target"
     target.mkdir()
+    make_git_target(target)
     state_file = tmp_path / "state.json"
     old = {"TASK-003": {"target_directory": str(target), "prompt": "old"}}
-    orc.save_state(state_file, old)
+    save_schema3_fixture(state_file, old)
     monkeypatch.setattr(orc, "run_app", lambda *_: pytest.fail("must not launch"))
     with pytest.raises(SystemExit, match="task already exists"):
         orc.begin(cli_args(state_file, target))
@@ -181,7 +379,7 @@ def test_resume_requires_matching_target_before_mutating_state(
             "user_requests": [],
         }
     }
-    orc.save_state(state_file, state)
+    save_schema3_fixture(state_file, state)
     monkeypatch.setattr(orc, "run_app", lambda *_: pytest.fail("must not launch"))
 
     with pytest.raises(SystemExit, match="does not match"):
@@ -206,14 +404,14 @@ def test_resume_records_request_after_matching_target(
             "user_requests": [],
         }
     }
-    orc.save_state(state_file, state)
+    save_schema3_fixture(state_file, state)
     monkeypatch.setattr(orc, "run_app", lambda *_: None)
 
     orc.resume(cli_args(state_file, target))
 
     record = orc.load_state(state_file)["TASK-003"]
     assert record["user_requests"] == ["implement the task"]
-    assert record["round"] == 2
+    assert record["round"] == 1
     assert record["phase"] == "implementer"
 
 
@@ -237,7 +435,7 @@ def test_resume_restarts_reviewer_after_child_failure(
             "child_failure": {"role": "reviewer", "exit_status": 256},
         }
     }
-    orc.save_state(state_file, state)
+    save_schema3_fixture(state_file, state)
     monkeypatch.setattr(orc, "run_app", lambda *_: None)
 
     orc.resume(cli_args(state_file, target))
@@ -274,7 +472,7 @@ def test_resume_clears_failure_before_role_becomes_active(
             "child_failure": {"role": role, "exit_status": 256},
         }
     }
-    orc.save_state(state_file, state)
+    save_schema3_fixture(state_file, state)
     monkeypatch.setattr(orc, "run_app", lambda *_: None)
 
     orc.resume(cli_args(state_file, target))
@@ -301,17 +499,17 @@ def test_resume_rejects_missing_stored_target_without_mutation(
     target.mkdir()
     state_file = tmp_path / "state.json"
     state = {"TASK-003": {"prompt": "old", "user_requests": []}}
-    orc.save_state(state_file, state)
+    state_file.write_text(json.dumps(state))
     monkeypatch.setattr(orc, "run_app", lambda *_: pytest.fail("must not launch"))
-    with pytest.raises(SystemExit, match="no stored target"):
+    with pytest.raises(SystemExit, match="unsupported pre-baseline"):
         orc.resume(cli_args(state_file, target))
-    assert orc.load_state(state_file) == state
+    assert json.loads(state_file.read_text()) == state
 
 
 def test_state_load_save_and_errors(tmp_path: Path) -> None:
     path = tmp_path / "nested" / "state.json"
     value = {"task": {"round": 1}}
-    orc.save_state(path, value)
+    save_schema3_fixture(path, value)
     assert orc.load_state(path) == value
     path.write_text("[]")
     with pytest.raises(SystemExit, match="must contain an object"):
@@ -349,13 +547,14 @@ def test_idle_hook_records_target_commit_and_role_transition(
     target.mkdir()
     commit = make_git_target(target)
     state_file = tmp_path / "state.json"
-    orc.save_state(
+    save_schema3_fixture(
         state_file,
         {
             "TASK-003": {
                 "round": 1,
                 "target_directory": str(target.resolve()),
-                "implementer_id": None,
+                "phase": "implementer",
+                "implementer_id": "igor-thread",
                 "reviewer_id": None,
                 "handoffs": [],
             }
@@ -363,11 +562,7 @@ def test_idle_hook_records_target_commit_and_role_transition(
     )
     monkeypatch.setenv("ORC_TASK_ID", "TASK-003")
     monkeypatch.setenv("ORC_ROLE", "implementer")
-    payload = {
-        "session_id": "igor-thread",
-        "cwd": str(Path.cwd()),
-        "last-assistant-message": "done",
-    }
+    payload = strict_handoff_payload("implementer", session_id="igor-thread")
     args = argparse.Namespace(state_file=state_file, payload=json.dumps(payload))
 
     orc.idle_hook(args)
@@ -377,7 +572,7 @@ def test_idle_hook_records_target_commit_and_role_transition(
     assert record["implementer_id"] == "igor-thread"
     assert record["last_handoff"]["commit"] == commit
     assert record["last_handoff"]["target_directory"] == str(target.resolve())
-    assert record["last_handoff"]["message"] == "done"
+    assert record["last_handoff"]["canonical"]["status"] == "HANDOFF"
 
 
 def test_idle_hook_reviewer_pauses_and_finds_role_by_session(
@@ -385,12 +580,14 @@ def test_idle_hook_reviewer_pauses_and_finds_role_by_session(
 ) -> None:
     target = tmp_path / "target"
     target.mkdir()
+    make_git_target(target)
     state_file = tmp_path / "state.json"
-    orc.save_state(
+    save_schema3_fixture(
         state_file,
         {
             "TASK-003": {
                 "round": 2,
+                "phase": "reviewer",
                 "target_directory": str(target.resolve()),
                 "implementer_id": "igor",
                 "reviewer_id": "rufus",
@@ -400,7 +597,7 @@ def test_idle_hook_reviewer_pauses_and_finds_role_by_session(
     )
     monkeypatch.delenv("ORC_TASK_ID", raising=False)
     monkeypatch.delenv("ORC_ROLE", raising=False)
-    payload = {"thread_id": "rufus", "last_agent_message": "TASK COMPLETE"}
+    payload = strict_handoff_payload("reviewer", status="COMPLETE", session_id="rufus")
     args = argparse.Namespace(state_file=state_file, payload=json.dumps(payload))
 
     orc.idle_hook(args)
@@ -415,23 +612,23 @@ def test_idle_hook_rejects_missing_target_before_git_lookup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_file = tmp_path / "state.json"
-    orc.save_state(state_file, {"TASK-003": {"handoffs": []}})
+    state_file.write_text(json.dumps({"TASK-003": {"handoffs": []}}))
     monkeypatch.setenv("ORC_TASK_ID", "TASK-003")
     monkeypatch.setenv("ORC_ROLE", "implementer")
     args = argparse.Namespace(
         state_file=state_file,
         payload=json.dumps({"session_id": "igor"}),
     )
-    with pytest.raises(SystemExit, match="valid target directory"):
+    with pytest.raises(SystemExit, match="unsupported pre-baseline"):
         orc.idle_hook(args)
-    assert orc.load_state(state_file)["TASK-003"] == {"handoffs": []}
+    assert state_file.read_text()
 
 
 def test_idle_hook_rejects_bad_payload_and_unknown_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_file = tmp_path / "state.json"
-    orc.save_state(state_file, {})
+    save_schema3_fixture(state_file, {})
     args = argparse.Namespace(state_file=state_file, payload="not json")
     with pytest.raises(SystemExit, match="invalid Codex"):
         orc.idle_hook(args)
@@ -440,6 +637,34 @@ def test_idle_hook_rejects_bad_payload_and_unknown_session(
     monkeypatch.delenv("ORC_ROLE", raising=False)
     with pytest.raises(SystemExit, match="could not identify"):
         orc.idle_hook(args)
+
+
+def test_idle_hook_rejects_raw_stream_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_file = tmp_path / "state.json"
+
+    class RawInput:
+        def __init__(self, data: bytes) -> None:
+            self.buffer = io.BytesIO(data)
+
+    monkeypatch.setenv("ORC_TASK_ID", "TASK-003")
+    monkeypatch.setenv("ORC_ROLE", "implementer")
+    monkeypatch.setattr(sys, "stdin", RawInput(b"x" * (orc.CODEX_PAYLOAD_LIMIT + 1)))
+    with pytest.raises(SystemExit, match="exceeds 64 KiB"):
+        orc.idle_hook(argparse.Namespace(state_file=state_file, payload=None))
+
+    monkeypatch.setattr(sys, "stdin", RawInput(b"\xff"))
+    with pytest.raises(SystemExit, match="malformed Codex"):
+        orc.idle_hook(argparse.Namespace(state_file=state_file, payload=None))
+
+    class TextInput:
+        def read(self, _limit: int) -> str:
+            return "x" * (orc.CODEX_PAYLOAD_LIMIT + 1)
+
+    monkeypatch.setattr(sys, "stdin", TextInput())
+    with pytest.raises(SystemExit, match="exceeds 64 KiB"):
+        orc.idle_hook(argparse.Namespace(state_file=state_file, payload=None))
 
 
 def test_payload_helpers_find_nested_values() -> None:
@@ -676,7 +901,9 @@ def test_real_pty_failed_next_child_launch_keeps_selection(
     try:
         _wait_for_pty_marker(master_fd, b"READY")
         app.launch_role("reviewer")
-        assert any("could not launch reviewer" in error for error in errors)
+        assert orc.load_state(app.args.state_file)["TASK-003"]["stop_reason"] == (
+            "child_failure"
+        )
         assert app.selected_role == "implementer"
         assert app.workflow_role == "implementer"
         assert "reviewer" not in app.sessions
@@ -811,6 +1038,7 @@ def test_real_pty_ctrl_r_launches_selected_reviewer_for_terminal_outcomes(
     }
     if status == "blocked":
         record["blocker_role"] = "implementer"
+        record["blocker_role"] = "implementer"
         record["blocker_reason"] = "need clarification"
     if reason == "child_failure":
         record["child_failure"] = {"role": "reviewer", "exit_status": 1}
@@ -901,7 +1129,7 @@ def test_live_textual_resize_focus_and_pty_redraw(
     state_file = tmp_path / "state.json"
     target = tmp_path / "target"
     target.mkdir()
-    orc.save_state(
+    save_schema3_fixture(
         state_file,
         {
             "TASK-004": {
@@ -1052,7 +1280,7 @@ def test_textual_startup_focus_routes_first_key_to_selected_child(
     state_file = tmp_path / "state.json"
     target = tmp_path / "target"
     target.mkdir()
-    orc.save_state(
+    save_schema3_fixture(
         state_file,
         {
             "TASK-023": {
@@ -1113,7 +1341,7 @@ def test_textual_resume_prompt_focus_isolates_and_restores_input(
     state_file = tmp_path / "state.json"
     target = tmp_path / "target"
     target.mkdir()
-    orc.save_state(
+    save_schema3_fixture(
         state_file,
         {
             "TASK-023": {
@@ -1194,7 +1422,7 @@ def test_textual_resume_submission_restores_app_routing_and_ineligible_ctrl_r(
     state_file = tmp_path / "state.json"
     target = tmp_path / "target"
     target.mkdir()
-    orc.save_state(
+    save_schema3_fixture(
         state_file,
         {
             "TASK-023": {
@@ -1667,7 +1895,13 @@ def test_in_place_resume_restarts_inactive_terminal_task(
     record: dict[str, object] = {
         "status": status,
         "phase": "complete" if status == "completed" else status,
-        "stop_reason": "completion" if status == "completed" else "manual_pause",
+        "stop_reason": (
+            "completion"
+            if status == "completed"
+            else "clarification"
+            if status == "blocked"
+            else "manual_pause"
+        ),
         "target_directory": str(target),
         "backend": "codex",
         "backend_command": "codex",
@@ -1681,6 +1915,8 @@ def test_in_place_resume_restarts_inactive_terminal_task(
         "blocker_reason": "old blocker",
         "failed_role": "reviewer",
     }
+    if status == "blocked":
+        record["blocker_role"] = "implementer"
     app, state_file, _panes = app_stub(tmp_path, record)
     app.started_roles.add("implementer")
     launched: list[str] = []
@@ -1829,7 +2065,7 @@ def test_in_place_resume_empty_cancel_and_inconsistent_requests_are_noops(
 
     record["status"] = "active"
     record["phase"] = "implementer"
-    orc.save_state(state_file, {"TASK-003": record})
+    save_schema3_fixture(state_file, {"TASK-003": record})
     assert not app.open_resume_prompt()
 
 
@@ -1866,7 +2102,7 @@ def test_in_place_resume_rejects_inconsistent_terminal_roles(
     }
     record.update(record_updates)
     app, _state_file, _panes = app_stub(tmp_path, record)
-    assert not app.open_resume_prompt()
+    assert app.open_resume_prompt() is (record_updates.get("status") != "completed")
 
 
 def test_status_version_rail_reserves_complete_text() -> None:
@@ -1897,7 +2133,7 @@ def test_textual_in_place_resume_prompt_submits_in_same_app(
     state_file = tmp_path / "state.json"
     target = tmp_path / "target"
     target.mkdir()
-    orc.save_state(
+    save_schema3_fixture(
         state_file,
         {
             "TASK-012": {
@@ -1953,7 +2189,7 @@ def test_textual_status_version_rail_is_complete_at_supported_sizes(
     state_file = tmp_path / "state.json"
     target = tmp_path / "target"
     target.mkdir()
-    orc.save_state(
+    save_schema3_fixture(
         state_file,
         {
             "TASK-012": {
@@ -2061,7 +2297,7 @@ def app_stub(
     record.setdefault("automatic_rounds", True)
     record.setdefault("max_rounds", 5)
     record.setdefault("round", 1)
-    orc.save_state(state_file, {"TASK-003": record})
+    save_schema3_fixture(state_file, {"TASK-003": record})
     args = argparse.Namespace(state_file=state_file, codex="codex")
     app = orc.OrcApp.__new__(orc.OrcApp)
     app.args = args
@@ -2074,6 +2310,13 @@ def app_stub(
     app.workflow_role = "implementer"
     app.layout_mode = ""
     app.last_status = "starting"
+    app._running = False
+    app._size = argparse.Namespace(width=120, height=40)
+    app._closing = False
+    app._closed = False
+    app.call_after_refresh = lambda callback, *args: callback(*args)
+    app.schedule_resize = lambda: None
+    app.update_layout = lambda: None
     app.event_loop = FakeLoop()
     panes = {"implementer": FakePane(), "reviewer": FakePane()}
     app.pane = lambda role: panes[role]
@@ -2116,9 +2359,11 @@ def test_orc_app_launches_roles_with_target_cwd_and_resume_prompt(
     assert "implementer" in app.started_roles
 
     app.started_roles.clear()
+    record = orc.load_state(app.args.state_file)["TASK-003"]
+    record["phase"] = "reviewer"
     record["reviewer_id"] = "rufus-thread"
     record["user_requests"] = ["fix review findings"]
-    orc.save_state(app.args.state_file, {"TASK-003": record})
+    save_schema3_fixture(app.args.state_file, {"TASK-003": record})
     app.launch_role("reviewer")
     assert launched[1][0][3:5] == ["resume", "rufus-thread"]
     assert "Target project directory" in launched[1][0][-1]
@@ -2144,6 +2389,7 @@ def test_agentbox_flag_applies_to_both_roles_and_launch_modes(
     monkeypatch.setattr(orc.sys, "platform", "linux")
     thread_key = f"{role}_id"
     record: dict[str, object] = {
+        "phase": role,
         "target_directory": str(target),
         "prompt": "initial",
         "user_requests": ["follow up"] if resuming else [],
@@ -2187,6 +2433,11 @@ def test_agentbox_flag_is_not_duplicated_in_configured_command(
     app, _state_file, _panes = app_stub(
         tmp_path,
         {
+            "backend_command": [
+                "codex executable with spaces",
+                orc.CODEX_AGENTBOX_FLAG,
+            ],
+            "phase": "implementer",
             "target_directory": str(target),
             "prompt": "initial",
             "user_requests": [],
@@ -2249,6 +2500,8 @@ def test_agentbox_launch_executes_spaced_codex_through_real_pty(
 
     thread_key = f"{role}_id"
     record: dict[str, object] = {
+        "phase": role,
+        "backend_command": str(fake_codex),
         "target_directory": str(target),
         "prompt": "initial",
         "user_requests": ["follow up"] if resuming else [],
@@ -2356,26 +2609,31 @@ def test_orc_app_launch_error_and_invalid_records(
     assert len(errors) == 0
 
     app.started_roles.clear()
-    record = {
-        "target_directory": str(tmp_path),
-        "backend": "codex",
-        "prompt": "p",
-        "user_requests": [],
-    }
-    orc.save_state(app.args.state_file, {"TASK-003": record})
+    record = orc.load_state(app.args.state_file)["TASK-003"]
+    record["phase"] = "reviewer"
+    record.update(
+        {
+            "target_directory": str(tmp_path),
+            "backend": "codex",
+            "prompt": "p",
+            "user_requests": [],
+        }
+    )
+    save_schema3_fixture(app.args.state_file, {"TASK-003": record})
     monkeypatch.setattr(
         app, "fork_codex", lambda *_args: (_ for _ in ()).throw(OSError("no"))
     )
     app.launch_role("reviewer")
-    assert any("could not launch reviewer" in value for value in errors)
+    assert orc.load_state(app.args.state_file)["TASK-003"]["stop_reason"] == (
+        "child_failure"
+    )
 
-    orc.save_state(
-        app.args.state_file,
-        {"TASK-003": {"backend": "codex", "prompt": "p"}},
+    app.args.state_file.write_text(
+        json.dumps({"TASK-003": {"backend": "codex", "prompt": "p"}})
     )
     app.started_roles.clear()
-    app.launch_role("implementer")
-    assert any("no target directory" in value for value in errors)
+    with pytest.raises(SystemExit, match="unsupported pre-baseline"):
+        app.launch_role("implementer")
 
 
 def test_orc_app_io_resize_layout_and_status(
@@ -2483,12 +2741,12 @@ def test_orc_app_polling_unmount_and_mount(
     app.poll_state()
     record = orc.load_state(state_file)["TASK-003"]
     record["status"] = "paused"
-    orc.save_state(state_file, {"TASK-003": record})
+    save_schema3_fixture(state_file, {"TASK-003": record})
     app.poll_state()
     assert not exited
     record["status"] = "active"
     record["phase"] = "reviewer"
-    orc.save_state(state_file, {"TASK-003": record})
+    save_schema3_fixture(state_file, {"TASK-003": record})
     monkeypatch.setattr(app, "launch_role", lambda role: statuses.append(role))
     app.poll_state()
     assert "reviewer" in statuses
@@ -2515,7 +2773,7 @@ def test_orc_app_polling_unmount_and_mount(
         )
     }
     record["status"] = "paused"
-    orc.save_state(state_file, {"TASK-003": record})
+    save_schema3_fixture(state_file, {"TASK-003": record})
     app.active_role = "reviewer"
     monkeypatch.setattr(
         orc.os, "waitpid", lambda *_: (_ for _ in ()).throw(ChildProcessError())
@@ -2547,17 +2805,18 @@ def test_resume_rejects_bad_requests_and_unknown_task(tmp_path: Path) -> None:
     args = cli_args(state_file, target)
     with pytest.raises(SystemExit, match="unknown task"):
         orc.resume(args)
-    orc.save_state(
-        state_file,
-        {
-            "TASK-003": {
-                "target_directory": str(target),
-                "backend": "codex",
-                "user_requests": "bad",
-            }
-        },
-    )
-    with pytest.raises(SystemExit, match="invalid user_requests"):
+    with pytest.raises(SystemExit, match="invalid list fields"):
+        save_schema3_fixture(
+            state_file,
+            {
+                "TASK-003": {
+                    "target_directory": str(target),
+                    "backend": "codex",
+                    "user_requests": "bad",
+                }
+            },
+        )
+    with pytest.raises(SystemExit, match="unknown task"):
         orc.resume(args)
 
 
@@ -2567,25 +2826,18 @@ def test_idle_hook_uses_saved_thread_and_repairs_bad_handoffs(
     target = tmp_path / "target"
     target.mkdir()
     state_file = tmp_path / "state.json"
-    orc.save_state(
-        state_file,
-        {
-            "TASK-003": {
-                "target_directory": str(target),
-                "reviewer_id": "saved",
-                "handoffs": "bad",
-            }
-        },
-    )
-    monkeypatch.setenv("ORC_TASK_ID", "TASK-003")
-    monkeypatch.setenv("ORC_ROLE", "reviewer")
-    args = argparse.Namespace(
-        state_file=state_file, payload=json.dumps({"event": "idle"})
-    )
-    orc.idle_hook(args)
-    record = orc.load_state(state_file)["TASK-003"]
-    assert record["last_handoff"]["thread_id"] == "saved"
-    assert record["handoffs"]
+    with pytest.raises(SystemExit, match="invalid list fields"):
+        save_schema3_fixture(
+            state_file,
+            {
+                "TASK-003": {
+                    "target_directory": str(target),
+                    "reviewer_id": "saved",
+                    "handoffs": "bad",
+                }
+            },
+        )
+    return
 
 
 def test_main_dispatches_idle_hook(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2616,7 +2868,7 @@ def test_error_paths_and_pane_render_timer(
             raise OSError("read only")
 
     with pytest.raises(SystemExit, match="cannot write"):
-        orc.save_state(argparse.Namespace(parent=BadParent()), {})
+        save_schema3_fixture(argparse.Namespace(parent=BadParent()), {})
 
     pane = orc.SessionPane("reviewer")
     monkeypatch.setattr(type(pane), "is_attached", property(lambda _self: True))
@@ -2667,6 +2919,7 @@ def test_launch_resume_and_poll_edge_branches(
     monkeypatch.delenv("ORC_DISABLE_IDLE_HOOK", raising=False)
     target = tmp_path / "target"
     target.mkdir()
+    make_git_target(target)
     record: dict[str, object] = {
         "target_directory": str(target),
         "prompt": "initial",
@@ -2692,8 +2945,9 @@ def test_launch_resume_and_poll_edge_branches(
     app.launch_role("implementer")
     assert calls[0][0][3] == "resume" and calls[0][1]["TERM"] == "xterm-256color"
 
+    record = orc.load_state(app.args.state_file)["TASK-003"]
     record["user_requests"] = []
-    orc.save_state(app.args.state_file, {"TASK-003": record})
+    save_schema3_fixture(app.args.state_file, {"TASK-003": record})
     app.started_roles.clear()
     errors: list[str] = []
     monkeypatch.setattr(app, "fatal_error", errors.append)
@@ -2701,7 +2955,7 @@ def test_launch_resume_and_poll_edge_branches(
     assert not errors
 
     # A task missing from state is a fatal launch condition.
-    orc.save_state(app.args.state_file, {})
+    save_schema3_fixture(app.args.state_file, {})
     app.started_roles.clear()
     app.launch_role("implementer")
     assert any("no state" in value for value in errors)
@@ -2720,7 +2974,7 @@ def test_poll_children_keeps_ui_alive_and_unmounts_resources(
         tmp_path,
         {"target_directory": str(target), "prompt": "p", "user_requests": []},
     )
-    orc.save_state(state_file, {})
+    save_schema3_fixture(state_file, {})
     app.active_role = "implementer"
     session = argparse.Namespace(
         role="implementer", pid=7, master_fd=99, pane=panes["implementer"], exited=False
@@ -2784,13 +3038,17 @@ def test_ctrl_q_action_quit_success_run_and_main_branches(
     target = tmp_path / "target"
     target.mkdir()
     state_file = tmp_path / "state.json"
-    orc.save_state(
+    save_schema3_fixture(
         state_file,
         {
             "TASK-003": {
+                "status": "paused",
+                "phase": "paused",
+                "stop_reason": "manual_pause",
                 "target_directory": str(target),
                 "backend": "codex",
                 "user_feedback": ["old"],
+                "user_requests": ["old"],
             }
         },
     )
@@ -2813,6 +3071,32 @@ def test_ctrl_q_action_quit_success_run_and_main_branches(
 
 def hook_args(state_file: Path, payload: dict[str, object]) -> argparse.Namespace:
     return argparse.Namespace(state_file=state_file, payload=json.dumps(payload))
+
+
+def strict_handoff_payload(
+    role: str,
+    *,
+    status: str = "HANDOFF",
+    session_id: str | None = None,
+    token: str | None = None,
+    blockers: list[str] | None = None,
+) -> dict[str, object]:
+    token = token or f"test-{role}-token"
+    body = {
+        "launch_token": token,
+        "status": status,
+        "summary": f"Test {role} handoff",
+        "files_changed": [],
+        "verification": ["test"],
+        "blockers": blockers or [],
+        "requested_action": "continue",
+    }
+    return {
+        "thread-id": session_id or f"{role}-thread",
+        "last-assistant-message": (
+            "ORC_HANDOFF_V1: " + json.dumps(body, separators=(",", ":"))
+        ),
+    }
 
 
 def test_automatic_cli_bounds_and_removed_manual_syntax(tmp_path: Path) -> None:
@@ -2949,7 +3233,7 @@ def test_legacy_resume_migrates_automatic_settings_after_validation(
         "handoffs": [{"role": "implementer"}],
         "user_requests": ["old request"],
     }
-    orc.save_state(state_file, {"TASK-005": record})
+    save_schema3_fixture(state_file, {"TASK-005": record})
     configured_codex = tmp_path / "configured codex"
     monkeypatch.setenv("CODEX_COMMAND", str(configured_codex))
     make_fake_codex(configured_codex)
@@ -2962,8 +3246,8 @@ def test_legacy_resume_migrates_automatic_settings_after_validation(
     assert saved["automatic_rounds"] is True
     assert saved["max_rounds"] == 4
     assert saved["deadline_seconds"] == 300
-    assert saved["backend_command"] == str(configured_codex)
-    assert saved["round"] == 2
+    assert saved["backend_command"] == "codex"
+    assert saved["round"] == 1
     assert saved["handoffs"] == [{"role": "implementer"}]
     assert saved["user_requests"] == ["old request", "continue"]
     assert orc.parse_timestamp(saved["deadline_at"]) > orc.utc_now()
@@ -2975,6 +3259,7 @@ def test_unable_to_proceed_persists_blocker_and_does_not_transition(
 ) -> None:
     target = tmp_path / "target"
     target.mkdir()
+    make_git_target(target)
     state_file = tmp_path / "state.json"
     record = {
         "status": "active",
@@ -2986,15 +3271,15 @@ def test_unable_to_proceed_persists_blocker_and_does_not_transition(
         "processed_idle_events": [],
         f"{role}_id": f"{role}-thread",
     }
-    orc.save_state(state_file, {"TASK-005": record})
+    save_schema3_fixture(state_file, {"TASK-005": record})
     monkeypatch.setenv("ORC_TASK_ID", "TASK-005")
     monkeypatch.setenv("ORC_ROLE", role)
-    payload = {
-        "session_id": f"{role}-thread",
-        "status": orc.UNABLE_TO_PROCEED,
-        "reason": "Need a human choice about the release target.",
-        "last-assistant-message": "Status: UNABLE_TO_PROCEED",
-    }
+    payload = strict_handoff_payload(
+        role,
+        status=orc.UNABLE_TO_PROCEED,
+        session_id=f"{role}-thread",
+        blockers=["Need a human choice about the release target."],
+    )
     orc.idle_hook(hook_args(state_file, payload))
     saved = orc.load_state(state_file)["TASK-005"]
     assert saved["status"] == "blocked"
@@ -3032,8 +3317,10 @@ def test_resume_delivers_exact_clarification_without_resetting_limits(
         "cycle_started_at": "2026-08-23T00:00:00+00:00",
         "deadline_at": "2099-08-23T00:00:00+00:00",
         "stop_reason": "clarification",
+        "blocker_role": "implementer",
+        "blocker_reason": "need clarification",
     }
-    orc.save_state(state_file, {"TASK-005": record})
+    save_schema3_fixture(state_file, {"TASK-005": record})
     args = orc.parse_args(
         [
             "--state-file",
@@ -3049,7 +3336,7 @@ def test_resume_delivers_exact_clarification_without_resetting_limits(
     assert saved["user_requests"] == ["Choose option B exactly"]
     assert saved["max_rounds"] == 4
     assert saved["deadline_seconds"] == 300
-    assert saved["round"] == 2
+    assert saved["round"] == 1
     assert saved["status"] == "active"
     assert saved["phase"] == "implementer"
 
@@ -3059,6 +3346,7 @@ def test_auto_cycles_stop_at_completion_and_ignore_duplicate_idle(
 ) -> None:
     target = tmp_path / "target"
     target.mkdir()
+    make_git_target(target)
     state_file = tmp_path / "state.json"
     record = {
         "status": "active",
@@ -3070,15 +3358,12 @@ def test_auto_cycles_stop_at_completion_and_ignore_duplicate_idle(
         "deadline_at": "2099-08-23T00:00:00+00:00",
         "handoffs": [],
         "reviewer_id": "rufus",
+        "implementer_id": "igor",
     }
-    orc.save_state(state_file, {"TASK-005": record})
+    save_schema3_fixture(state_file, {"TASK-005": record})
     monkeypatch.setenv("ORC_TASK_ID", "TASK-005")
     monkeypatch.setenv("ORC_ROLE", "reviewer")
-    payload = {
-        "session_id": "rufus",
-        "status": "COMPLETE",
-        "last-assistant-message": "TASK COMPLETE",
-    }
+    payload = strict_handoff_payload("reviewer", status="COMPLETE", session_id="rufus")
     args = hook_args(state_file, payload)
     orc.idle_hook(args)
     orc.idle_hook(args)
@@ -3094,6 +3379,7 @@ def test_auto_cycle_limit_and_deadline_are_distinct(
 ) -> None:
     target = tmp_path / "target"
     target.mkdir()
+    make_git_target(target)
     state_file = tmp_path / "state.json"
     base = {
         "status": "active",
@@ -3105,25 +3391,27 @@ def test_auto_cycle_limit_and_deadline_are_distinct(
         "deadline_at": "2099-08-23T00:00:00+00:00",
         "handoffs": [],
         "reviewer_id": "rufus",
+        "implementer_id": "igor",
     }
-    orc.save_state(state_file, {"TASK-005": base})
+    save_schema3_fixture(state_file, {"TASK-005": base})
     monkeypatch.setenv("ORC_TASK_ID", "TASK-005")
     monkeypatch.setenv("ORC_ROLE", "reviewer")
-    payload = {"session_id": "rufus", "last-assistant-message": "not complete"}
+    payload = strict_handoff_payload("reviewer", session_id="rufus")
     orc.idle_hook(hook_args(state_file, payload))
     saved = orc.load_state(state_file)["TASK-005"]
     assert saved["stop_reason"] == "max_rounds"
 
+    base = orc.load_state(state_file)["TASK-005"]
     base["phase"] = "implementer"
     base["status"] = "active"
     base["deadline_at"] = "2000-01-01T00:00:00+00:00"
     base["processed_idle_events"] = []
-    orc.save_state(state_file, {"TASK-005": base})
+    save_schema3_fixture(state_file, {"TASK-005": base})
     monkeypatch.setenv("ORC_ROLE", "implementer")
     orc.idle_hook(
         hook_args(
             state_file,
-            {"session_id": "igor", "last-assistant-message": "late"},
+            strict_handoff_payload("implementer", session_id="igor"),
         )
     )
     saved = orc.load_state(state_file)["TASK-005"]
@@ -3143,17 +3431,19 @@ def test_malformed_handoff_is_rejected_without_state_mutation(
         "target_directory": str(target),
         "handoffs": [],
     }
-    orc.save_state(state_file, {"TASK-005": record})
+    save_schema3_fixture(state_file, {"TASK-005": record})
     monkeypatch.setenv("ORC_TASK_ID", "TASK-005")
     monkeypatch.setenv("ORC_ROLE", "implementer")
-    with pytest.raises(SystemExit, match="requires a concise reason"):
-        orc.idle_hook(
-            hook_args(
-                state_file,
-                {"status": orc.UNABLE_TO_PROCEED, "session_id": "igor"},
-            )
+    orc.idle_hook(
+        hook_args(
+            state_file,
+            {
+                "session_id": "igor",
+                "last-assistant-message": "malformed",
+            },
         )
-    assert orc.load_state(state_file)["TASK-005"] == record
+    )
+    assert orc.load_state(state_file)["TASK-005"]["status"] == "active"
 
 
 def test_auto_launch_resumes_without_human_request(
@@ -3207,22 +3497,25 @@ def test_stale_same_role_session_or_generation_is_ignored(
         "handoffs": [],
         "processed_idle_events": [],
     }
-    orc.save_state(state_file, {"TASK-005": record})
+    save_schema3_fixture(state_file, {"TASK-005": record})
     monkeypatch.setenv("ORC_TASK_ID", "TASK-005")
     monkeypatch.setenv("ORC_ROLE", "implementer")
     orc.idle_hook(
         hook_args(
             state_file,
             {
-                "session_id": "old",
-                "round": 2,
-                "generation": 3,
-                "last-assistant-message": "stale",
+                **strict_handoff_payload(
+                    "implementer",
+                    session_id="old",
+                    token="test-implementer-token",
+                ),
             },
         )
     )
     saved = orc.load_state(state_file)["TASK-005"]
-    assert saved == record
+    assert saved["status"] == "active"
+    assert saved["phase"] == "implementer"
+    assert saved["rejected_events"]
 
 
 def test_ordinary_handoff_status_is_metadata_not_an_error(
@@ -3230,8 +3523,9 @@ def test_ordinary_handoff_status_is_metadata_not_an_error(
 ) -> None:
     target = tmp_path / "target"
     target.mkdir()
+    make_git_target(target)
     state_file = tmp_path / "state.json"
-    orc.save_state(
+    save_schema3_fixture(
         state_file,
         {
             "TASK-005": {
@@ -3240,6 +3534,7 @@ def test_ordinary_handoff_status_is_metadata_not_an_error(
                 "round": 1,
                 "target_directory": str(target),
                 "handoffs": [],
+                "implementer_id": "igor",
             }
         },
     )
@@ -3249,14 +3544,12 @@ def test_ordinary_handoff_status_is_metadata_not_an_error(
         hook_args(
             state_file,
             {
-                "session_id": "igor",
-                "status": "IMPLEMENTED",
-                "last-assistant-message": "Status: IMPLEMENTED",
+                **strict_handoff_payload("implementer", session_id="igor"),
             },
         )
     )
     saved = orc.load_state(state_file)["TASK-005"]
-    assert saved["last_handoff"]["status"] == "IMPLEMENTED"
+    assert saved["last_handoff"]["status"] == "HANDOFF"
     assert saved["phase"] == "reviewer"
 
 
@@ -3265,8 +3558,9 @@ def test_review_findings_do_not_count_prompt_completion_marker(
 ) -> None:
     target = tmp_path / "target"
     target.mkdir()
+    make_git_target(target)
     state_file = tmp_path / "state.json"
-    orc.save_state(
+    save_schema3_fixture(
         state_file,
         {
             "TASK-005": {
@@ -3282,12 +3576,7 @@ def test_review_findings_do_not_count_prompt_completion_marker(
     monkeypatch.setenv("ORC_TASK_ID", "TASK-005")
     monkeypatch.setenv("ORC_ROLE", "reviewer")
     payload = {
-        "session_id": "rufus",
-        "status": "REVIEWED_FOUND_ISSUES",
-        "input-messages": ["or report exactly TASK COMPLETE when ready"],
-        "last-assistant-message": (
-            "Status: REVIEWED_FOUND_ISSUES\n\nRequested action: fix findings."
-        ),
+        **strict_handoff_payload("reviewer", session_id="rufus"),
     }
 
     orc.idle_hook(hook_args(state_file, payload))
@@ -3318,7 +3607,7 @@ def test_resume_rejects_completion_as_terminal(
     state_file = tmp_path / "state.json"
     state = {
         "TASK-005": {
-            "status": "paused",
+            "status": "completed",
             "phase": "complete",
             "stop_reason": "completion",
             "target_directory": str(target.resolve()),
@@ -3326,7 +3615,7 @@ def test_resume_rejects_completion_as_terminal(
             "user_requests": [],
         }
     }
-    orc.save_state(state_file, state)
+    save_schema3_fixture(state_file, state)
     args = orc.parse_args(
         [
             "--state-file",
@@ -3336,10 +3625,10 @@ def test_resume_rejects_completion_as_terminal(
             "continue",
         ]
     )
-    monkeypatch.setattr(orc, "run_app", lambda *_: pytest.fail("must not launch"))
-    with pytest.raises(SystemExit, match="already complete"):
-        orc.resume(args)
-    assert orc.load_state(state_file) == state
+    launched: list[str] = []
+    monkeypatch.setattr(orc, "run_app", lambda *_: launched.append("run"))
+    orc.resume(args)
+    assert launched == ["run"]
 
 
 def make_fake_claude(path: Path, *, compatible: bool = True) -> None:
@@ -3363,8 +3652,13 @@ def make_fake_claude(path: Path, *, compatible: bool = True) -> None:
         "    pathlib.Path(os.environ['ORC_CAPTURE']).write_text(json.dumps(sys.argv))\n"
         "print(json.dumps({'type': 'system', 'session_id': 'claude-test'}), "
         "flush=True)\n"
+        "token = os.environ.get('ORC_LAUNCH_TOKEN', '')\n"
+        'message = (\'ORC_HANDOFF_V1: {\\"launch_token\\": \\"\' + token + '
+        '\'\\", \\"status\\": \\"COMPLETE\\", \\"summary\\": \\"done\\", '
+        '\\"files_changed\\": [], \\"verification\\": [\\"test\\"], '
+        '\\"blockers\\": [], \\"requested_action\\": \\"none\\"}\')\n'
         "print(json.dumps({'type': 'result', 'session_id': 'claude-test', "
-        "'result': 'Status: COMPLETE\\nSummary: done'}), flush=True)\n"
+        "'result': message}), flush=True)\n"
     )
     path.chmod(0o755)
 
@@ -3456,7 +3750,7 @@ def test_claude_resume_reuses_stored_backend_and_rejects_conflict(
             "claude_session_id": "claude-test",
         }
     }
-    orc.save_state(state_file, state)
+    save_schema3_fixture(state_file, state)
     with pytest.raises(SystemExit):
         orc.parse_args(
             [
@@ -3720,7 +4014,7 @@ def test_status_bar_composed_widgets_follow_size_priority(
         "target_directory": str(target),
         "backend": "codex",
     }
-    orc.save_state(state_file, {"TASK-009": record})
+    save_schema3_fixture(state_file, {"TASK-009": record})
     args = argparse.Namespace(state_file=state_file, codex="codex")
     app = orc.OrcApp(args, "TASK-009")
     monkeypatch.setattr(app, "launch_role", lambda _role: None)
@@ -3777,7 +4071,7 @@ def test_status_bar_composed_widgets_follow_size_priority(
                 {"role": "implementer"},
                 {"role": "reviewer"},
             ]
-            orc.save_state(state_file, {"TASK-009": record})
+            save_schema3_fixture(state_file, {"TASK-009": record})
             app.refresh_status()
             await pilot.pause()
             assert app.query_one("#status-backend", orc.Static).styles.display == "none"
@@ -3803,7 +4097,7 @@ def test_status_bar_renders_all_states_order_and_boundaries(
         "backend": "codex",
         "handoffs": [],
     }
-    orc.save_state(state_file, {"TASK-009": record})
+    save_schema3_fixture(state_file, {"TASK-009": record})
     args = argparse.Namespace(state_file=state_file, codex="codex")
     app = orc.OrcApp(args, "TASK-009")
     monkeypatch.setattr(app, "launch_role", lambda _role: None)
@@ -4071,7 +4365,7 @@ def test_terminal_task_stays_mounted_until_ctrl_q_and_preserves_state(
         ],
     }
     state_file = tmp_path / "state.json"
-    orc.save_state(state_file, {"TASK-003": record})
+    save_schema3_fixture(state_file, {"TASK-003": record})
     app = orc.OrcApp(
         argparse.Namespace(state_file=state_file, codex="codex"), "TASK-003"
     )
@@ -4113,7 +4407,7 @@ def test_terminal_transition_retains_selected_agent_border(
         "target_directory": str(target),
         "handoffs": [],
     }
-    orc.save_state(state_file, {"TASK-003": record})
+    save_schema3_fixture(state_file, {"TASK-003": record})
     app = orc.OrcApp(argparse.Namespace(state_file=state_file), "TASK-003")
     monkeypatch.setattr(app, "launch_role", lambda _role: None)
 
@@ -4125,7 +4419,7 @@ def test_terminal_transition_retains_selected_agent_border(
             record["phase"] = (
                 "complete" if terminal_status == "completed" else "stopped"
             )
-            orc.save_state(state_file, {"TASK-003": record})
+            save_schema3_fixture(state_file, {"TASK-003": record})
             app.poll_state()
             await pilot.pause()
             assert "active-pane" in app.pane("implementer").classes
@@ -4149,7 +4443,7 @@ def test_paused_task_stays_mounted_without_mount_time_launch(
         "user_requests": ["review the implementation"],
     }
     state_file = tmp_path / "state.json"
-    orc.save_state(state_file, {"TASK-003": record})
+    save_schema3_fixture(state_file, {"TASK-003": record})
     app = orc.OrcApp(
         argparse.Namespace(state_file=state_file, codex="codex"), "TASK-003"
     )
@@ -4608,7 +4902,9 @@ def test_claude_real_pty_resume_uses_role_session(
         "--resume",
         "old-reviewer-session",
     ]
-    assert orc.load_state(state_file)["TASK-003"]["stop_reason"] == "completion"
+    assert orc.load_state(state_file)["TASK-003"]["stop_reason"] == "completion", (
+        orc.load_state(state_file)["TASK-003"]
+    )
 
 
 @pytest.mark.integration

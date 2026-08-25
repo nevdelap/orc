@@ -133,7 +133,7 @@ Acceptance criteria:
 
 ## TASK-017 - Add a bounded workflow audit trail
 
-State: NEW
+State: COMPLETED
 
 Goal:
 

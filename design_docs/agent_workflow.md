@@ -394,12 +394,42 @@ transition.
 
 ## Durable state and handoff protocol
 
-New task records use schema version 2 and a monotonically increasing revision.
+New task records use schema version 3 and a monotonically increasing revision.
 State mutations hold an advisory lock associated with the state file, validate
 the complete current record, flush a temporary JSON document in the same
 directory, atomically replace the state file, and flush its containing
 directory. A malformed or unsupported record is never overwritten; an
-interrupted replacement leaves the previous valid record readable.
+interrupted replacement leaves the previous valid record readable. Schema 2
+and every other unsupported record are rejected before mutation with
+`unsupported pre-baseline state schema`; Orc does not migrate or repair
+private pre-release records.
+
+Each schema-3 task has `audit_events`, `audit_next_sequence`,
+`audit_dropped_count`, `last_terminal_event_key`, and `timing`. The audit list
+is chronological and retains at most 256 events. A locked append assigns the
+current positive sequence, increments `audit_next_sequence`, evicts the
+oldest event at the cap, and saturates `audit_dropped_count` at 1,000,000.
+Sequences do not repeat after eviction. Events have exactly `sequence`,
+`time`, `event`, `role`, `round`, `generation`, `status_before`,
+`status_after`, `phase_before`, `phase_after`, `stop_reason`, `commit`, and
+`detail`. Times are UTC RFC3339 seconds with `Z`; detail is at most 4 KiB;
+`commit` is null until TASK-018. Launch, handoff, transition, child-exit, and
+cleanup applicability is strict, and role events always carry their positive
+generation. Audit data contains no prompts, launch tokens, backend arguments,
+raw payloads, or transcript text.
+
+`timing` contains exactly `task_started_at`, `task_finished_at`,
+`wall_seconds`, `agent_wall_seconds`, `unattributed_wall_seconds`, and
+`generations`. The task start is immutable across resume cycles. Successful
+`launch_spawned` starts a generation; the first accepted handoff or terminal
+child exit/cleanup closes it once. At most 256 generation records are retained;
+the oldest closed record is evicted first and open records are never evicted.
+If all retained records are open, launch is refused with `timing generation retention full` before child spawn. Wall values are clamped whole seconds;
+backward clock movement contributes zero and records a bounded diagnostic.
+Terminal transition timing records the finish and computes unattributed time
+as the non-negative remainder after implementer and reviewer totals. Resume
+clears the finish and resets the terminal-event identity without changing the
+immutable task start.
 
 The workflow transition function is the authority for handoffs, terminal
 events, child failures, polling, CLI resume, and in-place resume. Terminal

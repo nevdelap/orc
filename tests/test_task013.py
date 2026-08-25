@@ -52,7 +52,7 @@ def handoff(token: str, status: str = "HANDOFF", **extra: object) -> str:
 def strict_record(
     target: Path, *, status: str = "active", phase: str = "implementer"
 ) -> dict[str, object]:
-    return {
+    record = {
         "schema_version": orc.STATE_SCHEMA_VERSION,
         "revision": 1,
         "task_id": "TASK-013",
@@ -77,7 +77,45 @@ def strict_record(
         "automatic_rounds": True,
         "deadline_at": "2099-01-01T00:00:00+00:00",
         "stop_reason": None,
+        "audit_events": [],
+        "audit_next_sequence": 1,
+        "audit_dropped_count": 0,
+        "last_terminal_event_key": None,
+        "timing": {
+            "task_started_at": "2025-01-01T00:00:00Z",
+            "task_finished_at": (
+                "2025-01-01T00:00:00Z" if status != "active" else None
+            ),
+            "wall_seconds": 0,
+            "agent_wall_seconds": {"implementer": 0, "reviewer": 0},
+            "unattributed_wall_seconds": 0,
+            "generations": [],
+        },
     }
+    if status in {"paused", "blocked", "stopped", "completed"}:
+        terminal_reason = {
+            "paused": "manual_pause",
+            "blocked": "clarification",
+            "stopped": "deadline",
+            "completed": "completion",
+        }[status]
+        terminal_phase = {
+            "paused": "paused",
+            "blocked": "blocked",
+            "stopped": "stopped",
+            "completed": "complete",
+        }[status]
+        record["phase"] = terminal_phase
+        record["stop_reason"] = terminal_reason
+        record["last_terminal_event_key"] = orc._audit_terminal_key(
+            "state_transition",
+            None,
+            None,
+            status,
+            terminal_phase,
+            terminal_reason,
+        )
+    return record
 
 
 def test_handoff_schema_is_exact_and_bounded() -> None:
@@ -192,6 +230,20 @@ def test_claude_adapter_accepts_documented_result_events(
 def test_claude_adapter_rejects_invalid_result_events(event: dict[str, object]) -> None:
     with pytest.raises(ValueError):
         orc.parse_claude_result_event([event])
+
+
+def test_claude_adapter_rejects_stream_boundary_events() -> None:
+    with pytest.raises(ValueError, match="system event lacks"):
+        orc.parse_claude_result_event([{"type": "system", "session_id": ""}])
+    with pytest.raises(ValueError, match="session ID does not match"):
+        orc.parse_claude_result_event(
+            [
+                {"type": "system", "session_id": "system"},
+                {"type": "result", "session_id": "result", "result": "x"},
+            ]
+        )
+    with pytest.raises(ValueError, match="no valid result"):
+        orc.parse_claude_result_event([None])  # type: ignore[list-item]
 
 
 def test_atomic_state_replacement_preserves_previous_record(
@@ -1457,30 +1509,11 @@ def test_strict_launch_rejects_invalid_preconditions(
             app.launch_role("implementer")
 
 
-def test_legacy_idle_hook_terminal_and_replay_matrix(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_legacy_idle_hook_state_is_rejected_before_launch(
+    tmp_path: Path,
 ) -> None:
     target = tmp_path / "target"
     target.mkdir()
-    monkeypatch.setattr(orc, "current_commit", lambda *_args, **_kwargs: "abc123")
-    monkeypatch.setenv("ORC_TASK_ID", "TASK-013")
-
-    def run(
-        record: dict[str, object], role: str, message: str, name: str
-    ) -> dict[str, object]:
-        path = tmp_path / f"{name}.json"
-        orc.save_state(path, {"TASK-013": record})
-        monkeypatch.setenv("ORC_ROLE", role)
-        orc.idle_hook(
-            argparse.Namespace(
-                state_file=path,
-                payload=json.dumps(
-                    {"thread-id": "thread", "last-assistant-message": message}
-                ),
-            )
-        )
-        return orc.load_state(path)["TASK-013"]
-
     base = {
         "status": "active",
         "phase": "implementer",
@@ -1488,41 +1521,13 @@ def test_legacy_idle_hook_terminal_and_replay_matrix(
         "target_directory": str(target),
         "handoffs": [],
         "processed_idle_events": [],
-        "role_generations": {},
         "max_rounds": 2,
         "automatic_rounds": False,
         "implementer_id": None,
         "reviewer_id": None,
     }
-    saved = run(dict(base), "implementer", "status: HANDOFF", "legacy-implementer")
-    assert saved["phase"] == "reviewer"
-    saved = run(
-        {**base, "phase": "reviewer"}, "reviewer", "status: COMPLETE", "legacy-complete"
-    )
-    assert saved["status"] == "completed"
-    saved = run(
-        {**base, "phase": "implementer"},
-        "implementer",
-        "status: UNABLE_TO_PROCEED\nreason: choose a version",
-        "legacy-blocked",
-    )
-    assert saved["status"] == "blocked"
-    duplicate = dict(base)
-    duplicate["processed_idle_events"] = [
-        orc.handoff_event_key(
-            "TASK-013",
-            "implementer",
-            {"thread-id": "thread", "last-assistant-message": "status: HANDOFF"},
-        )
-    ]
-    saved = run(duplicate, "implementer", "status: HANDOFF", "legacy-duplicate")
-    assert saved["handoffs"] == []
-    mismatch = {**base, "phase": "reviewer"}
-    saved = run(mismatch, "implementer", "status: HANDOFF", "legacy-mismatch")
-    assert saved["handoffs"] == []
-    paused = {**base, "status": "paused"}
-    saved = run(paused, "reviewer", "status: HANDOFF", "legacy-paused")
-    assert saved["handoffs"] == []
+    with pytest.raises(SystemExit, match="unsupported pre-baseline state schema"):
+        orc.save_state(tmp_path / "legacy.json", {"TASK-013": base})
 
 
 def test_state_lock_and_ui_edge_paths(
